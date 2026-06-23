@@ -4,8 +4,6 @@ import {
 	normalizeCommand,
 	extractErrorFingerprint,
 	normalizeToolArgs,
-	isNudged,
-	markNudged,
 	lastItemIsThinking,
 	lastItemIsToolUse,
 	pruneFailureHistory,
@@ -166,6 +164,24 @@ describe("normalizeToolArgs", () => {
 		expect(normalizeToolArgs("read", {})).toBe("");
 	});
 
+	it("includes offset and limit in read fingerprint", () => {
+		expect(normalizeToolArgs("read", { path: "/some/file.ts", offset: 10, limit: 20 })).toBe("/some/file.ts:o=10:l=20");
+	});
+
+	it("differs when offset changes", () => {
+		const fp1 = normalizeToolArgs("read", { path: "file.ts", offset: 10, limit: 20 });
+		const fp2 = normalizeToolArgs("read", { path: "file.ts", offset: 30, limit: 20 });
+		expect(fp1).not.toBe(fp2);
+	});
+
+	it("handles offset without limit", () => {
+		expect(normalizeToolArgs("read", { path: "x", offset: 5 })).toBe("x:o=5:l=");
+	});
+
+	it("handles limit without offset", () => {
+		expect(normalizeToolArgs("read", { path: "x", limit: 100 })).toBe("x:o=:l=100");
+	});
+
 	it("handles missing command for bash tool", () => {
 		expect(normalizeToolArgs("bash", {})).toBe("");
 	});
@@ -184,55 +200,6 @@ describe("normalizeToolArgs", () => {
 	it("returns '{}' for non-object args", () => {
 		expect(normalizeToolArgs("read", "string")).toBe("{}");
 		expect(normalizeToolArgs("bash", 42)).toBe("{}");
-	});
-});
-
-// ── isNudged / markNudged ──
-
-describe("isNudged / markNudged", () => {
-	beforeEach(() => {
-		vi.useFakeTimers();
-	});
-
-	it("markNudged sets expiry in the future", () => {
-		const map = new Map<string, number>();
-		markNudged(map, "test-key", 30_000);
-		expect(map.has("test-key")).toBe(true);
-		const expiry = map.get("test-key")!;
-		expect(expiry).toBeGreaterThan(Date.now());
-	});
-
-	it("isNudged returns true for unexpired key", () => {
-		const map = new Map<string, number>();
-		markNudged(map, "test-key", 30_000);
-		expect(isNudged(map, "test-key")).toBe(true);
-	});
-
-	it("isNudged returns false for expired key and prunes it", () => {
-		const map = new Map<string, number>();
-		markNudged(map, "test-key", 30_000);
-
-		// Advance past expiry
-		vi.advanceTimersByTime(30_001);
-
-		expect(isNudged(map, "test-key")).toBe(false);
-		expect(map.has("test-key")).toBe(false);
-	});
-
-	it("isNudged returns false for unknown key", () => {
-		const map = new Map<string, number>();
-		expect(isNudged(map, "unknown")).toBe(false);
-	});
-
-	it("handles multiple keys independently", () => {
-		const map = new Map<string, number>();
-		markNudged(map, "key-a", 10_000);
-		markNudged(map, "key-b", 60_000);
-
-		vi.advanceTimersByTime(15_000);
-
-		expect(isNudged(map, "key-a")).toBe(false); // expired
-		expect(isNudged(map, "key-b")).toBe(true);  // still valid
 	});
 });
 

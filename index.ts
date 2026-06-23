@@ -30,11 +30,7 @@ const failureHistory: {
   command: string;    // normalized command
   fingerprint: string; // error fingerprint
   turnIndex: number;
-  timestamp: number;
 }[] = [];
-
-/** Track which command+error combos we've already nudged about (key -> expiry timestamp) */
-const nudgedKeys = new Map<string, number>();
 
 // ── Repetitive-call detection state ──
 
@@ -44,17 +40,54 @@ let repetitiveCallState: {
   count: number;
 } | null = null;
 
-/** Repetitive-call patterns we've already nudged about (key -> expiry timestamp) */
-const repetitiveNudgedKeys = new Map<string, number>();
-
 // Thresholds
 const FAILURE_LOOP_THRESHOLD = 3;     // N identical failures before nudging
+const FAILURE_LOOP_NUDGE_PLUS = 5;    // N failures before escalated nudge
+const FAILURE_LOOP_BLOCK = 7;         // N failures before hard block
 const FAILURE_WINDOW_TURNS = 5;       // Only consider failures within last N turns
 const REPETITIVE_CALL_THRESHOLD = 3;  // N consecutive identical calls before nudging
+const REPETITIVE_CALL_NUDGE_PLUS = 5; // N consecutive calls before escalated nudge
+const REPETITIVE_CALL_BLOCK = 7;      // N consecutive calls before hard block
 const NUDGE_COOLDOWN_MS = 30_000;     // Cooldown between nudges for same pattern
+const STALL_WARN = 4;                 // Stalls before strong warning
+const STALL_STOP = 5;                 // Stalls before stopping and notifying user
+const CIRCUIT_BREAKER_BLOCKS = 5;     // Total blocks before shutdown
+
+const ESCALATION_LEVELS: EscalationLevel[] = ["nudge", "nudge_plus", "block"];
 
 let currentTurnIndex = 0;
-let nudgeCooldownUntil = 0;
+let failureLoopCooldownUntil = 0;
+let repetitiveCallCooldownUntil = 0;
+
+// ── Escalation state ──
+
+type EscalationLevel = "nudge" | "nudge_plus" | "block";
+
+interface EscalationEntry {
+  level: EscalationLevel;
+  nudgeCount: number;
+}
+
+/** Failure-loop escalation: key -> { level, nudgeCount } */
+const failureEscalation = new Map<string, EscalationEntry>();
+
+/** Repetitive-call escalation: fingerprint -> { level, nudgeCount } */
+const repetitiveEscalation = new Map<string, EscalationEntry>();
+
+/** Patterns currently blocked (key -> reason snippet for error messages) */
+const blockedPatterns = new Map<string, string>();
+
+/** Total blocks enforced (for circuit breaker) */
+let totalBlocks = 0;
+
+/** Circuit breaker has tripped — no more auto-intervention */
+let circuitBreakerTripped = false;
+
+/** User chose "Stop" on circuit breaker — block all tool calls */
+let circuitBreakerHalted = false;
+
+/** Consecutive stall count */
+let stallCount = 0;
 
 // ── Helpers ──
 
@@ -62,27 +95,6 @@ export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${n}`;
-}
-
-/**
- * Check if a nudge key has been flagged and hasn't expired yet.
- * Prunes expired entries automatically.
- */
-export function isNudged(map: Map<string, number>, key: string): boolean {
-  const expires = map.get(key);
-  if (expires === undefined) return false;
-  if (Date.now() > expires) {
-    map.delete(key);
-    return false;
-  }
-  return true;
-}
-
-/**
- * Mark a nudge key with a time-to-live expiry.
- */
-export function markNudged(map: Map<string, number>, key: string, ttlMs: number): void {
-  map.set(key, Date.now() + ttlMs);
 }
 
 export function lastItemIsThinking(message: { content?: unknown[] }): boolean {
@@ -169,6 +181,61 @@ export function extractErrorFingerprint(result: any): string {
 }
 
 /**
+ * Handle circuit breaker: pause agent with a UI dialog, let user decide.
+ */
+async function handleCircuitBreaker(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): Promise<{ block?: boolean; reason?: string }> {
+  circuitBreakerTripped = true;
+
+  if (ctx.hasUI) {
+    ctx.ui.notify(`Gallop: circuit breaker — ${totalBlocks} blocks enforced. Pausing.`, "error");
+
+    const choice = await ctx.ui.select(
+      `⚠️ Gallop Circuit Breaker\n\n${totalBlocks} tool calls were blocked due to persistent failure/repetition loops.`,
+      ["Continue", "Stop"],
+    );
+
+    if (choice === "Stop") {
+      // Block all further tool calls — agent will halt and return to prompt
+      circuitBreakerHalted = true;
+      pi.sendUserMessage(
+        `[Gallop] Circuit breaker: agent halted by user. You can type a new message, or use /compact / /new.`,
+        { deliverAs: "steer" },
+      );
+      return { block: true, reason: `[Gallop] Circuit breaker: agent halted by user. Type a message or use /compact / /new.` };
+    }
+
+    // "Continue" — full reset, fresh Gallop state
+    blockedPatterns.clear();
+    failureEscalation.clear();
+    repetitiveEscalation.clear();
+    failureHistory.length = 0;
+    totalBlocks = 0;
+    stallCount = 0;
+    circuitBreakerTripped = false;
+    pi.sendUserMessage(
+      `[Gallop] Circuit breaker: blocks cleared by user. Continuing.`,
+      { deliverAs: "steer" },
+    );
+  } else {
+    // No UI — just step back
+    blockedPatterns.clear();
+    failureEscalation.clear();
+    repetitiveEscalation.clear();
+    circuitBreakerTripped = false;
+    pi.sendUserMessage(
+      `[Gallop] Circuit breaker: ${totalBlocks} blocks enforced. Stepping back (no UI).`,
+      { deliverAs: "steer" },
+    );
+  }
+
+  // Let this tool call through
+  return {};
+}
+
+/**
  * Prune failure history to keep only entries within the window.
  */
 export function pruneFailureHistory(
@@ -193,9 +260,15 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
 
   const a = args as Record<string, unknown>;
 
-  // read: fingerprint by path
+  // read: fingerprint by path + offset/limit
   if (toolName === "read") {
-    return (typeof a.path === "string" ? a.path : String(a.path ?? "")).replace(/\\/g, "/");
+    const path = (typeof a.path === "string" ? a.path : String(a.path ?? "")).replace(/\\/g, "/");
+    const offset = a.offset;
+    const limit = a.limit;
+    if (offset !== undefined || limit !== undefined) {
+      return `${path}:o=${offset ?? ""}:l=${limit ?? ""}`;
+    }
+    return path;
   }
 
   // bash: fingerprint by normalized command
@@ -213,7 +286,7 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
 
 /**
  * Check for repetitive consecutive tool calls.
- * Injects a steer nudge when threshold is hit.
+ * Escalates: nudge → nudge+ (stronger) → block (enforced in tool_call).
  */
 function checkRepetitiveCall(
   fingerprint: string,
@@ -221,20 +294,45 @@ function checkRepetitiveCall(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
 ): void {
-  if (count < REPETITIVE_CALL_THRESHOLD) return;
+  if (circuitBreakerTripped) return;
+  if (count < REPETITIVE_CALL_THRESHOLD) {
+    // Below threshold — reset escalation for this pattern
+    repetitiveEscalation.delete(fingerprint);
+    return;
+  }
 
-  // Avoid repeating the same nudge (TTL allows re-detection later)
-  if (isNudged(repetitiveNudgedKeys, fingerprint)) return;
+  // Get or create escalation entry
+  let entry = repetitiveEscalation.get(fingerprint);
+  if (!entry) {
+    entry = { level: "nudge", nudgeCount: 0 };
+    repetitiveEscalation.set(fingerprint, entry);
+  }
 
-  // Check cooldown
-  if (Date.now() < nudgeCooldownUntil) return;
+  // Determine current escalation level
+  let currentLevel: EscalationLevel;
+  if (count >= REPETITIVE_CALL_BLOCK) {
+    currentLevel = "block";
+  } else if (count >= REPETITIVE_CALL_NUDGE_PLUS) {
+    currentLevel = "nudge_plus";
+  } else {
+    currentLevel = "nudge";
+  }
 
-  // Parse tool name and arg summary from fingerprint
+  // Escalate if needed
+  const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
+  const targetIndex = ESCALATION_LEVELS.indexOf(currentLevel);
+  if (targetIndex <= currentIndex) return; // Already at or past target level
+
+  entry.level = currentLevel;
+  entry.nudgeCount++;
+
+  // Cooldown check (skip for block level — always escalate)
+  if (currentLevel !== "block" && Date.now() < repetitiveCallCooldownUntil) return;
+
+  // Parse tool name and arg summary
   const colonIndex = fingerprint.indexOf(":");
   const toolName = colonIndex > -1 ? fingerprint.slice(0, colonIndex) : fingerprint;
   const argSummary = colonIndex > -1 ? fingerprint.slice(colonIndex + 1) : "";
-
-  // Truncate long arg summaries for display
   const displayArg = argSummary.length > 80 ? argSummary.slice(0, 77) + "..." : argSummary;
 
   let hint = "";
@@ -246,23 +344,30 @@ function checkRepetitiveCall(
     hint = " Consider whether the result is already available in context.";
   }
 
-  const msg = `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
+  let msg: string;
+  if (currentLevel === "block") {
+    msg = `[Gallop] BLOCKED: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This pattern is now blocked. You MUST use a different tool or different arguments.${hint}`;
+  } else if (currentLevel === "nudge_plus") {
+    msg = `[Gallop] WARNING: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This has been flagged before. Stop repeating and try a different approach.${hint}`;
+  } else {
+    msg = `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
+  }
 
-  // Mark as nudged with TTL and set cooldown
-  markNudged(repetitiveNudgedKeys, fingerprint, NUDGE_COOLDOWN_MS);
-  nudgeCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
+  // Set cooldown for non-block levels
+  if (currentLevel !== "block") {
+    repetitiveCallCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
+  }
 
-  // Inject steer message
   pi.sendUserMessage(msg, { deliverAs: "steer" });
 
   if (ctx.hasUI) {
-    ctx.ui.notify(`Gallop: repetitive call detected (${count}x ${toolName})`, "warning");
+    ctx.ui.notify(`Gallop: ${currentLevel} — repetitive call (${count}x ${toolName})`, currentLevel === "block" ? "error" : "warning");
   }
 }
 
 /**
  * Check if the current failure pattern indicates a loop.
- * If so, inject a steer message to nudge the agent.
+ * Escalates: nudge → nudge+ (stronger warning) → block (enforced in tool_call).
  */
 function checkFailureLoop(
   normalized: string,
@@ -270,29 +375,54 @@ function checkFailureLoop(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
 ): void {
+  if (circuitBreakerTripped) return;
   // Count matching failures in the window
   const matches = failureHistory.filter(
     entry => entry.command === normalized && entry.fingerprint === fingerprint,
   );
-
-  if (matches.length < FAILURE_LOOP_THRESHOLD) return;
-
-  // Build a nudge key to avoid repeating the same nudge
-  const nudgeKey = `${normalized}:${fingerprint}`;
-  if (isNudged(nudgedKeys, nudgeKey)) return;
-
-  // Check cooldown
-  if (Date.now() < nudgeCooldownUntil) return;
-
-  // Extract the original command (first match's raw form for display)
   const matchCount = matches.length;
 
-  // Build helpful nudge message
+  if (matchCount < FAILURE_LOOP_THRESHOLD) {
+    // Below threshold — reset escalation
+    const nudgeKey = `${normalized}:${fingerprint}`;
+    failureEscalation.delete(nudgeKey);
+    return;
+  }
+
+  // Get or create escalation entry
+  const nudgeKey = `${normalized}:${fingerprint}`;
+  let entry = failureEscalation.get(nudgeKey);
+  if (!entry) {
+    entry = { level: "nudge", nudgeCount: 0 };
+    failureEscalation.set(nudgeKey, entry);
+  }
+
+  // Determine current escalation level
+  let currentLevel: EscalationLevel;
+  if (matchCount >= FAILURE_LOOP_BLOCK) {
+    currentLevel = "block";
+  } else if (matchCount >= FAILURE_LOOP_NUDGE_PLUS) {
+    currentLevel = "nudge_plus";
+  } else {
+    currentLevel = "nudge";
+  }
+
+  // Escalate if needed
+  const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
+  const targetIndex = ESCALATION_LEVELS.indexOf(currentLevel);
+  if (targetIndex <= currentIndex) return; // Already at or past target level
+
+  entry.level = currentLevel;
+  entry.nudgeCount++;
+
+  // Cooldown check (skip for block level — always escalate)
+  if (currentLevel !== "block" && Date.now() < failureLoopCooldownUntil) return;
+
+  // Build display snippets
   const shortCommand = normalized.length > 80 ? normalized.slice(0, 77) + "..." : normalized;
   const errorSnippet = fingerprint.length > 60 ? fingerprint.slice(0, 57) + "..." : fingerprint;
 
   let hint = "";
-  // Generate contextual hints based on error patterns
   if (fingerprint.includes("enoent") || fingerprint.includes("command not found") || fingerprint.includes("not found")) {
     hint = " The command or a dependency may not exist in the current working directory. Consider checking the working directory or using absolute paths.";
   } else if (fingerprint.includes("permission") || fingerprint.includes("eacces")) {
@@ -305,17 +435,25 @@ function checkFailureLoop(
     hint = " Consider checking the working directory, command syntax, or prerequisites.";
   }
 
-  const msg = `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
+  let msg: string;
+  if (currentLevel === "block") {
+    msg = `[Gallop] BLOCKED: This command has failed ${matchCount} times with the same error ("${errorSnippet}"). Further retries are blocked. You MUST try a fundamentally different approach. Command: \`${shortCommand}\`${hint}`;
+    blockedPatterns.set(normalized, errorSnippet);
+  } else if (currentLevel === "nudge_plus") {
+    msg = `[Gallop] WARNING: This command has failed ${matchCount} times with the same error ("${errorSnippet}"). A previous nudge was ignored. Stop retrying and change strategy. Command: \`${shortCommand}\`${hint}`;
+  } else {
+    msg = `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
+  }
 
-  // Mark as nudged with TTL and set cooldown
-  markNudged(nudgedKeys, nudgeKey, NUDGE_COOLDOWN_MS);
-  nudgeCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
+  // Set cooldown for non-block levels
+  if (currentLevel !== "block") {
+    failureLoopCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
+  }
 
-  // Inject steer message
   pi.sendUserMessage(msg, { deliverAs: "steer" });
 
   if (ctx.hasUI) {
-    ctx.ui.notify(`Gallop: failure loop detected (${matchCount} retries)`, "warning");
+    ctx.ui.notify(`Gallop: ${currentLevel} — failure loop (${matchCount} failures)`, currentLevel === "block" ? "error" : "warning");
   }
 }
 
@@ -381,13 +519,21 @@ export default function gallopExtension(pi: ExtensionAPI) {
     // Reset failure-loop detection
     pendingCommands.clear();
     failureHistory.length = 0;
-    nudgedKeys.clear();
+    failureEscalation.clear();
     currentTurnIndex = 0;
-    nudgeCooldownUntil = 0;
+    failureLoopCooldownUntil = 0;
+    repetitiveCallCooldownUntil = 0;
 
     // Reset repetitive-call detection
     repetitiveCallState = null;
-    repetitiveNudgedKeys.clear();
+    repetitiveEscalation.clear();
+
+    // Reset escalation state
+    blockedPatterns.clear();
+    totalBlocks = 0;
+    circuitBreakerTripped = false;
+    circuitBreakerHalted = false;
+    stallCount = 0;
   });
 
   // ── Before agent start: inject context usage ──
@@ -428,6 +574,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant" || !sawAssistantMessage) return;
+    // Circuit breaker tripped — no more stall intervention
+    if (circuitBreakerTripped) return;
     sawAssistantMessage = false;
 
     if (lastItemIsThinking(event.message) || lastItemIsToolUse(event.message)) {
@@ -440,9 +588,32 @@ export default function gallopExtension(pi: ExtensionAPI) {
       if (Date.now() < cooldownUntil) return;
       cooldownUntil = Date.now() + 10_000;
 
+      stallCount++;
       const reason = lastItemIsThinking(event.message)
         ? "stopped mid-thought"
         : "stopped after tool call";
+
+      // Escalate based on consecutive stall count
+      if (stallCount >= STALL_STOP) {
+        // Stop sending resumes — context is likely corrupted
+        const msg = `[Gallop] Agent has stalled ${stallCount} times consecutively. Stopping auto-resume to prevent infinite loop. Please try /new, /compact, or change the prompt.`;
+        pi.sendUserMessage(msg, { deliverAs: "steer" });
+
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Gallop: stall loop stopped (${stallCount} stalls)`, "error");
+        }
+        return;
+      }
+
+      if (stallCount >= STALL_WARN) {
+        const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason}). This is stall #${stallCount} — if generation keeps stopping, consider compacting or restarting.`;
+        pi.sendUserMessage(msg, { deliverAs: "steer" });
+
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Gallop: repeated stall #${stallCount} (${reason})`, "warning");
+        }
+        return;
+      }
 
       const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason})`;
       pi.sendUserMessage(msg, { deliverAs: "steer" });
@@ -450,6 +621,9 @@ export default function gallopExtension(pi: ExtensionAPI) {
       if (ctx.hasUI) {
         ctx.ui.notify(`Gallop: ${reason} (stopReason: ${stopReason})`, "info");
       }
+    } else {
+      // Non-stall message — reset stall counter
+      stallCount = 0;
     }
   });
 
@@ -457,6 +631,67 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   pi.on("turn_start", async (event: { turnIndex: number }) => {
     currentTurnIndex = event.turnIndex;
+  });
+
+  // ── Tool call interceptor: enforce blocks ──
+
+  pi.on("tool_call", async (event, ctx) => {
+    // User halted via circuit breaker — block everything
+    if (circuitBreakerHalted) {
+      return { block: true, reason: `[Gallop] Agent halted by user (circuit breaker). Type a message or use /compact / /new.` };
+    }
+    // Circuit breaker tripped — no more auto-intervention
+    if (circuitBreakerTripped) return;
+
+    // Check failure-loop blocks (bash commands)
+    if (blockedPatterns.size > 0 && event.toolName === "bash") {
+      const command = (event.input as any)?.command;
+      if (typeof command === "string") {
+        const normalized = normalizeCommand(command);
+        const reason = blockedPatterns.get(normalized);
+        if (reason) {
+          totalBlocks++;
+
+          // Circuit breaker: too many blocks total — pause and let user decide
+          if (totalBlocks >= CIRCUIT_BREAKER_BLOCKS) {
+            return handleCircuitBreaker(ctx, pi);
+          }
+
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Gallop: blocked command ("${reason.slice(0, 50)}")`, "error");
+          }
+          return { block: true, reason: `[Gallop] Blocked: This command has been retried too many times with error "${reason}". Try a fundamentally different approach.` };
+        }
+      }
+    }
+
+    // Check repetitive-call blocks (all tools)
+    if (repetitiveEscalation.size > 0) {
+      const args = (event as any).input as Record<string, unknown> | undefined;
+      const argFingerprint = normalizeToolArgs(event.toolName, args);
+      const callFingerprint = `${event.toolName}:${argFingerprint}`;
+
+      const repEntry = repetitiveEscalation.get(callFingerprint);
+      if (repEntry && repEntry.level === "block") {
+        totalBlocks++;
+
+        // Circuit breaker
+        if (totalBlocks >= CIRCUIT_BREAKER_BLOCKS) {
+          return handleCircuitBreaker(ctx, pi);
+        }
+
+        const colonIndex = callFingerprint.indexOf(":");
+        const toolName = colonIndex > -1 ? callFingerprint.slice(0, colonIndex) : event.toolName;
+        const displayArg = (colonIndex > -1 ? callFingerprint.slice(colonIndex + 1) : "").length > 60
+          ? (colonIndex > -1 ? callFingerprint.slice(colonIndex + 1) : "").slice(0, 57) + "..."
+          : (colonIndex > -1 ? callFingerprint.slice(colonIndex + 1) : "");
+
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Gallop: blocked repetitive call (${toolName})`, "error");
+        }
+        return { block: true, reason: `[Gallop] Blocked: You've called ${toolName} too many times with the same arguments (${displayArg}). Use a different tool or arguments.` };
+      }
+    }
   });
 
   // ── Failure-loop detection ──
@@ -494,8 +729,10 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
       if (rawCommand) {
         if (!event.isError) {
-          // Successful execution — reset failure history to avoid stale detections
+          // Successful execution — reset failure history and escalation to avoid stale detections
           failureHistory.length = 0;
+          failureEscalation.clear();
+          blockedPatterns.clear();
         } else {
           // Normalize the command for comparison
           const normalized = normalizeCommand(rawCommand);
@@ -508,7 +745,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
             command: normalized,
             fingerprint,
             turnIndex: currentTurnIndex,
-            timestamp: Date.now(),
           });
 
           // Prune old entries outside the window
@@ -557,11 +793,19 @@ export default function gallopExtension(pi: ExtensionAPI) {
     }
     // Reset failure-loop detection after compaction to avoid stale state
     failureHistory.length = 0;
-    nudgedKeys.clear();
-    nudgeCooldownUntil = 0;
+    failureEscalation.clear();
+    failureLoopCooldownUntil = 0;
+    repetitiveCallCooldownUntil = 0;
 
     // Reset repetitive-call detection after compaction
     repetitiveCallState = null;
-    repetitiveNudgedKeys.clear();
+    repetitiveEscalation.clear();
+
+    // Reset escalation state after compaction
+    blockedPatterns.clear();
+    totalBlocks = 0;
+    circuitBreakerTripped = false;
+    circuitBreakerHalted = false;
+    stallCount = 0;
   });
 }
