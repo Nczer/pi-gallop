@@ -33,8 +33,8 @@ const failureHistory: {
   timestamp: number;
 }[] = [];
 
-/** Track which command+error combos we've already nudged about */
-const nudgedKeys = new Set<string>();
+/** Track which command+error combos we've already nudged about (key -> expiry timestamp) */
+const nudgedKeys = new Map<string, number>();
 
 // ── Repetitive-call detection state ──
 
@@ -44,8 +44,8 @@ let repetitiveCallState: {
   count: number;
 } | null = null;
 
-/** Repetitive-call patterns we've already nudged about */
-const repetitiveNudgedKeys = new Set<string>();
+/** Repetitive-call patterns we've already nudged about (key -> expiry timestamp) */
+const repetitiveNudgedKeys = new Map<string, number>();
 
 // Thresholds
 const FAILURE_LOOP_THRESHOLD = 3;     // N identical failures before nudging
@@ -58,19 +58,40 @@ let nudgeCooldownUntil = 0;
 
 // ── Helpers ──
 
-function formatTokens(n: number): string {
+export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${n}`;
 }
 
-function lastItemIsThinking(message: { content?: unknown[] }): boolean {
+/**
+ * Check if a nudge key has been flagged and hasn't expired yet.
+ * Prunes expired entries automatically.
+ */
+export function isNudged(map: Map<string, number>, key: string): boolean {
+  const expires = map.get(key);
+  if (expires === undefined) return false;
+  if (Date.now() > expires) {
+    map.delete(key);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Mark a nudge key with a time-to-live expiry.
+ */
+export function markNudged(map: Map<string, number>, key: string, ttlMs: number): void {
+  map.set(key, Date.now() + ttlMs);
+}
+
+export function lastItemIsThinking(message: { content?: unknown[] }): boolean {
   if (!message.content || !Array.isArray(message.content) || message.content.length === 0) return false;
   const last = message.content[message.content.length - 1];
   return typeof last === "object" && last !== null && (last as any).type === "thinking";
 }
 
-function lastItemIsToolUse(message: { content?: unknown[] }): boolean {
+export function lastItemIsToolUse(message: { content?: unknown[] }): boolean {
   if (!message.content || !Array.isArray(message.content) || message.content.length === 0) return false;
   const last = message.content[message.content.length - 1];
   return typeof last === "object" && last !== null && (last as any).type === "tool_use";
@@ -104,7 +125,7 @@ function triggerCompaction(
  * Normalize a command string for comparison.
  * Collapses whitespace, trims, and lowercases for fuzzy matching.
  */
-function normalizeCommand(command: string): string {
+export function normalizeCommand(command: string): string {
   return command
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
@@ -120,7 +141,7 @@ function normalizeCommand(command: string): string {
  * Extract an error fingerprint from tool result content.
  * Uses the last meaningful error line (trimmed, lowercased) as a fingerprint.
  */
-function extractErrorFingerprint(result: any): string {
+export function extractErrorFingerprint(result: any): string {
   if (!result) return "unknown";
 
   // Try to get text content from result
@@ -150,8 +171,12 @@ function extractErrorFingerprint(result: any): string {
 /**
  * Prune failure history to keep only entries within the window.
  */
-function pruneFailureHistory(): void {
-  const cutoff = currentTurnIndex - FAILURE_WINDOW_TURNS;
+export function pruneFailureHistory(
+  failureHistory: { turnIndex: number }[],
+  currentTurnIndex: number,
+  windowTurns: number,
+): void {
+  const cutoff = currentTurnIndex - windowTurns;
   while (failureHistory.length > 0 && failureHistory[0].turnIndex < cutoff) {
     failureHistory.shift();
   }
@@ -163,7 +188,7 @@ function pruneFailureHistory(): void {
  * Normalize tool arguments into a stable fingerprint string.
  * For read: just the path. For bash: the command. For others: JSON of args.
  */
-function normalizeToolArgs(toolName: string, args: unknown): string {
+export function normalizeToolArgs(toolName: string, args: unknown): string {
   if (!args || typeof args !== "object") return "{}";
 
   const a = args as Record<string, unknown>;
@@ -198,8 +223,8 @@ function checkRepetitiveCall(
 ): void {
   if (count < REPETITIVE_CALL_THRESHOLD) return;
 
-  // Avoid repeating the same nudge
-  if (repetitiveNudgedKeys.has(fingerprint)) return;
+  // Avoid repeating the same nudge (TTL allows re-detection later)
+  if (isNudged(repetitiveNudgedKeys, fingerprint)) return;
 
   // Check cooldown
   if (Date.now() < nudgeCooldownUntil) return;
@@ -223,8 +248,8 @@ function checkRepetitiveCall(
 
   const msg = `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
 
-  // Mark as nudged and set cooldown
-  repetitiveNudgedKeys.add(fingerprint);
+  // Mark as nudged with TTL and set cooldown
+  markNudged(repetitiveNudgedKeys, fingerprint, NUDGE_COOLDOWN_MS);
   nudgeCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
 
   // Inject steer message
@@ -254,7 +279,7 @@ function checkFailureLoop(
 
   // Build a nudge key to avoid repeating the same nudge
   const nudgeKey = `${normalized}:${fingerprint}`;
-  if (nudgedKeys.has(nudgeKey)) return;
+  if (isNudged(nudgedKeys, nudgeKey)) return;
 
   // Check cooldown
   if (Date.now() < nudgeCooldownUntil) return;
@@ -282,8 +307,8 @@ function checkFailureLoop(
 
   const msg = `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
 
-  // Mark as nudged and set cooldown
-  nudgedKeys.add(nudgeKey);
+  // Mark as nudged with TTL and set cooldown
+  markNudged(nudgedKeys, nudgeKey, NUDGE_COOLDOWN_MS);
   nudgeCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
 
   // Inject steer message
@@ -471,7 +496,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
         if (!event.isError) {
           // Successful execution — reset failure history to avoid stale detections
           failureHistory.length = 0;
-          nudgedKeys.clear();
         } else {
           // Normalize the command for comparison
           const normalized = normalizeCommand(rawCommand);
@@ -488,7 +512,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
           });
 
           // Prune old entries outside the window
-          pruneFailureHistory();
+          pruneFailureHistory(failureHistory, currentTurnIndex, FAILURE_WINDOW_TURNS);
 
           // Check for failure loop
           checkFailureLoop(normalized, fingerprint, ctx, pi);
@@ -496,9 +520,10 @@ export default function gallopExtension(pi: ExtensionAPI) {
       }
     }
 
-    // ── Repetitive-call detection (new) ──
-
-    if (repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
+    // ── Repetitive-call detection ──
+    // Skip when bash just failed — failure-loop handler already covered it
+    if (!(event.toolName === "bash" && event.isError) &&
+        repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
       checkRepetitiveCall(repetitiveCallState.fingerprint, repetitiveCallState.count, pi, ctx);
     }
   });
