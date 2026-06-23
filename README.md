@@ -20,7 +20,7 @@ Tracks bash commands that fail repeatedly with the same error. When a command fa
 - Normalizes commands (whitespace, case) for fuzzy matching
 - Fingerprints errors by last meaningful line
 - Provides hints for common patterns: ENOENT, permission denied, package managers, syntax errors
-- 30s cooldown per command+error combo to avoid spam
+- 30s cooldown per command+error combo to avoid spam; nudges expire after cooldown so stale patterns can be re-detected
 - Sends `[Gallop] Failure loop detected: <details>` as steer message
 
 ### Repetitive-Call Detection
@@ -31,7 +31,8 @@ Tracks consecutive tool calls with identical arguments across **all tools**. Whe
 - `bash` — fingerprints by normalized command; hints to use output or move on
 - Other tools — fingerprints by sorted JSON of args
 - Resets counter on any different call
-- 30s cooldown per fingerprint to avoid spam
+- 30s cooldown per fingerprint to avoid spam; nudges expire after cooldown so patterns can be re-detected
+- Skips bash errors (failure-loop handler already covers them)
 - Sends `[Gallop] Repetitive action detected: <details>` as steer message
 
 ### Compaction + Resume
