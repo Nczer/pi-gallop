@@ -112,15 +112,25 @@ const ERROR_ACK_KEYWORDS = [
 
 // ── Binary detection ──
 
+/** Result from binary content detection */
+interface BinaryDetectionResult {
+  binary: boolean;
+  reason: string;       // e.g. "contains null bytes" or "6.2% non-printable characters"
+  nonPrintablePct: number;
+}
+
 /**
  * Detect binary content in bash output.
  * Checks for null bytes and high ratio of non-printable characters.
+ * Returns a result with detection reason for use in suppression messages.
  */
-export function isBinaryContent(text: string): boolean {
-  if (!text.length) return false;
+export function detectBinaryContent(text: string): BinaryDetectionResult {
+  if (!text.length) return { binary: false, reason: "", nonPrintablePct: 0 };
 
   // Any null byte = binary
-  if (text.includes("\0")) return true;
+  if (text.includes("\0")) {
+    return { binary: true, reason: "contains null bytes", nonPrintablePct: 0 };
+  }
 
   // Count non-printable bytes (excluding normal whitespace \n \r \t)
   let nonPrintable = 0;
@@ -136,8 +146,17 @@ export function isBinaryContent(text: string): boolean {
     }
   }
 
-  // >5% non-printable = binary
-  return (nonPrintable / text.length) > 0.05;
+  const pct = nonPrintable / text.length;
+  if (pct > 0.05) {
+    return { binary: true, reason: `${(pct * 100).toFixed(1)}% non-printable characters`, nonPrintablePct: pct };
+  }
+
+  return { binary: false, reason: "", nonPrintablePct: pct };
+}
+
+/** @deprecated Use detectBinaryContent() for result with reason */
+export function isBinaryContent(text: string): boolean {
+  return detectBinaryContent(text).binary;
 }
 
 // ── Helpers ──
@@ -259,13 +278,7 @@ async function handleCircuitBreaker(
     }
 
     // "Continue" — full reset, fresh Gallop state
-    blockedPatterns.clear();
-    failureEscalation.clear();
-    repetitiveEscalation.clear();
-    failureHistory.length = 0;
-    totalBlocks = 0;
-    stallCount = 0;
-    circuitBreakerTripped = false;
+    resetAllState();
     pi.sendUserMessage(
       `[Gallop] Circuit breaker: blocks cleared by user. Continuing.`,
       { deliverAs: "steer" },
@@ -284,6 +297,37 @@ async function handleCircuitBreaker(
 
   // Let this tool call through
   return {};
+}
+
+/**
+ * Reset all Gallop state. Called on session start, compaction, and circuit breaker continue.
+ */
+function resetAllState(): void {
+  cooldownUntil = 0;
+  sawAssistantMessage = false;
+  compactRequested = false;
+  pendingTask = null;
+  customCompactInstructions = null;
+  lastReportedPct = null;
+
+  pendingCommands.clear();
+  failureHistory.length = 0;
+  failureEscalation.clear();
+  currentTurnIndex = 0;
+  failureLoopCooldownUntil = 0;
+  repetitiveCallCooldownUntil = 0;
+
+  repetitiveCallState = null;
+  repetitiveEscalation.clear();
+
+  blockedPatterns.clear();
+  totalBlocks = 0;
+  circuitBreakerTripped = false;
+  circuitBreakerHalted = false;
+  stallCount = 0;
+
+  lastFailedToolCall = null;
+  llmAcknowledgedError = false;
 }
 
 /**
@@ -342,6 +386,70 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
 }
 
 /**
+ * Shared escalation engine.
+ * Manages level transitions (nudge → nudge_plus → block), cooldowns,
+ * and message delivery. Callers provide a message builder for their context.
+ */
+function escalate(
+  fingerprint: string,
+  count: number,
+  threshold: number,
+  nudgePlusThreshold: number,
+  blockThreshold: number,
+  escalationMap: Map<string, EscalationEntry>,
+  cooldownUntil: number,
+  setCooldownUntil: (ms: number) => void,
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  buildMessage: (level: EscalationLevel) => string,
+  uiLabel: string,
+): void {
+  if (circuitBreakerTripped) return;
+  if (count < threshold) {
+    escalationMap.delete(fingerprint);
+    return;
+  }
+
+  let entry = escalationMap.get(fingerprint);
+  if (!entry) {
+    entry = { level: "nudge", nudgeCount: 0 };
+    escalationMap.set(fingerprint, entry);
+  }
+
+  let targetLevel: EscalationLevel;
+  if (count >= blockThreshold) {
+    targetLevel = "block";
+  } else if (count >= nudgePlusThreshold) {
+    targetLevel = "nudge_plus";
+  } else {
+    targetLevel = "nudge";
+  }
+
+  const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
+  const targetIndex = ESCALATION_LEVELS.indexOf(targetLevel);
+  if (targetIndex <= currentIndex) return;
+
+  const escalated = targetIndex > currentIndex;
+  entry.level = targetLevel;
+  entry.nudgeCount++;
+
+  if (!escalated && targetLevel !== "block" && Date.now() < cooldownUntil) return;
+
+  const msg = buildMessage(targetLevel);
+  if (msg) {
+    pi.sendUserMessage(msg, { deliverAs: "steer" });
+  }
+
+  if (targetLevel !== "block") {
+    setCooldownUntil(Date.now() + NUDGE_COOLDOWN_MS);
+  }
+
+  if (ctx.hasUI) {
+    ctx.ui.notify(`Gallop: ${targetLevel} — ${uiLabel}`, targetLevel === "block" ? "error" : "warning");
+  }
+}
+
+/**
  * Check for repetitive consecutive tool calls.
  * Escalates: nudge → nudge+ (stronger) → block (enforced in tool_call).
  */
@@ -351,43 +459,6 @@ function checkRepetitiveCall(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
 ): void {
-  if (circuitBreakerTripped) return;
-  if (count < REPETITIVE_CALL_THRESHOLD) {
-    // Below threshold — reset escalation for this pattern
-    repetitiveEscalation.delete(fingerprint);
-    return;
-  }
-
-  // Get or create escalation entry
-  let entry = repetitiveEscalation.get(fingerprint);
-  if (!entry) {
-    entry = { level: "nudge", nudgeCount: 0 };
-    repetitiveEscalation.set(fingerprint, entry);
-  }
-
-  // Determine current escalation level
-  let currentLevel: EscalationLevel;
-  if (count >= REPETITIVE_CALL_BLOCK) {
-    currentLevel = "block";
-  } else if (count >= REPETITIVE_CALL_NUDGE_PLUS) {
-    currentLevel = "nudge_plus";
-  } else {
-    currentLevel = "nudge";
-  }
-
-  // Escalate if needed
-  const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
-  const targetIndex = ESCALATION_LEVELS.indexOf(currentLevel);
-  if (targetIndex <= currentIndex) return; // Already at or past target level
-
-  const escalated = targetIndex > currentIndex;
-  entry.level = currentLevel;
-  entry.nudgeCount++;
-
-  // Cooldown check — skip when escalating to a new level or at block
-  if (!escalated && currentLevel !== "block" && Date.now() < repetitiveCallCooldownUntil) return;
-
-  // Parse tool name and arg summary
   const colonIndex = fingerprint.indexOf(":");
   const toolName = colonIndex > -1 ? fingerprint.slice(0, colonIndex) : fingerprint;
   const argSummary = colonIndex > -1 ? fingerprint.slice(colonIndex + 1) : "";
@@ -402,25 +473,24 @@ function checkRepetitiveCall(
     hint = " Consider whether the result is already available in context.";
   }
 
-  let msg: string;
-  if (currentLevel === "block") {
-    msg = `[Gallop] BLOCKED: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This pattern is now blocked. You MUST use a different tool or different arguments.${hint}`;
-  } else if (currentLevel === "nudge_plus") {
-    msg = `[Gallop] WARNING: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This has been flagged before. Stop repeating and try a different approach.${hint}`;
-  } else {
-    msg = `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
-  }
-
-  // Set cooldown for non-block levels
-  if (currentLevel !== "block") {
-    repetitiveCallCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
-  }
-
-  pi.sendUserMessage(msg, { deliverAs: "steer" });
-
-  if (ctx.hasUI) {
-    ctx.ui.notify(`Gallop: ${currentLevel} — repetitive call (${count}x ${toolName})`, currentLevel === "block" ? "error" : "warning");
-  }
+  escalate(
+    fingerprint, count,
+    REPETITIVE_CALL_THRESHOLD, REPETITIVE_CALL_NUDGE_PLUS, REPETITIVE_CALL_BLOCK,
+    repetitiveEscalation,
+    repetitiveCallCooldownUntil,
+    (ms) => { repetitiveCallCooldownUntil = ms; },
+    ctx, pi,
+    (level) => {
+      if (level === "block") {
+        return `[Gallop] BLOCKED: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This pattern is now blocked. You MUST use a different tool or different arguments.${hint}`;
+      }
+      if (level === "nudge_plus") {
+        return `[Gallop] WARNING: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This has been flagged before. Stop repeating and try a different approach.${hint}`;
+      }
+      return `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
+    },
+    `repetitive call (${count}x ${toolName})`,
+  );
 }
 
 /**
@@ -433,51 +503,12 @@ function checkFailureLoop(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
 ): void {
-  if (circuitBreakerTripped) return;
-  // Count matching failures in the window
   const matches = failureHistory.filter(
     entry => entry.command === normalized && entry.fingerprint === fingerprint,
   );
   const matchCount = matches.length;
 
-  if (matchCount < FAILURE_LOOP_THRESHOLD) {
-    // Below threshold — reset escalation
-    const nudgeKey = `${normalized}:${fingerprint}`;
-    failureEscalation.delete(nudgeKey);
-    return;
-  }
-
-  // Get or create escalation entry
   const nudgeKey = `${normalized}:${fingerprint}`;
-  let entry = failureEscalation.get(nudgeKey);
-  if (!entry) {
-    entry = { level: "nudge", nudgeCount: 0 };
-    failureEscalation.set(nudgeKey, entry);
-  }
-
-  // Determine current escalation level
-  let currentLevel: EscalationLevel;
-  if (matchCount >= FAILURE_LOOP_BLOCK) {
-    currentLevel = "block";
-  } else if (matchCount >= FAILURE_LOOP_NUDGE_PLUS) {
-    currentLevel = "nudge_plus";
-  } else {
-    currentLevel = "nudge";
-  }
-
-  // Escalate if needed
-  const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
-  const targetIndex = ESCALATION_LEVELS.indexOf(currentLevel);
-  if (targetIndex <= currentIndex) return; // Already at or past target level
-
-  const escalated = targetIndex > currentIndex;
-  entry.level = currentLevel;
-  entry.nudgeCount++;
-
-  // Cooldown check — skip when escalating to a new level or at block
-  if (!escalated && currentLevel !== "block" && Date.now() < failureLoopCooldownUntil) return;
-
-  // Build display snippets
   const shortCommand = normalized.length > 80 ? normalized.slice(0, 77) + "..." : normalized;
   const errorSnippet = fingerprint.length > 60 ? fingerprint.slice(0, 57) + "..." : fingerprint;
 
@@ -494,26 +525,25 @@ function checkFailureLoop(
     hint = " Consider checking the working directory, command syntax, or prerequisites.";
   }
 
-  let msg: string;
-  if (currentLevel === "block") {
-    msg = `[Gallop] BLOCKED: This command has failed ${matchCount} times with the same error ("${errorSnippet}"). Further retries are blocked. You MUST try a fundamentally different approach. Command: \`${shortCommand}\`${hint}`;
-    blockedPatterns.set(normalized, errorSnippet);
-  } else if (currentLevel === "nudge_plus") {
-    msg = `[Gallop] WARNING: This command has failed ${matchCount} times with the same error ("${errorSnippet}"). A previous nudge was ignored. Stop retrying and change strategy. Command: \`${shortCommand}\`${hint}`;
-  } else {
-    msg = `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
-  }
-
-  // Set cooldown for non-block levels
-  if (currentLevel !== "block") {
-    failureLoopCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
-  }
-
-  pi.sendUserMessage(msg, { deliverAs: "steer" });
-
-  if (ctx.hasUI) {
-    ctx.ui.notify(`Gallop: ${currentLevel} — failure loop (${matchCount} failures)`, currentLevel === "block" ? "error" : "warning");
-  }
+  escalate(
+    nudgeKey, matchCount,
+    FAILURE_LOOP_THRESHOLD, FAILURE_LOOP_NUDGE_PLUS, FAILURE_LOOP_BLOCK,
+    failureEscalation,
+    failureLoopCooldownUntil,
+    (ms) => { failureLoopCooldownUntil = ms; },
+    ctx, pi,
+    (level) => {
+      if (level === "block") {
+        blockedPatterns.set(normalized, errorSnippet);
+        return `[Gallop] BLOCKED: This command has failed ${matchCount} times with the same error ("${errorSnippet}"). Further retries are blocked. You MUST try a fundamentally different approach. Command: \`${shortCommand}\`${hint}`;
+      }
+      if (level === "nudge_plus") {
+        return `[Gallop] WARNING: This command has failed ${matchCount} times with the same error ("${errorSnippet}"). A previous nudge was ignored. Stop retrying and change strategy. Command: \`${shortCommand}\`${hint}`;
+      }
+      return `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
+    },
+    `failure loop (${matchCount} failures)`,
+  );
 }
 
 // ── Main extension ──
@@ -568,35 +598,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // ── Session lifecycle ──
 
   pi.on("session_start", async (_event, _ctx) => {
-    cooldownUntil = 0;
-    sawAssistantMessage = false;
-    compactRequested = false;
-    pendingTask = null;
-    customCompactInstructions = null;
-    lastReportedPct = null;
-
-    // Reset failure-loop detection
-    pendingCommands.clear();
-    failureHistory.length = 0;
-    failureEscalation.clear();
-    currentTurnIndex = 0;
-    failureLoopCooldownUntil = 0;
-    repetitiveCallCooldownUntil = 0;
-
-    // Reset repetitive-call detection
-    repetitiveCallState = null;
-    repetitiveEscalation.clear();
-
-    // Reset escalation state
-    blockedPatterns.clear();
-    totalBlocks = 0;
-    circuitBreakerTripped = false;
-    circuitBreakerHalted = false;
-    stallCount = 0;
-
-    // Reset mismatch detection
-    lastFailedToolCall = null;
-    llmAcknowledgedError = false;
+    resetAllState();
   });
 
   // ── Before agent start: inject context usage ──
@@ -814,7 +816,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
     if (!fullText.length) return;
 
-    if (isBinaryContent(fullText)) {
+    const detection = detectBinaryContent(fullText);
+    if (detection.binary) {
       const bytes = new TextEncoder().encode(fullText).length;
       const command = (event.input as any)?.command;
       const shortCommand = typeof command === "string"
@@ -822,25 +825,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
           ? command.split("\n")[0].trim().slice(0, 77) + "..."
           : command.split("\n")[0].trim()
         : "<unknown>";
-
-      // Detect reason for binary flag
-      let reason = "";
-      if (fullText.includes("\0")) {
-        reason = "contains null bytes";
-      } else {
-        let nonPrintable = 0;
-        for (let i = 0; i < fullText.length; i++) {
-          const code = fullText.charCodeAt(i);
-          if ((code >= 0x00 && code <= 0x08) ||
-              code === 0x0B || code === 0x0C ||
-              (code >= 0x0E && code <= 0x1F) ||
-              code === 0x7F) {
-            nonPrintable++;
-          }
-        }
-        const pct = ((nonPrintable / fullText.length) * 100).toFixed(1);
-        reason = `${pct}% non-printable characters`;
-      }
 
       // Hex dump of first 64 bytes for debugging (safe ASCII only)
       const rawBytes = new TextEncoder().encode(fullText);
@@ -852,7 +836,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${reason})\nCommand: \`${shortCommand}\`\nHead (hex): ${hexHead}\nBinary content is hidden to protect context. The output was not sent to the model.`,
+          text: `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${detection.reason})\nCommand: \`${shortCommand}\`\nHead (hex): ${hexHead}\nBinary content is hidden to protect context. The output was not sent to the model.`,
         }],
       };
     }
@@ -970,25 +954,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     if (ctx.hasUI) {
       ctx.ui.setStatus("compact", undefined);
     }
-    // Reset failure-loop detection after compaction to avoid stale state
-    failureHistory.length = 0;
-    failureEscalation.clear();
-    failureLoopCooldownUntil = 0;
-    repetitiveCallCooldownUntil = 0;
-
-    // Reset repetitive-call detection after compaction
-    repetitiveCallState = null;
-    repetitiveEscalation.clear();
-
-    // Reset escalation state after compaction
-    blockedPatterns.clear();
-    totalBlocks = 0;
-    circuitBreakerTripped = false;
-    circuitBreakerHalted = false;
-    stallCount = 0;
-
-    // Reset mismatch detection after compaction
-    lastFailedToolCall = null;
-    llmAcknowledgedError = false;
+    // Reset all Gallop state after compaction to avoid stale state
+    resetAllState();
   });
 }
