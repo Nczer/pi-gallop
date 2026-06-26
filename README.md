@@ -36,18 +36,17 @@ Tracks bash commands that fail repeatedly with the same error. When a command fa
 - Normalizes commands (whitespace, case) for fuzzy matching
 - Fingerprints errors by last meaningful line
 - Provides hints for common patterns: ENOENT, permission denied, package managers, syntax errors
-- 30s cooldown per command+error combo to avoid spam; nudges expire after cooldown so stale patterns can be re-detected
 - Sends `[Gallop] Failure loop detected: <details>` as steer message
 
 #### Failure-Loop Escalation
 
-Repeated failures escalate from suggestion to hard block:
+Repeated failures escalate from suggestion to hard block. If a nudge is ignored (same command fails again), it escalates immediately:
 
 | Failures | Level | Action |
 |----------|-------|--------|
-| 3–4 | **Nudge** | Suggest changing strategy with contextual hints |
-| 5–6 | **Nudge+** | Stronger warning that previous nudge was ignored |
-| 7+ | **Block** | Hard-block further retries via `tool_call` interceptor; LLM must use a different command |
+| 3 | **Nudge** | Suggest changing strategy with contextual hints |
+| 4 | **Nudge+** | Stronger warning that previous nudge was ignored |
+| 5+ | **Block** | Hard-block further retries via `tool_call` interceptor; LLM must use a different command |
 
 Successful command execution resets all failure-loop state.
 
@@ -59,27 +58,38 @@ Tracks consecutive tool calls with identical arguments across **all tools**. Whe
 - `bash` — fingerprints by normalized command; hints to use output or move on
 - Other tools — fingerprints by sorted JSON of args
 - Resets counter on any different call
-- 30s cooldown per fingerprint to avoid spam; nudges expire after cooldown so patterns can be re-detected
 - Skips bash errors (failure-loop handler already covers them)
 - Sends `[Gallop] Repetitive action detected: <details>` as steer message
 
 #### Repetitive-Call Escalation
 
+If a nudge is ignored (same call repeats again), it escalates immediately:
+
 | Calls | Level | Action |
 |-------|-------|--------|
-| 3–4 | **Nudge** | Suggest analyzing existing output or moving on |
-| 5–6 | **Nudge+** | Stronger warning to stop repeating |
-| 7+ | **Block** | Hard-block identical calls via `tool_call` interceptor |
+| 3 | **Nudge** | Suggest analyzing existing output or moving on |
+| 4 | **Nudge+** | Stronger warning to stop repeating |
+| 5+ | **Block** | Hard-block identical calls via `tool_call` interceptor |
 
 ### Circuit Breaker
 
 A global circuit breaker prevents total doom loops when multiple patterns are blocked:
 
 - Tracks total blocks enforced across all detectors
-- After **5 total blocks**, Gallop **pauses the agent** with a dialog:
+- After **3 total blocks**, Gallop **pauses the agent** with a dialog:
   - **Continue** — clears all blocks, lets the agent try again
   - **Stop** — blocks all tool calls, halts the agent, returns to your prompt
 - After Stop, you're in control: type a new message, or use `/new` / `/compact` / change model
+
+### Reasoning-Action Mismatch
+
+Detects when the LLM acknowledges an error in its thinking but then calls the same tool that just failed. Catches the gap between what the model says and what it does.
+
+- After any tool call fails, records the fingerprint (tool + args + error)
+- On the next `tool_call`, checks if the thinking block contains error keywords ("wrong", "failed", "retry", "different", "instead", etc.)
+- If thinking acknowledges an error AND the tool call matches the last failed fingerprint → injects `[Gallop] Mismatch: ...` steer message
+- One-shot: clears after firing or on any successful tool call
+- Operates independently of failure-loop and repetitive-call escalation
 
 ### Compaction + Resume
 
