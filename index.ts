@@ -50,7 +50,7 @@ const REPETITIVE_CALL_NUDGE_PLUS = 5; // N consecutive calls before escalated nu
 const REPETITIVE_CALL_BLOCK = 7;      // N consecutive calls before hard block
 const STALL_WARN = 4;                 // Stalls before strong warning
 const STALL_STOP = 5;                 // Stalls before stopping and notifying user
-const CIRCUIT_BREAKER_BLOCKS = 5;     // Total blocks before shutdown
+const CIRCUIT_BREAKER_BLOCKS = 3;     // Total blocks before shutdown
 
 const ESCALATION_LEVELS: EscalationLevel[] = ["nudge", "nudge_plus", "block"];
 
