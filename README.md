@@ -4,6 +4,10 @@ Keeps the agent moving. Prevents stalls and manages context lifecycle.
 
 ## Features
 
+### Binary Output Filter
+
+Intercepts bash tool results before they enter context. Detects binary output (null bytes, >5% non-printable characters) and replaces it with `[Gallop] Binary output suppressed — N bytes`. Prevents context corruption from accidental `head`, `cat`, or other commands on binary files.
+
 ### Stall Detection
 
 Monitors assistant messages for unexpected stops. When the LLM halts mid-thought or mid-tool-call (not a clean `tool_use` handoff), sends a resume prompt.

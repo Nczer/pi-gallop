@@ -89,6 +89,36 @@ let circuitBreakerHalted = false;
 /** Consecutive stall count */
 let stallCount = 0;
 
+// ── Binary detection ──
+
+/**
+ * Detect binary content in bash output.
+ * Checks for null bytes and high ratio of non-printable characters.
+ */
+export function isBinaryContent(text: string): boolean {
+  if (!text.length) return false;
+
+  // Any null byte = binary
+  if (text.includes("\0")) return true;
+
+  // Count non-printable bytes (excluding normal whitespace \n \r \t)
+  let nonPrintable = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    // Control chars 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, plus DEL (0x7F)
+    // Allow: 0x09 (\t), 0x0A (\n), 0x0D (\r)
+    if ((code >= 0x00 && code <= 0x08) ||
+        code === 0x0B || code === 0x0C ||
+        (code >= 0x0E && code <= 0x1F) ||
+        code === 0x7F) {
+      nonPrintable++;
+    }
+  }
+
+  // >5% non-printable = binary
+  return (nonPrintable / text.length) > 0.05;
+}
+
 // ── Helpers ──
 
 export function formatTokens(n: number): string {
@@ -323,11 +353,12 @@ function checkRepetitiveCall(
   const targetIndex = ESCALATION_LEVELS.indexOf(currentLevel);
   if (targetIndex <= currentIndex) return; // Already at or past target level
 
+  const escalated = targetIndex > currentIndex;
   entry.level = currentLevel;
   entry.nudgeCount++;
 
-  // Cooldown check (skip for block level — always escalate)
-  if (currentLevel !== "block" && Date.now() < repetitiveCallCooldownUntil) return;
+  // Cooldown check — skip when escalating to a new level or at block
+  if (!escalated && currentLevel !== "block" && Date.now() < repetitiveCallCooldownUntil) return;
 
   // Parse tool name and arg summary
   const colonIndex = fingerprint.indexOf(":");
@@ -412,11 +443,12 @@ function checkFailureLoop(
   const targetIndex = ESCALATION_LEVELS.indexOf(currentLevel);
   if (targetIndex <= currentIndex) return; // Already at or past target level
 
+  const escalated = targetIndex > currentIndex;
   entry.level = currentLevel;
   entry.nudgeCount++;
 
-  // Cooldown check (skip for block level — always escalate)
-  if (currentLevel !== "block" && Date.now() < failureLoopCooldownUntil) return;
+  // Cooldown check — skip when escalating to a new level or at block
+  if (!escalated && currentLevel !== "block" && Date.now() < failureLoopCooldownUntil) return;
 
   // Build display snippets
   const shortCommand = normalized.length > 80 ? normalized.slice(0, 77) + "..." : normalized;
@@ -691,6 +723,68 @@ export default function gallopExtension(pi: ExtensionAPI) {
         }
         return { block: true, reason: `[Gallop] Blocked: You've called ${toolName} too many times with the same arguments (${displayArg}). Use a different tool or arguments.` };
       }
+    }
+  });
+
+  // ── Binary output filter ──
+
+  pi.on("tool_result", async (event) => {
+    if (event.toolName !== "bash") return;
+
+    const content = event.content;
+    if (!Array.isArray(content)) return;
+
+    // Collect all text from content
+    let fullText = "";
+    for (const item of content) {
+      if (item && typeof item === "object" && item.type === "text" && typeof item.text === "string") {
+        fullText += item.text;
+      }
+    }
+
+    if (!fullText.length) return;
+
+    if (isBinaryContent(fullText)) {
+      const bytes = new TextEncoder().encode(fullText).length;
+      const command = (event.input as any)?.command;
+      const shortCommand = typeof command === "string"
+        ? command.split("\n")[0].trim().length > 80
+          ? command.split("\n")[0].trim().slice(0, 77) + "..."
+          : command.split("\n")[0].trim()
+        : "<unknown>";
+
+      // Detect reason for binary flag
+      let reason = "";
+      if (fullText.includes("\0")) {
+        reason = "contains null bytes";
+      } else {
+        let nonPrintable = 0;
+        for (let i = 0; i < fullText.length; i++) {
+          const code = fullText.charCodeAt(i);
+          if ((code >= 0x00 && code <= 0x08) ||
+              code === 0x0B || code === 0x0C ||
+              (code >= 0x0E && code <= 0x1F) ||
+              code === 0x7F) {
+            nonPrintable++;
+          }
+        }
+        const pct = ((nonPrintable / fullText.length) * 100).toFixed(1);
+        reason = `${pct}% non-printable characters`;
+      }
+
+      // Hex dump of first 64 bytes for debugging (safe ASCII only)
+      const rawBytes = new TextEncoder().encode(fullText);
+      const headBytes = rawBytes.slice(0, 64);
+      const hexHead = Array.from(headBytes)
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join(" ");
+
+      return {
+        content: [{
+          type: "text",
+          text: `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${reason})\nCommand: \`${shortCommand}\`\nHead (hex): ${hexHead}\nBinary content is hidden to protect context. The output was not sent to the model.`,
+        }],
+      };
     }
   });
 
