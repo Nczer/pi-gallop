@@ -427,7 +427,8 @@ function escalate(
 
   const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
   const targetIndex = ESCALATION_LEVELS.indexOf(targetLevel);
-  if (targetIndex <= currentIndex) return;
+  // Skip if already at target level and we've nudged before (new entries still need initial nudge)
+  if (targetIndex <= currentIndex && entry.nudgeCount > 0) return;
 
   const escalated = targetIndex > currentIndex;
   entry.level = targetLevel;
