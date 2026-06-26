@@ -48,7 +48,6 @@ const FAILURE_WINDOW_TURNS = 5;       // Only consider failures within last N tu
 const REPETITIVE_CALL_THRESHOLD = 3;  // N consecutive identical calls before nudging
 const REPETITIVE_CALL_NUDGE_PLUS = 5; // N consecutive calls before escalated nudge
 const REPETITIVE_CALL_BLOCK = 7;      // N consecutive calls before hard block
-const NUDGE_COOLDOWN_MS = 30_000;     // Cooldown between nudges for same pattern
 const STALL_WARN = 4;                 // Stalls before strong warning
 const STALL_STOP = 5;                 // Stalls before stopping and notifying user
 const CIRCUIT_BREAKER_BLOCKS = 5;     // Total blocks before shutdown
@@ -56,8 +55,6 @@ const CIRCUIT_BREAKER_BLOCKS = 5;     // Total blocks before shutdown
 const ESCALATION_LEVELS: EscalationLevel[] = ["nudge", "nudge_plus", "block"];
 
 let currentTurnIndex = 0;
-let failureLoopCooldownUntil = 0;
-let repetitiveCallCooldownUntil = 0;
 
 // ── Escalation state ──
 
@@ -314,9 +311,6 @@ function resetAllState(): void {
   failureHistory.length = 0;
   failureEscalation.clear();
   currentTurnIndex = 0;
-  failureLoopCooldownUntil = 0;
-  repetitiveCallCooldownUntil = 0;
-
   repetitiveCallState = null;
   repetitiveEscalation.clear();
 
@@ -387,8 +381,9 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
 
 /**
  * Shared escalation engine.
- * Manages level transitions (nudge → nudge_plus → block), cooldowns,
- * and message delivery. Callers provide a message builder for their context.
+ * Manages level transitions (nudge → nudge_plus → block) and message delivery.
+ * Repeated failures at the same level escalate immediately (previous warning ignored).
+ * Callers provide a message builder for their context.
  */
 function escalate(
   fingerprint: string,
@@ -397,8 +392,6 @@ function escalate(
   nudgePlusThreshold: number,
   blockThreshold: number,
   escalationMap: Map<string, EscalationEntry>,
-  cooldownUntil: number,
-  setCooldownUntil: (ms: number) => void,
   ctx: ExtensionContext,
   pi: ExtensionAPI,
   buildMessage: (level: EscalationLevel) => string,
@@ -426,23 +419,27 @@ function escalate(
   }
 
   const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
-  const targetIndex = ESCALATION_LEVELS.indexOf(targetLevel);
-  // Skip if already at target level and we've nudged before (new entries still need initial nudge)
-  if (targetIndex <= currentIndex && entry.nudgeCount > 0) return;
+  let targetIndex = ESCALATION_LEVELS.indexOf(targetLevel);
 
-  const escalated = targetIndex > currentIndex;
+  // Already at target level and nudged before → escalate immediately (previous warning ignored)
+  if (targetIndex <= currentIndex && entry.nudgeCount > 0) {
+    const nextIndex = Math.min(currentIndex + 1, ESCALATION_LEVELS.length - 1);
+    if (nextIndex > currentIndex) {
+      targetLevel = ESCALATION_LEVELS[nextIndex];
+      targetIndex = nextIndex;
+    } else {
+      return; // Already at max level, nothing left to do
+    }
+  } else if (targetIndex <= currentIndex) {
+    // New entry, hasn't nudged yet — fall through to send initial nudge
+  }
+
   entry.level = targetLevel;
   entry.nudgeCount++;
-
-  if (!escalated && targetLevel !== "block" && Date.now() < cooldownUntil) return;
 
   const msg = buildMessage(targetLevel);
   if (msg) {
     pi.sendUserMessage(msg, { deliverAs: "steer" });
-  }
-
-  if (targetLevel !== "block") {
-    setCooldownUntil(Date.now() + NUDGE_COOLDOWN_MS);
   }
 
   if (ctx.hasUI) {
@@ -478,8 +475,6 @@ function checkRepetitiveCall(
     fingerprint, count,
     REPETITIVE_CALL_THRESHOLD, REPETITIVE_CALL_NUDGE_PLUS, REPETITIVE_CALL_BLOCK,
     repetitiveEscalation,
-    repetitiveCallCooldownUntil,
-    (ms) => { repetitiveCallCooldownUntil = ms; },
     ctx, pi,
     (level) => {
       if (level === "block") {
@@ -530,8 +525,6 @@ function checkFailureLoop(
     nudgeKey, matchCount,
     FAILURE_LOOP_THRESHOLD, FAILURE_LOOP_NUDGE_PLUS, FAILURE_LOOP_BLOCK,
     failureEscalation,
-    failureLoopCooldownUntil,
-    (ms) => { failureLoopCooldownUntil = ms; },
     ctx, pi,
     (level) => {
       if (level === "block") {
