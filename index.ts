@@ -89,6 +89,27 @@ let circuitBreakerHalted = false;
 /** Consecutive stall count */
 let stallCount = 0;
 
+// ── Reasoning-action mismatch detection ──
+
+/** Last failed tool call for mismatch detection */
+let lastFailedToolCall: {
+  toolName: string;
+  fingerprint: string;
+  error: string;
+} | null = null;
+
+/** Whether LLM's thinking acknowledged an error */
+let llmAcknowledgedError = false;
+
+/** Keywords that suggest the LLM acknowledged an error or strategy change */
+const ERROR_ACK_KEYWORDS = [
+  "wrong", "error", "failed", "fail", "issue", "problem",
+  "retry", "retried", "repeat", "same", "again",
+  "cd ", "change", "different", "alternative", "instead",
+  "directory", "path", "not found", "does not exist",
+  "should have", "need to", "must", "fix", "correct",
+];
+
 // ── Binary detection ──
 
 /**
@@ -268,6 +289,12 @@ async function handleCircuitBreaker(
 /**
  * Prune failure history to keep only entries within the window.
  */
+/** Check if thinking content contains error/strategy keywords */
+function thinkingAcknowledgesError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return ERROR_ACK_KEYWORDS.some(keyword => lower.includes(keyword));
+}
+
 export function pruneFailureHistory(
   failureHistory: { turnIndex: number }[],
   currentTurnIndex: number,
@@ -566,6 +593,10 @@ export default function gallopExtension(pi: ExtensionAPI) {
     circuitBreakerTripped = false;
     circuitBreakerHalted = false;
     stallCount = 0;
+
+    // Reset mismatch detection
+    lastFailedToolCall = null;
+    llmAcknowledgedError = false;
   });
 
   // ── Before agent start: inject context usage ──
@@ -656,6 +687,45 @@ export default function gallopExtension(pi: ExtensionAPI) {
     } else {
       // Non-stall message — reset stall counter
       stallCount = 0;
+    }
+
+    // ── Reasoning-action mismatch detection ──
+    // Check if LLM acknowledged an error in thinking but is about to repeat the same failed call
+    if (lastFailedToolCall) {
+      // Check if thinking contains error keywords
+      const thinkingContent = event.message.content?.find(
+        (item: any) => item.type === "thinking",
+      ) as { text?: string } | undefined;
+      llmAcknowledgedError = thinkingContent
+        ? thinkingAcknowledgesError(thinkingContent.text ?? "")
+        : false;
+
+      // Check if tool_use matches the last failed call
+      const toolUseContent = event.message.content?.find(
+        (item: any) => item.type === "tool_use",
+      ) as { name?: string; input?: Record<string, unknown> } | undefined;
+
+      if (toolUseContent && llmAcknowledgedError) {
+        const argFingerprint = normalizeToolArgs(toolUseContent.name ?? "", toolUseContent.input);
+        const callFingerprint = `${toolUseContent.name}:${argFingerprint}`;
+
+        if (callFingerprint === lastFailedToolCall.fingerprint) {
+          const errorSnippet = lastFailedToolCall.error.length > 60
+            ? lastFailedToolCall.error.slice(0, 57) + "..."
+            : lastFailedToolCall.error;
+
+          const msg = `[Gallop] Mismatch: You acknowledged an error in your thinking but are about to call ${lastFailedToolCall.toolName} with the same arguments that just failed (error: "${errorSnippet}"). Change the tool call to match your reasoning.`;
+          pi.sendUserMessage(msg, { deliverAs: "steer" });
+
+          if (ctx.hasUI) {
+            ctx.ui.notify("Gallop: reasoning-action mismatch", "warning");
+          }
+
+          // Clear tracking so we don't flag repeatedly
+          lastFailedToolCall = null;
+          llmAcknowledgedError = false;
+        }
+      }
     }
   });
 
@@ -850,6 +920,21 @@ export default function gallopExtension(pi: ExtensionAPI) {
       }
     }
 
+    // ── Track last failed tool call for mismatch detection ──
+    if (event.isError) {
+      const args = event.args as Record<string, unknown> | undefined;
+      const argFingerprint = normalizeToolArgs(event.toolName, args);
+      const error = extractErrorFingerprint(event.result);
+      lastFailedToolCall = {
+        toolName: event.toolName,
+        fingerprint: `${event.toolName}:${argFingerprint}`,
+        error,
+      };
+    } else {
+      // Success clears mismatch tracking
+      lastFailedToolCall = null;
+    }
+
     // ── Repetitive-call detection ──
     // Skip when bash just failed — failure-loop handler already covered it
     if (!(event.toolName === "bash" && event.isError) &&
@@ -901,5 +986,9 @@ export default function gallopExtension(pi: ExtensionAPI) {
     circuitBreakerTripped = false;
     circuitBreakerHalted = false;
     stallCount = 0;
+
+    // Reset mismatch detection after compaction
+    lastFailedToolCall = null;
+    llmAcknowledgedError = false;
   });
 }
