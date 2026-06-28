@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.1
+
+### Added
+- **Edit tool fingerprinting** — `edit` calls are fingerprinted by `path` + short `oldText` prefix per edit, so edits to different regions get distinct fingerprints and won't trigger false repetitive-call detection
+- **Edit repetitive-call hint** — suggests making multiple distinct edits in one call instead of repeating the same edit
+
 ## v1.2.0
 
 ### Added
