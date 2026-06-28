@@ -371,6 +371,17 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
     return normalizeCommand(typeof a.command === "string" ? a.command : String(a.command ?? ""));
   }
 
+  // edit: fingerprint by path + short oldText prefix per edit (different regions = different fingerprints)
+  if (toolName === "edit") {
+    const path = (typeof a.path === "string" ? a.path : String(a.path ?? "")).replace(/\\/g, "/");
+    const edits = Array.isArray(a.edits) ? a.edits : [];
+    const regionTags = edits.map((e: any) => {
+      const old = typeof e?.oldText === "string" ? e.oldText.trim().slice(0, 40) : "";
+      return old.replace(/[^a-zA-Z0-9_$/]/g, "");
+    }).join("|");
+    return `${path}:${regionTags}`;
+  }
+
   // Default: stable JSON of arg keys/values (sorted keys)
   try {
     return JSON.stringify(a, Object.keys(a).sort(), 0);
@@ -467,6 +478,8 @@ function checkRepetitiveCall(
     hint = " The file content is already in context — analyze it or move on.";
   } else if (toolName === "bash") {
     hint = " The command already succeeded — using its output or moving on would be more productive.";
+  } else if (toolName === "edit") {
+    hint = " Check if you meant to make multiple distinct edits in one call instead.";
   } else {
     hint = " Consider whether the result is already available in context.";
   }
