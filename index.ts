@@ -124,7 +124,7 @@ interface BinaryDetectionResult {
 export function detectBinaryContent(text: string): BinaryDetectionResult {
   if (!text.length) return { binary: false, reason: "", nonPrintablePct: 0 };
 
-  // Any null byte = binary
+  // Any null byte = binary (always, no percentage threshold)
   if (text.includes("\0")) {
     return { binary: true, reason: "contains null bytes", nonPrintablePct: 0 };
   }
@@ -840,10 +840,28 @@ export default function gallopExtension(pi: ExtensionAPI) {
         .map(b => b.toString(16).padStart(2, "0"))
         .join(" ");
 
+      // Strip control chars (except newlines/tabs) to extract readable lines
+      const cleaned = fullText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+      const lines = cleaned.split("\n")
+        .map(l => l.trim())
+        .filter(l => l.length > 0)
+        .map(l => l.replace(/\s+\d+%\s*/g, " ").replace(/\s+/g, " ").trim())
+        .map(l => l.slice(0, 120));
+      const headLines = lines.slice(0, 3);
+      const tailLines = lines.length > 3 ? lines.slice(-5) : [];
+
+      let summary = `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${detection.reason})\nCommand: \`${shortCommand}\`\nHead (hex): ${hexHead}`;
+      if (headLines.length) summary += `\n> ${headLines.join("\n> ")}`;
+      if (tailLines.length && lines.length > 3) {
+        summary += `\n...\n> ${tailLines.join("\n> ")}`;
+      }
+      if (lines.length > 8) summary += `\n... (${lines.length} lines total)`;
+      summary += "\nBinary content is hidden to protect context. The output was not sent to the model.";
+
       return {
         content: [{
           type: "text",
-          text: `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${detection.reason})\nCommand: \`${shortCommand}\`\nHead (hex): ${hexHead}\nBinary content is hidden to protect context. The output was not sent to the model.`,
+          text: summary,
         }],
       };
     }
