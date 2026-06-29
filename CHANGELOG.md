@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.2
+
+### Added
+- **Binary suppression head/tail preview** — when suppressing binary output, now shows first 3 and last 5 readable lines (stripped of control chars) so the user can verify the command ran correctly without flooding context
+
+### Changed
+- **request_compact tool description** — added "Call when" guidance for clearer LLM trigger conditions
+
 ## v1.2.1
 
 ### Added

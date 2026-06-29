@@ -6,7 +6,13 @@ Keeps the agent moving. Prevents stalls and manages context lifecycle.
 
 ### Binary Output Filter
 
-Intercepts bash tool results before they enter context. Detects binary output (null bytes, >5% non-printable characters) and replaces it with `[Gallop] Binary output suppressed — N bytes`. Prevents context corruption from accidental `head`, `cat`, or other commands on binary files.
+Intercepts bash tool results before they enter context. Detects binary output (null bytes, >5% non-printable characters) and replaces it with a summary message. Prevents context corruption from accidental `head`, `cat`, or other commands on binary files.
+
+The summary includes:
+- Byte count and detection reason
+- Hex head preview (first 16 bytes)
+- **First 3 and last 5 readable lines** (control chars stripped) so you can verify the command ran correctly
+- Total line count when output exceeds 8 readable lines
 
 ### Stall Detection
 
