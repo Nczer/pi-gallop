@@ -561,7 +561,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "request_compact",
     label: "Request Compact",
-    description: `Compact context to reduce token usage. Discards bloat while preserving active tasks. 
+    description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
+    - Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, or session is long.
     - 'pending': A direct instruction (e.g., 'Immediately finish the refactor of X') that will be injected as a high-priority user message immediately after compaction to ensure seamless resumption.
     - 'customInstructions': Specific directions for the compactor (e.g., 'Keep the last 3 error logs but discard previous ones').`,
     parameters: {
