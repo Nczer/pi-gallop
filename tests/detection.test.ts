@@ -1,6 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
-	formatTokens,
 	normalizeCommand,
 	extractErrorFingerprint,
 	normalizeToolArgs,
@@ -8,28 +7,6 @@ import {
 	lastItemIsToolUse,
 	pruneFailureHistory,
 } from "../index";
-
-// ── formatTokens ──
-
-describe("formatTokens", () => {
-	it("returns raw number under 1000", () => {
-		expect(formatTokens(0)).toBe("0");
-		expect(formatTokens(512)).toBe("512");
-		expect(formatTokens(999)).toBe("999");
-	});
-
-	it("formats thousands as X.Xk", () => {
-		expect(formatTokens(1000)).toBe("1.0k");
-		expect(formatTokens(42300)).toBe("42.3k");
-		expect(formatTokens(999999)).toBe("1000.0k");
-	});
-
-	it("formats millions as X.XM", () => {
-		expect(formatTokens(1_000_000)).toBe("1.0M");
-		expect(formatTokens(128_000_000)).toBe("128.0M");
-		expect(formatTokens(200_000_100)).toBe("200.0M");
-	});
-});
 
 // ── normalizeCommand ──
 
@@ -232,17 +209,17 @@ describe("lastItemIsThinking", () => {
 // ── lastItemIsToolUse ──
 
 describe("lastItemIsToolUse", () => {
-	it("returns true when last content item is tool_use type", () => {
+	it("returns true when last content item is a tool call", () => {
 		const msg = {
 			content: [
 				{ type: "text", text: "let me check" },
-				{ type: "tool_use", name: "read", input: { path: "x" } },
+				{ type: "toolCall", name: "read", arguments: { path: "x" } },
 			],
 		};
 		expect(lastItemIsToolUse(msg)).toBe(true);
 	});
 
-	it("returns false when last item is not tool_use", () => {
+	it("returns false when last item is not a tool call", () => {
 		const msg = { content: [{ type: "thinking", thinking: "..." }] };
 		expect(lastItemIsToolUse(msg)).toBe(false);
 	});

@@ -107,10 +107,3 @@ LLM can request compaction via the `request_compact` tool. After compaction comp
 
 Compaction resets all escalation state (blocks, nudges, stall count).
 
-### Context Usage
-
-Injects context usage stats before each turn (when percentage changes by ≥5 points):
-
-```
-Context: 42.3k / 128k (33%)
-```

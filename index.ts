@@ -5,7 +5,6 @@
  * - Detects stalled generation (stopped mid-thinking or mid-tool-call) and sends resume
  * - Detects repetitive command failure loops and nudges the agent to change strategy
  * - LLM can trigger compaction via `request_compact` tool with post-compaction resume
- * - Injects context usage before each turn
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -18,12 +17,12 @@ let sawAssistantMessage = false;
 let compactRequested = false;
 let pendingTask: string | null = null;
 let customCompactInstructions: string | null = null;
-let lastReportedPct: number | null = null;
 
 // ── Failure-loop detection state ──
 
-/** Commands in-flight, keyed by toolCallId */
-const pendingCommands = new Map<string, string>();
+/** In-flight tool calls keyed by toolCallId: { args, fingerprint }.
+ *  tool_execution_end events carry no args, so we stash them here. */
+const pendingToolCalls = new Map<string, { args: unknown; fingerprint: string }>();
 
 /** History of recent bash failures for loop detection */
 const failureHistory: {
@@ -158,12 +157,6 @@ export function isBinaryContent(text: string): boolean {
 
 // ── Helpers ──
 
-export function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return `${n}`;
-}
-
 export function lastItemIsThinking(message: { content?: unknown[] }): boolean {
   if (!message.content || !Array.isArray(message.content) || message.content.length === 0) return false;
   const last = message.content[message.content.length - 1];
@@ -173,7 +166,8 @@ export function lastItemIsThinking(message: { content?: unknown[] }): boolean {
 export function lastItemIsToolUse(message: { content?: unknown[] }): boolean {
   if (!message.content || !Array.isArray(message.content) || message.content.length === 0) return false;
   const last = message.content[message.content.length - 1];
-  return typeof last === "object" && last !== null && (last as any).type === "tool_use";
+  // Assistant tool-call content blocks use type "toolCall" (not "tool_use").
+  return typeof last === "object" && last !== null && (last as any).type === "toolCall";
 }
 
 function triggerCompaction(
@@ -187,7 +181,6 @@ function triggerCompaction(
   ctx.compact({
     customInstructions: instructions,
     onComplete: () => {
-      lastReportedPct = null;
       if (task) {
         pi.appendEntry("auto-compact-pending-task", { task });
         setTimeout(() => {
@@ -305,9 +298,8 @@ function resetAllState(): void {
   compactRequested = false;
   pendingTask = null;
   customCompactInstructions = null;
-  lastReportedPct = null;
 
-  pendingCommands.clear();
+  pendingToolCalls.clear();
   failureHistory.length = 0;
   failureEscalation.clear();
   currentTurnIndex = 0;
@@ -609,34 +601,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
     resetAllState();
   });
 
-  // ── Before agent start: inject context usage ──
-
-  pi.on("before_agent_start", async (_event: unknown, ctx: ExtensionContext) => {
-    try {
-      const usage = ctx.getContextUsage();
-      if (!usage?.percent) return;
-
-      if (lastReportedPct !== null && Math.abs(usage.percent - lastReportedPct) < 5) return;
-      lastReportedPct = usage.percent;
-
-      const maxTokens = ctx.model?.contextWindow ?? ctx.model?.maxTokens;
-      const pct = Math.round(usage.percent);
-      const tokens = usage.tokens ?? 0;
-      const injection = typeof maxTokens === "number" && maxTokens > 0
-        ? `Context: ${formatTokens(tokens)} / ${formatTokens(maxTokens)} (${pct}%)`
-        : `Context: ${formatTokens(tokens)}`;
-      return {
-        message: {
-          customType: "context-usage",
-          content: injection,
-          display: false,
-        },
-      };
-    } catch {
-      // getContextUsage may not be available
-    }
-  });
-
   // ── Stall detection ──
 
   pi.on("message_start", async (event, _ctx) => {
@@ -651,12 +615,56 @@ export default function gallopExtension(pi: ExtensionAPI) {
     if (circuitBreakerTripped) return;
     sawAssistantMessage = false;
 
+    // ── Reasoning-action mismatch detection ──
+    // Runs before stall handling so it still fires on normal tool-call handoffs
+    // (which return early from the stall block below). Assistant tool-call content
+    // blocks use type "toolCall" with { name, arguments }.
+    if (lastFailedToolCall) {
+      const content = Array.isArray(event.message.content) ? event.message.content : [];
+      const thinkingContent = content.find(
+        (item: any) => item.type === "thinking",
+      ) as { text?: string } | undefined;
+      llmAcknowledgedError = thinkingContent
+        ? thinkingAcknowledgesError(thinkingContent.text ?? "")
+        : false;
+
+      if (llmAcknowledgedError) {
+        const toolCalls = content.filter(
+          (item: any) => item.type === "toolCall",
+        ) as { name?: string; arguments?: Record<string, unknown> }[];
+
+        for (const tc of toolCalls) {
+          const argFingerprint = normalizeToolArgs(tc.name ?? "", tc.arguments);
+          const callFingerprint = `${tc.name}:${argFingerprint}`;
+
+          if (callFingerprint === lastFailedToolCall.fingerprint) {
+            const errorSnippet = lastFailedToolCall.error.length > 60
+              ? lastFailedToolCall.error.slice(0, 57) + "..."
+              : lastFailedToolCall.error;
+
+            const msg = `[Gallop] Mismatch: You acknowledged an error in your thinking but are about to call ${lastFailedToolCall.toolName} with the same arguments that just failed (error: "${errorSnippet}"). Change the tool call to match your reasoning.`;
+            pi.sendUserMessage(msg, { deliverAs: "steer" });
+
+            if (ctx.hasUI) {
+              ctx.ui.notify("Gallop: reasoning-action mismatch", "warning");
+            }
+
+            // Clear tracking so we don't flag repeatedly
+            lastFailedToolCall = null;
+            llmAcknowledgedError = false;
+            break;
+          }
+        }
+      }
+    }
+
+    // ── Stall detection ──
     if (lastItemIsThinking(event.message) || lastItemIsToolUse(event.message)) {
       const stopReason = (event.message as any).stopReason;
       if (stopReason === "aborted" || stopReason === "error") return;
 
-      // Normal tool call flow: LLM stops with stopReason="tool_use" to let the tool run.
-      if (lastItemIsToolUse(event.message) && stopReason === "tool_use") return;
+      // Normal tool call flow: LLM stops with stopReason "toolUse" to let the tool run.
+      if (lastItemIsToolUse(event.message) && stopReason === "toolUse") return;
 
       if (Date.now() < cooldownUntil) return;
       cooldownUntil = Date.now() + 10_000;
@@ -697,45 +705,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
     } else {
       // Non-stall message — reset stall counter
       stallCount = 0;
-    }
-
-    // ── Reasoning-action mismatch detection ──
-    // Check if LLM acknowledged an error in thinking but is about to repeat the same failed call
-    if (lastFailedToolCall) {
-      // Check if thinking contains error keywords
-      const thinkingContent = event.message.content?.find(
-        (item: any) => item.type === "thinking",
-      ) as { text?: string } | undefined;
-      llmAcknowledgedError = thinkingContent
-        ? thinkingAcknowledgesError(thinkingContent.text ?? "")
-        : false;
-
-      // Check if tool_use matches the last failed call
-      const toolUseContent = event.message.content?.find(
-        (item: any) => item.type === "tool_use",
-      ) as { name?: string; input?: Record<string, unknown> } | undefined;
-
-      if (toolUseContent && llmAcknowledgedError) {
-        const argFingerprint = normalizeToolArgs(toolUseContent.name ?? "", toolUseContent.input);
-        const callFingerprint = `${toolUseContent.name}:${argFingerprint}`;
-
-        if (callFingerprint === lastFailedToolCall.fingerprint) {
-          const errorSnippet = lastFailedToolCall.error.length > 60
-            ? lastFailedToolCall.error.slice(0, 57) + "..."
-            : lastFailedToolCall.error;
-
-          const msg = `[Gallop] Mismatch: You acknowledged an error in your thinking but are about to call ${lastFailedToolCall.toolName} with the same arguments that just failed (error: "${errorSnippet}"). Change the tool call to match your reasoning.`;
-          pi.sendUserMessage(msg, { deliverAs: "steer" });
-
-          if (ctx.hasUI) {
-            ctx.ui.notify("Gallop: reasoning-action mismatch", "warning");
-          }
-
-          // Clear tracking so we don't flag repeatedly
-          lastFailedToolCall = null;
-          llmAcknowledgedError = false;
-        }
-      }
     }
   });
 
@@ -779,9 +748,11 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
     // Check repetitive-call blocks (all tools)
     if (repetitiveEscalation.size > 0) {
-      const args = (event as any).input as Record<string, unknown> | undefined;
-      const argFingerprint = normalizeToolArgs(event.toolName, args);
-      const callFingerprint = `${event.toolName}:${argFingerprint}`;
+      // Prefer the fingerprint captured at tool_execution_start (raw args) so the
+      // lookup key matches the one used when the block was recorded. Fall back to
+      // recomputing from the (possibly coerced) validated input.
+      const callFingerprint = pendingToolCalls.get(event.toolCallId)?.fingerprint
+        ?? `${event.toolName}:${normalizeToolArgs(event.toolName, (event as any).input)}`;
 
       const repEntry = repetitiveEscalation.get(callFingerprint);
       if (repEntry && repEntry.level === "block") {
@@ -826,7 +797,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
     const detection = detectBinaryContent(fullText);
     if (detection.binary) {
-      const bytes = new TextEncoder().encode(fullText).length;
+      const rawBytes = new TextEncoder().encode(fullText);
+      const bytes = rawBytes.length;
       const command = (event.input as any)?.command;
       const shortCommand = typeof command === "string"
         ? command.split("\n")[0].trim().length > 80
@@ -835,7 +807,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
         : "<unknown>";
 
       // Hex dump of first 64 bytes for debugging (safe ASCII only)
-      const rawBytes = new TextEncoder().encode(fullText);
       const headBytes = rawBytes.slice(0, 64);
       const hexHead = Array.from(headBytes)
         .map(b => b.toString(16).padStart(2, "0"))
@@ -871,19 +842,15 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // ── Failure-loop detection ──
 
   pi.on("tool_execution_start", async (event) => {
-    // Track bash commands for failure-loop detection
-    if (event.toolName === "bash") {
-      const command = (event.args as any)?.command;
-      if (typeof command === "string") {
-        pendingCommands.set(event.toolCallId, command);
-      }
-    }
-
-    // Track ALL tools for repetitive-call detection
+    // Stash args + fingerprint for this call. tool_execution_end events carry no
+    // args field, so we look them up here. Used for bash failure-loop command
+    // extraction, repetitive-call block matching, and mismatch arg fingerprinting.
     const args = event.args as Record<string, unknown> | undefined;
     const argFingerprint = normalizeToolArgs(event.toolName, args);
     const callFingerprint = `${event.toolName}:${argFingerprint}`;
+    pendingToolCalls.set(event.toolCallId, { args, fingerprint: callFingerprint });
 
+    // Track ALL tools for repetitive-call detection
     if (repetitiveCallState && repetitiveCallState.fingerprint === callFingerprint) {
       repetitiveCallState.count += 1;
     } else {
@@ -895,13 +862,14 @@ export default function gallopExtension(pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
-    // ── Bash failure-loop detection (existing) ──
+    // Args are not present on tool_execution_end events; retrieve what
+    // tool_execution_start stashed for this call.
+    const pending = pendingToolCalls.get(event.toolCallId);
 
+    // ── Bash failure-loop detection ──
     if (event.toolName === "bash") {
-      const rawCommand = pendingCommands.get(event.toolCallId);
-      pendingCommands.delete(event.toolCallId);
-
-      if (rawCommand) {
+      const rawCommand = (pending?.args as any)?.command;
+      if (typeof rawCommand === "string") {
         if (!event.isError) {
           // Successful execution — reset failure history and escalation to avoid stale detections
           failureHistory.length = 0;
@@ -932,8 +900,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
     // ── Track last failed tool call for mismatch detection ──
     if (event.isError) {
-      const args = event.args as Record<string, unknown> | undefined;
-      const argFingerprint = normalizeToolArgs(event.toolName, args);
+      const argFingerprint = normalizeToolArgs(event.toolName, pending?.args);
       const error = extractErrorFingerprint(event.result);
       lastFailedToolCall = {
         toolName: event.toolName,
@@ -946,11 +913,16 @@ export default function gallopExtension(pi: ExtensionAPI) {
     }
 
     // ── Repetitive-call detection ──
-    // Skip when bash just failed — failure-loop handler already covered it
-    if (!(event.toolName === "bash" && event.isError) &&
-        repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
+    // Skip when bash just failed — failure-loop handler already covered it.
+    // Reset the consecutive counter on bash failure so a later success with the
+    // same command isn't flagged as a repetitive success.
+    if (event.toolName === "bash" && event.isError) {
+      repetitiveCallState = null;
+    } else if (repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
       checkRepetitiveCall(repetitiveCallState.fingerprint, repetitiveCallState.count, pi, ctx);
     }
+
+    pendingToolCalls.delete(event.toolCallId);
   });
 
   // ── Turn end: check for model-requested compaction ──
