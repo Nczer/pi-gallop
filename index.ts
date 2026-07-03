@@ -14,9 +14,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 let cooldownUntil = 0;
 let sawAssistantMessage = false;
 
-let compactRequested = false;
 let pendingTask: string | null = null;
-let customCompactInstructions: string | null = null;
 
 // ── Failure-loop detection state ──
 
@@ -176,8 +174,6 @@ function triggerCompaction(
   instructions?: string,
   task?: string | null,
 ): void {
-  compactRequested = false;
-
   ctx.compact({
     customInstructions: instructions,
     onComplete: () => {
@@ -295,9 +291,7 @@ async function handleCircuitBreaker(
 function resetAllState(): void {
   cooldownUntil = 0;
   sawAssistantMessage = false;
-  compactRequested = false;
   pendingTask = null;
-  customCompactInstructions = null;
 
   pendingToolCalls.clear();
   failureHistory.length = 0;
@@ -555,8 +549,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     label: "Request Compact",
     description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
     - Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, or session is long.
-    - 'pending': A direct instruction (e.g., 'Immediately finish the refactor of X') that will be injected as a high-priority user message immediately after compaction to ensure seamless resumption.
-    - 'customInstructions': Specific directions for the compactor (e.g., 'Keep the last 3 error logs but discard previous ones').`,
+    - 'pending': A direct instruction (e.g., 'Immediately finish the refactor of X') that will be injected as a user message after compaction to nudge the agent to continue.`,
     parameters: {
       type: "object",
       properties: {
@@ -568,28 +561,29 @@ export default function gallopExtension(pi: ExtensionAPI) {
           type: "string",
           description: "Task to resume after compaction. Write as a direct command.",
         },
-        customInstructions: {
-          type: "string",
-          description: "Custom instructions for the compaction summary process.",
-        },
       },
       required: [],
     },
-    async execute(_id: string, params: { reason?: string; pending?: string; customInstructions?: string }, _signal, _onUpdate) {
-      compactRequested = true;
-      pendingTask = params?.pending || null;
-      customCompactInstructions = params?.customInstructions || null;
+    async execute(_id: string, params: { reason?: string; pending?: string }, _signal, _onUpdate, ctx) {
       const reason = params?.reason || "model-initiated";
+      pendingTask = params?.pending || null;
 
       if (pendingTask) {
         pi.appendEntry("auto-compact-intent", { task: pendingTask });
       }
 
+      // Trigger compaction immediately inside the tool execute, so the LLM never
+      // processes a tool result and generates extra tokens before compaction.
+      // After compaction, onComplete sends the pending task as a user message
+      // to nudge the agent to continue.
+      triggerCompaction(ctx, pi, undefined, pendingTask);
+
+      const resumeNote = pendingTask ? ` After compaction, you will resume with: ${pendingTask}` : "";
       return {
         details: {},
         content: [{
           type: "text",
-          text: `Compacting (${reason}).`,
+          text: `Compacting (${reason}).${resumeNote}`,
         }],
       };
     },
@@ -923,21 +917,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
     }
 
     pendingToolCalls.delete(event.toolCallId);
-  });
-
-  // ── Turn end: check for model-requested compaction ──
-
-  pi.on("turn_end", async (_event: unknown, ctx: ExtensionContext) => {
-    if (compactRequested) {
-      const defaultInstructions = "The agent requested compaction. Preserve active work and key decisions. " +
-        "Aggressively remove completed tasks, old error traces, and accumulated bloat.";
-
-      const baseInstructions = customCompactInstructions || defaultInstructions;
-      const instructions = (pendingTask ? `CRITICAL: After compaction, the agent must execute this pending task: "${pendingTask}".\n\n` : "") +
-        baseInstructions;
-
-      triggerCompaction(ctx, pi, instructions, pendingTask);
-    }
   });
 
   // ── Compaction UI ──
