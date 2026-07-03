@@ -578,12 +578,12 @@ export default function gallopExtension(pi: ExtensionAPI) {
       // to nudge the agent to continue.
       triggerCompaction(ctx, pi, undefined, pendingTask);
 
-      const resumeNote = pendingTask ? ` After compaction, you will resume with: ${pendingTask}` : "";
+      const resumeNote = pendingTask ? ` → ${pendingTask}` : "";
       return {
         details: {},
         content: [{
           type: "text",
-          text: `Compacting (${reason}).${resumeNote}`,
+          text: `Compacting (${reason})${resumeNote}.`,
         }],
       };
     },
@@ -921,9 +921,16 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   // ── Compaction UI ──
 
-  pi.on("session_before_compact", async (_event: unknown, ctx: ExtensionContext) => {
+  pi.on("session_before_compact", async (event: { signal: AbortSignal }, ctx: ExtensionContext) => {
     if (ctx.hasUI) {
-      ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", "⟳ Compacting...")}`);
+      const resumePart = pendingTask ? " (will resume)" : "";
+      ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", `⟳ Compacting${resumePart}...`)}`);
+      // Clear status if compaction is cancelled
+      event.signal.addEventListener("abort", () => {
+        if (ctx.hasUI) {
+          ctx.ui.setStatus("compact", undefined);
+        }
+      });
     }
   });
 
