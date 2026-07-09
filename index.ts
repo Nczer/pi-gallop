@@ -7,7 +7,38 @@
  * - LLM can trigger compaction via `request_compact` tool with post-compaction resume
  */
 
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+// ── Persisted settings ──
+
+const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
+const BINARY_SUPPRESSION_KEY = "gallopBinarySuppressionEnabled";
+
+function loadSettings(): Record<string, any> {
+  if (existsSync(SETTINGS_PATH)) {
+    try { return JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")); } catch {}
+  }
+  return {};
+}
+
+function saveSettings(settings: Record<string, any>): void {
+  mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+}
+
+function loadBinarySuppressionSetting(): boolean {
+  const settings = loadSettings();
+  return settings[BINARY_SUPPRESSION_KEY] !== false; // default true
+}
+
+function saveBinarySuppressionSetting(enabled: boolean): void {
+  const settings = loadSettings();
+  settings[BINARY_SUPPRESSION_KEY] = enabled;
+  saveSettings(settings);
+}
 
 // ── State ──
 
@@ -15,6 +46,7 @@ let cooldownUntil = 0;
 let sawAssistantMessage = false;
 
 let pendingTask: string | null = null;
+let binarySuppressionEnabled = true;
 
 // ── Failure-loop detection state ──
 
@@ -589,10 +621,33 @@ export default function gallopExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Gallop-binary command ──
+
+  pi.registerCommand("gallop-binary", {
+    description: "Toggle binary output suppression on/off. Pass 'on', 'off', or nothing to toggle.",
+    handler: async (args, ctx) => {
+      const arg = (args ?? "").trim().toLowerCase();
+      if (arg === "on" || arg === "enable") {
+        binarySuppressionEnabled = true;
+      } else if (arg === "off" || arg === "disable") {
+        binarySuppressionEnabled = false;
+      } else {
+        binarySuppressionEnabled = !binarySuppressionEnabled;
+      }
+      saveBinarySuppressionSetting(binarySuppressionEnabled);
+      const status = binarySuppressionEnabled ? "enabled" : "disabled";
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Gallop: binary suppression ${status}`, binarySuppressionEnabled ? "info" : "warning");
+      }
+    },
+  });
+
   // ── Session lifecycle ──
 
   pi.on("session_start", async (_event, _ctx) => {
     resetAllState();
+    binarySuppressionEnabled = loadBinarySuppressionSetting();
   });
 
   // ── Stall detection ──
@@ -775,6 +830,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event) => {
     if (event.toolName !== "bash") return;
+    if (!binarySuppressionEnabled) return;
 
     const content = event.content;
     if (!Array.isArray(content)) return;
