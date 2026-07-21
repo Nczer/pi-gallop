@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.4.0
+
+### Fixed
+- **False-positive repetitive-call blocks for nested args** — the default fingerprint branch used `JSON.stringify(a, Object.keys(a).sort())`, and an array replacer drops keys at *every* depth, so `{query:"q", options:{limit:5}}` and `{query:"q", options:{limit:99}}` fingerprinted identically. Replaced with a recursive stable stringify. The test covering this branch also used the `edit` tool name, which has its own branch — now uses `write` plus two nested-args regression tests.
+- **Circuit breaker re-trip loop in headless sessions** — the no-UI branch never reset `totalBlocks`, so every subsequent blocked call re-tripped the breaker and re-sent the steer message. Now resets `totalBlocks` alongside the escalation maps.
+- **Stall-stop notice spam** — once `stallCount >= STALL_STOP`, every further stall re-sent the "stopping auto-resume" message and error notification. The notice now fires once per stall streak (`stallStopNotified` flag, reset on recovery / `resetAllState`).
+- **Potential `pendingToolCalls` leak** — `tool_execution_start` stashes before `tool_call` runs; if `tool_execution_end` never fires for a blocked call, the entry would leak. Map is now capped at 200 entries (oldest dropped).
+- **README** — hex head preview documented as 16 bytes; code dumps 64.
+
 ## v1.3.0
 
 ### Fixed

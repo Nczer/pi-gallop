@@ -10,7 +10,7 @@ Intercepts bash tool results before they enter context. Detects binary output (n
 
 The summary includes:
 - Byte count and detection reason
-- Hex head preview (first 16 bytes)
+- Hex head preview (first 64 bytes)
 - **First 3 and last 5 readable lines** (control chars stripped) so you can verify the command ran correctly
 - Total line count when output exceeds 8 readable lines
 

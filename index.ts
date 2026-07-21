@@ -115,6 +115,9 @@ let circuitBreakerHalted = false;
 /** Consecutive stall count */
 let stallCount = 0;
 
+/** Whether the "stopping auto-resume" notice was already sent (send once) */
+let stallStopNotified = false;
+
 // ── Reasoning-action mismatch detection ──
 
 /** Last failed tool call for mismatch detection */
@@ -302,10 +305,12 @@ async function handleCircuitBreaker(
       { deliverAs: "steer" },
     );
   } else {
-    // No UI — just step back
+    // No UI — just step back. Reset totalBlocks too, otherwise the next block
+    // immediately re-trips the breaker and spams the steer message every call.
     blockedPatterns.clear();
     failureEscalation.clear();
     repetitiveEscalation.clear();
+    totalBlocks = 0;
     circuitBreakerTripped = false;
     pi.sendUserMessage(
       `[Gallop] Circuit breaker: ${totalBlocks} blocks enforced. Stepping back (no UI).`,
@@ -337,6 +342,7 @@ function resetAllState(): void {
   circuitBreakerTripped = false;
   circuitBreakerHalted = false;
   stallCount = 0;
+  stallStopNotified = false;
 
   lastFailedToolCall = null;
   llmAcknowledgedError = false;
@@ -365,8 +371,21 @@ export function pruneFailureHistory(
 // ── Repetitive-call detection helpers ──
 
 /**
+ * Stable JSON stringify: sorts object keys recursively at every depth.
+ * (An array replacer in JSON.stringify would drop nested keys, collapsing
+ * distinct nested args into identical fingerprints.)
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+}
+
+/**
  * Normalize tool arguments into a stable fingerprint string.
- * For read: just the path. For bash: the command. For others: JSON of args.
+ * For read: just the path. For bash: the command. For others: stable JSON of args.
  */
 export function normalizeToolArgs(toolName: string, args: unknown): string {
   if (!args || typeof args !== "object") return "{}";
@@ -400,11 +419,11 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
     return `${path}:${regionTags}`;
   }
 
-  // Default: stable JSON of arg keys/values (sorted keys)
+  // Default: stable JSON of arg keys/values (keys sorted recursively)
   try {
-    return JSON.stringify(a, Object.keys(a).sort(), 0);
+    return stableStringify(a);
   } catch {
-    return JSON.stringify(a);
+    return "{}";
   }
 }
 
@@ -725,12 +744,16 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
       // Escalate based on consecutive stall count
       if (stallCount >= STALL_STOP) {
-        // Stop sending resumes — context is likely corrupted
-        const msg = `[Gallop] Agent has stalled ${stallCount} times consecutively. Stopping auto-resume to prevent infinite loop. Please try /new, /compact, or change the prompt.`;
-        pi.sendUserMessage(msg, { deliverAs: "steer" });
+        // Stop sending resumes — context is likely corrupted.
+        // Notify once; further stalls stay silent so the notice itself doesn't loop.
+        if (!stallStopNotified) {
+          stallStopNotified = true;
+          const msg = `[Gallop] Agent has stalled ${stallCount} times consecutively. Stopping auto-resume to prevent infinite loop. Please try /new, /compact, or change the prompt.`;
+          pi.sendUserMessage(msg, { deliverAs: "steer" });
 
-        if (ctx.hasUI) {
-          ctx.ui.notify(`Gallop: stall loop stopped (${stallCount} stalls)`, "error");
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Gallop: stall loop stopped (${stallCount} stalls)`, "error");
+          }
         }
         return;
       }
@@ -754,6 +777,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     } else {
       // Non-stall message — reset stall counter
       stallCount = 0;
+      stallStopNotified = false;
     }
   });
 
@@ -899,6 +923,13 @@ export default function gallopExtension(pi: ExtensionAPI) {
     const argFingerprint = normalizeToolArgs(event.toolName, args);
     const callFingerprint = `${event.toolName}:${argFingerprint}`;
     pendingToolCalls.set(event.toolCallId, { args, fingerprint: callFingerprint });
+
+    // Safety cap: if tool_execution_end never fires for a call (e.g. blocked),
+    // entries would leak — drop the oldest when the map grows unbounded.
+    if (pendingToolCalls.size > 200) {
+      const oldest = pendingToolCalls.keys().next().value;
+      if (oldest !== undefined) pendingToolCalls.delete(oldest);
+    }
 
     // Track ALL tools for repetitive-call detection
     if (repetitiveCallState && repetitiveCallState.fingerprint === callFingerprint) {

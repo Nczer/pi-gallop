@@ -164,8 +164,20 @@ describe("normalizeToolArgs", () => {
 	});
 
 	it("produces stable sorted JSON for other tools", () => {
-		const fp1 = normalizeToolArgs("edit", { path: "a.txt", content: "hi" });
-		const fp2 = normalizeToolArgs("edit", { content: "hi", path: "a.txt" });
+		const fp1 = normalizeToolArgs("write", { path: "a.txt", content: "hi" });
+		const fp2 = normalizeToolArgs("write", { content: "hi", path: "a.txt" });
+		expect(fp1).toBe(fp2);
+	});
+
+	it("distinguishes nested object args in the default branch", () => {
+		const fp1 = normalizeToolArgs("consult", { question: "q", options: { limit: 5 } });
+		const fp2 = normalizeToolArgs("consult", { question: "q", options: { limit: 99 } });
+		expect(fp1).not.toBe(fp2);
+	});
+
+	it("sorts keys recursively at every depth", () => {
+		const fp1 = normalizeToolArgs("consult", { b: { z: 1, a: 2 }, a: 1 });
+		const fp2 = normalizeToolArgs("consult", { a: 1, b: { a: 2, z: 1 } });
 		expect(fp1).toBe(fp2);
 	});
 
