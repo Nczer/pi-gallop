@@ -16,6 +16,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
 const BINARY_SUPPRESSION_KEY = "gallopBinarySuppressionEnabled";
+const READ_GUARD_KEY = "gallopReadGuardEnabled";
 
 function loadSettings(): Record<string, any> {
   if (existsSync(SETTINGS_PATH)) {
@@ -40,6 +41,17 @@ function saveBinarySuppressionSetting(enabled: boolean): void {
   saveSettings(settings);
 }
 
+function loadReadGuardSetting(): boolean {
+  const settings = loadSettings();
+  return settings[READ_GUARD_KEY] !== false; // default true
+}
+
+function saveReadGuardSetting(enabled: boolean): void {
+  const settings = loadSettings();
+  settings[READ_GUARD_KEY] = enabled;
+  saveSettings(settings);
+}
+
 // ── State ──
 
 let cooldownUntil = 0;
@@ -47,6 +59,7 @@ let sawAssistantMessage = false;
 
 let pendingTask: string | null = null;
 let binarySuppressionEnabled = true;
+let readGuardEnabled = true;
 
 // ── Failure-loop detection state ──
 
@@ -186,6 +199,58 @@ export function detectBinaryContent(text: string): BinaryDetectionResult {
 /** @deprecated Use detectBinaryContent() for result with reason */
 export function isBinaryContent(text: string): boolean {
   return detectBinaryContent(text).binary;
+}
+
+// ── Read guard: binary file blocking ──
+
+/** Result from matching a read path against known binary extensions */
+export interface BinaryReadMatch {
+  ext: string;
+  hint: string;
+}
+
+/**
+ * Binary extension groups → hint for the block message.
+ * Image formats handled natively by the read tool (jpg/png/gif/webp/bmp) are
+ * deliberately excluded — those attach correctly. Unsupported image formats
+ * (tiff, heic, ...) are also excluded: pi may add native support without notice,
+ * and the tool_result content sniff catches them safely in the meantime.
+ */
+const BINARY_READ_EXTENSION_GROUPS: [string[], string][] = [
+  [[".pdf"], "Use the pdf skill (pdftotext, pdfinfo, etc.) to extract text"],
+  [[".docx", ".doc"], "Use the docx skill"],
+  [[".xlsx", ".xlsm", ".xls"], "Use the xlsx skill"],
+  [[".pptx", ".ppt"], "Use the pptx skill"],
+  [[".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war"], "Archive file — list/extract via bash (unzip -l, tar -tf, etc.)"],
+  [[".sqlite", ".sqlite3", ".db"], "Database file — query via bash (sqlite3)"],
+  [[".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".wasm", ".pyc", ".class"], "Compiled binary — inspect via bash (file, strings, objdump)"],
+  [[".parquet", ".npy", ".npz", ".onnx", ".gguf", ".safetensors", ".ckpt", ".pt", ".pkl"], "Data/model file — inspect via bash with an appropriate CLI"],
+  [[".mp3", ".wav", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm"], "Media file — inspect via bash (ffprobe, etc.)"],
+  [[".ttf", ".otf", ".woff", ".woff2", ".eot"], "Font file — inspect via bash (fc-scan, etc.)"],
+  [[".blend", ".sketch", ".fig"], "Design file — use an appropriate CLI via bash"],
+  [[".dwg", ".dxf", ".step", ".stp", ".iges", ".igs", ".stl", ".3mf", ".obj"], "CAD file — use an appropriate CLI via bash"],
+  [[".epub", ".mobi"], "E-book file — extract via bash (ebook-convert, pandoc)"],
+];
+
+/** Flat lookup: lowercase extension → hint */
+const BINARY_READ_EXTENSIONS: Record<string, string> = Object.fromEntries(
+  BINARY_READ_EXTENSION_GROUPS.flatMap(([exts, hint]) => exts.map((ext) => [ext, hint])),
+);
+
+/**
+ * Match a read-tool path against known binary extensions.
+ * Returns the matched extension and a remediation hint, or null for text files.
+ * Case-insensitive; dotfiles without a real extension never match.
+ */
+export function matchBinaryReadPath(filePath: string): BinaryReadMatch | null {
+  if (!filePath) return null;
+  const fileName = filePath.replace(/\\/g, "/").split("/").pop() ?? "";
+  const dotIndex = fileName.lastIndexOf(".");
+  // dotIndex <= 0: no extension, or dotfile like ".gitignore"
+  if (dotIndex <= 0) return null;
+  const ext = fileName.slice(dotIndex).toLowerCase();
+  const hint = BINARY_READ_EXTENSIONS[ext];
+  return hint ? { ext, hint } : null;
 }
 
 // ── Helpers ──
@@ -664,9 +729,32 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   // ── Session lifecycle ──
 
+  // ── Gallop-read-guard command ──
+
+  pi.registerCommand("gallop-read-guard", {
+    description: "Toggle read-guard (blocking reads of binary files like PDFs) on/off. Pass 'on', 'off', or nothing to toggle.",
+    handler: async (args, ctx) => {
+      const arg = (args ?? "").trim().toLowerCase();
+      if (arg === "on" || arg === "enable") {
+        readGuardEnabled = true;
+      } else if (arg === "off" || arg === "disable") {
+        readGuardEnabled = false;
+      } else {
+        readGuardEnabled = !readGuardEnabled;
+      }
+      saveReadGuardSetting(readGuardEnabled);
+      const status = readGuardEnabled ? "enabled" : "disabled";
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Gallop: read guard ${status}`, readGuardEnabled ? "info" : "warning");
+      }
+    },
+  });
+
   pi.on("session_start", async (_event, _ctx) => {
     resetAllState();
     binarySuppressionEnabled = loadBinarySuppressionSetting();
+    readGuardEnabled = loadReadGuardSetting();
   });
 
   // ── Stall detection ──
@@ -797,6 +885,31 @@ export default function gallopExtension(pi: ExtensionAPI) {
     // Circuit breaker tripped — no more auto-intervention
     if (circuitBreakerTripped) return;
 
+    // Read guard: block reads of known binary file types (pdf, docx, zip, ...).
+    // The read tool has no binary detection — it would dump raw bytes as garbled
+    // UTF-8 text into context. Images (jpg/png/gif/webp/bmp) are excluded since
+    // the read tool handles them natively.
+    if (event.toolName === "read" && readGuardEnabled) {
+      const readInput = event.input as { path?: unknown; file_path?: unknown } | undefined;
+      const readPath = typeof readInput?.path === "string"
+        ? readInput.path
+        : typeof readInput?.file_path === "string"
+          ? readInput.file_path
+          : undefined;
+      if (readPath) {
+        const match = matchBinaryReadPath(readPath);
+        if (match) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Gallop: blocked read of ${match.ext} file`, "warning");
+          }
+          return {
+            block: true,
+            reason: `[Gallop] Blocked read of binary file "${readPath}" (${match.ext}) — the read tool cannot handle binary files and would dump raw bytes as garbled text into context. ${match.hint}. (The user can disable this guard with /gallop-read-guard off.)`,
+          };
+        }
+      }
+    }
+
     // Check failure-loop blocks (bash commands)
     if (blockedPatterns.size > 0 && event.toolName === "bash") {
       const command = (event.input as any)?.command;
@@ -853,8 +966,15 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // ── Binary output filter ──
 
   pi.on("tool_result", async (event) => {
-    if (event.toolName !== "bash") return;
-    if (!binarySuppressionEnabled) return;
+    // bash: suppress binary command output. read: safety net for binary content
+    // that slipped past the extension guard (misnamed or extension-less files,
+    // unsupported image formats like tiff/heic). Image reads are safe — they
+    // carry only a short printable text note.
+    const isBash = event.toolName === "bash";
+    const isRead = event.toolName === "read";
+    if (!isBash && !isRead) return;
+    if (isBash && !binarySuppressionEnabled) return;
+    if (isRead && !readGuardEnabled) return;
 
     const content = event.content;
     if (!Array.isArray(content)) return;
@@ -873,12 +993,24 @@ export default function gallopExtension(pi: ExtensionAPI) {
     if (detection.binary) {
       const rawBytes = new TextEncoder().encode(fullText);
       const bytes = rawBytes.length;
-      const command = (event.input as any)?.command;
-      const shortCommand = typeof command === "string"
-        ? command.split("\n")[0].trim().length > 80
-          ? command.split("\n")[0].trim().slice(0, 77) + "..."
-          : command.split("\n")[0].trim()
-        : "<unknown>";
+      let sourceLine: string;
+      if (isRead) {
+        const readInput = event.input as { path?: unknown; file_path?: unknown } | undefined;
+        const readPath = typeof readInput?.path === "string"
+          ? readInput.path
+          : typeof readInput?.file_path === "string"
+            ? readInput.file_path
+            : "<unknown>";
+        sourceLine = `Path: \`${readPath}\``;
+      } else {
+        const command = (event.input as any)?.command;
+        const shortCommand = typeof command === "string"
+          ? command.split("\n")[0].trim().length > 80
+            ? command.split("\n")[0].trim().slice(0, 77) + "..."
+            : command.split("\n")[0].trim()
+          : "<unknown>";
+        sourceLine = `Command: \`${shortCommand}\``;
+      }
 
       // Hex dump of first 64 bytes for debugging (safe ASCII only)
       const headBytes = rawBytes.slice(0, 64);
@@ -896,7 +1028,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
       const headLines = lines.slice(0, 3);
       const tailLines = lines.length > 3 ? lines.slice(-5) : [];
 
-      let summary = `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${detection.reason})\nCommand: \`${shortCommand}\`\nHead (hex): ${hexHead}`;
+      let summary = `[Gallop] Binary output suppressed — ${bytes.toLocaleString()} bytes (${detection.reason})\n${sourceLine}\nHead (hex): ${hexHead}`;
       if (headLines.length) summary += `\n> ${headLines.join("\n> ")}`;
       if (tailLines.length && lines.length > 3) {
         summary += `\n...\n> ${tailLines.join("\n> ")}`;

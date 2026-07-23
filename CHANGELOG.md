@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.5.0
+
+### Added
+- **Read guard for binary files** — `read` calls on known binary extensions (`.pdf`, `.docx`/`.xlsx`/`.pptx`, archives, databases, compiled binaries, media, fonts, design/CAD files, e-books) are blocked at `tool_call` with a remediation hint (e.g. "Use the pdf skill"). The pi read tool has no binary detection and would otherwise dump raw bytes as garbled text into context. Image formats are excluded — both natively supported ones (jpg/png/gif/webp/bmp) and unsupported ones (tiff/heic/...), since pi may add support without notice; the result sniff below covers them. Toggle via `/gallop-read-guard [on|off]` (persisted as `gallopReadGuardEnabled`, default on).
+- **Read-result binary sniffing** — the binary output filter now also covers `read` tool results as a safety net for misnamed or extension-less binaries (e.g. a PDF named `report.txt`) and unsupported image formats. Image reads are unaffected (their text note is printable).
+
 ## v1.4.0
 
 ### Fixed

@@ -4,6 +4,15 @@ Keeps the agent moving. Prevents stalls and manages context lifecycle.
 
 ## Features
 
+### Read Guard (binary file blocking)
+
+Intercepts `read` tool calls targeting known binary file types (`.pdf`, `.docx`, `.xlsx`, `.pptx`, archives, databases, compiled binaries, media, CAD files, etc.) and blocks them before execution. The read tool has no binary detection — it would dump raw bytes as garbled UTF-8 text into context. The block message includes a remediation hint pointing at the right tool or skill (e.g. the pdf skill for `.pdf`).
+
+- Image formats the read tool handles natively (jpg/png/gif/webp/bmp) are **not** blocked
+- Unsupported image formats (tiff, heic, ...) are deliberately **not** blocked either — pi may add native support without notice, and the safety net below catches them until then
+- Safety net: `read` tool **results** are also sniffed for binary content (null bytes, >5% non-printable) and replaced with a suppression summary — catches misnamed or extension-less binaries and unsupported image formats
+- Toggle with `/gallop-read-guard [on|off]` (persisted, default on)
+
 ### Binary Output Filter
 
 Intercepts bash tool results before they enter context. Detects binary output (null bytes, >5% non-printable characters) and replaces it with a summary message. Prevents context corruption from accidental `head`, `cat`, or other commands on binary files.
