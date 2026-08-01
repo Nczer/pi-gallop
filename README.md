@@ -10,12 +10,13 @@ Intercepts `read` tool calls targeting known binary file types (`.pdf`, `.docx`,
 
 - Image formats the read tool handles natively (jpg/png/gif/webp/bmp) are **not** blocked
 - Unsupported image formats (tiff, heic, ...) are deliberately **not** blocked either — pi may add native support without notice, and the safety net below catches them until then
-- Safety net: `read` tool **results** are also sniffed for binary content (null bytes, >5% non-printable) and replaced with a suppression summary — catches misnamed or extension-less binaries and unsupported image formats
-- Toggle with `/gallop-read-guard [on|off]` (persisted, default on)
+- ASCII-capable CAD formats (`.stl`, `.obj`, `.step`, `.iges`, `.dxf`) are **not** blocked — they are often plain text the read tool handles fine; binary variants (e.g. binary STL) are caught by the safety net. Always-binary `.dwg` and `.3mf` remain blocked
+- Safety net: `read` tool **results** are also sniffed for binary content (null bytes, >5% non-printable, >5% U+FFFD replacement characters) and replaced with a suppression summary — catches misnamed or extension-less binaries and unsupported image formats
+- Toggle with `/gallop-read-guard [on|off]` (persisted, default on; stored in `~/.pi/agent/gallop.json` — pi's own `settings.json` is left untouched)
 
 ### Binary Output Filter
 
-Intercepts bash tool results before they enter context. Detects binary output (null bytes, >5% non-printable characters) and replaces it with a summary message. Prevents context corruption from accidental `head`, `cat`, or other commands on binary files.
+Intercepts bash tool results before they enter context. Detects binary output (null bytes, >5% non-printable characters, >5% U+FFFD replacement characters from undecodable bytes) and replaces it with a summary message. Prevents context corruption from accidental `head`, `cat`, or other commands on binary files.
 
 The summary includes:
 - Byte count and detection reason
@@ -28,8 +29,8 @@ The summary includes:
 Monitors assistant messages for unexpected stops. When the LLM halts mid-thought or mid-tool-call (not a clean `tool_use` handoff), sends a resume prompt.
 
 - Triggers on: `message_end` where last content is `thinking` or `tool_use`
-- Skips: `aborted`, `error`, and normal `tool_use` stops
-- 10s cooldown to avoid spam
+- Skips: `aborted`, `error`, and normal `tool_use` stops (a normal tool handoff **resets** the stall streak)
+- Resume messages throttled to one per 10s to avoid spam, but **every** stall counts toward escalation — a fast stuck loop escalates instead of resuming forever
 - Sends `[Gallop] Resume: <reason> (stopReason: <value>)` as steer message
 
 #### Stall Escalation
@@ -42,7 +43,7 @@ Consecutive stalls escalate to prevent infinite resume loops:
 | 4+ | Stronger resume with stall count warning |
 | 5+ | **Stop** auto-resume; notify user to try `/new` or `/compact` |
 
-Stall counter resets on any non-stall assistant message.
+Stall counter resets on any non-stall assistant message (a final text answer or a normal tool-use handoff).
 
 ### Failure-Loop Detection
 
@@ -85,6 +86,8 @@ If a nudge is ignored (same call repeats again), it escalates immediately:
 | 3 | **Nudge** | Suggest analyzing existing output or moving on |
 | 4 | **Nudge+** | Stronger warning to stop repeating |
 | 5+ | **Block** | Hard-block identical calls via `tool_call` interceptor |
+
+A successful call with different arguments clears the escalation state, so a later legitimate re-use of the same call (e.g. `npm run build` after editing files) starts fresh instead of being hard-blocked from an earlier streak.
 
 ### Circuit Breaker
 

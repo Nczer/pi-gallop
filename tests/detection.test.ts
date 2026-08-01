@@ -6,6 +6,7 @@ import {
 	lastItemIsThinking,
 	lastItemIsToolUse,
 	pruneFailureHistory,
+	detectBinaryContent,
 } from "../index";
 
 // ── normalizeCommand ──
@@ -189,6 +190,47 @@ describe("normalizeToolArgs", () => {
 	it("returns '{}' for non-object args", () => {
 		expect(normalizeToolArgs("read", "string")).toBe("{}");
 		expect(normalizeToolArgs("bash", 42)).toBe("{}");
+	});
+});
+
+// ── detectBinaryContent ──
+
+describe("detectBinaryContent", () => {
+	it("flags null bytes", () => {
+		const result = detectBinaryContent("abc\0def");
+		expect(result.binary).toBe(true);
+		expect(result.reason).toContain("null");
+	});
+
+	it("flags high ratio of control characters", () => {
+		expect(detectBinaryContent("a\x01b\x02c\x03d\x04").binary).toBe(true);
+	});
+
+	it("allows tabs, newlines, and carriage returns", () => {
+		expect(detectBinaryContent("line1\n\tline2\r\n").binary).toBe(false);
+	});
+
+	it("flags high ratio of U+FFFD replacement characters", () => {
+		// e.g. read output of a null-free binary decoded with buffer.toString("utf-8")
+		const text = "\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFDok";
+		const result = detectBinaryContent(text);
+		expect(result.binary).toBe(true);
+		expect(result.reason).toContain("replacement");
+	});
+
+	it("allows text with a few stray replacement characters", () => {
+		const text = "mostly fine text \uFFFD with a few issues";
+		expect(detectBinaryContent(text).binary).toBe(false);
+	});
+
+	it("passes normal text", () => {
+		expect(detectBinaryContent("hello world\nsecond line").binary).toBe(false);
+	});
+
+	it("handles empty string", () => {
+		const result = detectBinaryContent("");
+		expect(result.binary).toBe(false);
+		expect(result.reason).toBe("");
 	});
 });
 

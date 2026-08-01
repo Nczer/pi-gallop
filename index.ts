@@ -14,15 +14,26 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 // ── Persisted settings ──
 
-const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
+const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "gallop.json");
+const LEGACY_SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
 const BINARY_SUPPRESSION_KEY = "gallopBinarySuppressionEnabled";
 const READ_GUARD_KEY = "gallopReadGuardEnabled";
 
-function loadSettings(): Record<string, any> {
-  if (existsSync(SETTINGS_PATH)) {
-    try { return JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")); } catch {}
+/** Gallop's own settings file (~/.pi/agent/gallop.json). pi owns settings.json
+ *  and writes it under a proper-lockfile lock; writing to it from an extension
+ *  races pi's saves and can clobber keys or corrupt the file. */
+function readJsonFile(filePath: string): Record<string, any> | null {
+  if (existsSync(filePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, "utf-8"));
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
   }
-  return {};
+  return null;
+}
+
+function loadSettings(): Record<string, any> {
+  return readJsonFile(SETTINGS_PATH) ?? {};
 }
 
 function saveSettings(settings: Record<string, any>): void {
@@ -30,25 +41,19 @@ function saveSettings(settings: Record<string, any>): void {
   writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
 }
 
-function loadBinarySuppressionSetting(): boolean {
-  const settings = loadSettings();
-  return settings[BINARY_SUPPRESSION_KEY] !== false; // default true
+/** Load a toggle: gallop.json first, then migrate from legacy settings.json keys. */
+function loadToggleSetting(key: string, defaultValue: boolean): boolean {
+  const own = loadSettings();
+  if (own[key] !== undefined) return own[key] !== false;
+  // Legacy: toggles used to live in pi's settings.json — migrate if present.
+  const legacy = readJsonFile(LEGACY_SETTINGS_PATH);
+  if (legacy && legacy[key] !== undefined) return legacy[key] !== false;
+  return defaultValue;
 }
 
-function saveBinarySuppressionSetting(enabled: boolean): void {
+function saveToggleSetting(key: string, enabled: boolean): void {
   const settings = loadSettings();
-  settings[BINARY_SUPPRESSION_KEY] = enabled;
-  saveSettings(settings);
-}
-
-function loadReadGuardSetting(): boolean {
-  const settings = loadSettings();
-  return settings[READ_GUARD_KEY] !== false; // default true
-}
-
-function saveReadGuardSetting(enabled: boolean): void {
-  const settings = loadSettings();
-  settings[READ_GUARD_KEY] = enabled;
+  settings[key] = enabled;
   saveSettings(settings);
 }
 
@@ -85,11 +90,11 @@ let repetitiveCallState: {
 // Thresholds
 const FAILURE_LOOP_THRESHOLD = 3;     // N identical failures before nudging
 const FAILURE_LOOP_NUDGE_PLUS = 5;    // N failures before escalated nudge
-const FAILURE_LOOP_BLOCK = 7;         // N failures before hard block
+const FAILURE_LOOP_BLOCK = 5;         // N failures before hard block (immediate escalation reaches it from 4)
 const FAILURE_WINDOW_TURNS = 5;       // Only consider failures within last N turns
 const REPETITIVE_CALL_THRESHOLD = 3;  // N consecutive identical calls before nudging
 const REPETITIVE_CALL_NUDGE_PLUS = 5; // N consecutive calls before escalated nudge
-const REPETITIVE_CALL_BLOCK = 7;      // N consecutive calls before hard block
+const REPETITIVE_CALL_BLOCK = 5;      // N consecutive calls before hard block (immediate escalation reaches it from 4)
 const STALL_WARN = 4;                 // Stalls before strong warning
 const STALL_STOP = 5;                 // Stalls before stopping and notifying user
 const CIRCUIT_BREAKER_BLOCKS = 3;     // Total blocks before shutdown
@@ -162,8 +167,11 @@ interface BinaryDetectionResult {
 }
 
 /**
- * Detect binary content in bash output.
- * Checks for null bytes and high ratio of non-printable characters.
+ * Detect binary content in bash/read output.
+ * Checks for null bytes, high ratio of non-printable characters, and high
+ * ratio of U+FFFD replacement characters (undecodable bytes — e.g. the read
+ * tool decodes via buffer.toString("utf-8"), which mangles null-free binaries
+ * into U+FFFD walls with no control characters left to flag).
  * Returns a result with detection reason for use in suppression messages.
  */
 export function detectBinaryContent(text: string): BinaryDetectionResult {
@@ -174,13 +182,17 @@ export function detectBinaryContent(text: string): BinaryDetectionResult {
     return { binary: true, reason: "contains null bytes", nonPrintablePct: 0 };
   }
 
-  // Count non-printable bytes (excluding normal whitespace \n \r \t)
+  // Count non-printable chars (excluding normal whitespace \n \r \t) and
+  // U+FFFD replacement chars (undecodable bytes)
   let nonPrintable = 0;
+  let replacementChars = 0;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     // Control chars 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, plus DEL (0x7F)
     // Allow: 0x09 (\t), 0x0A (\n), 0x0D (\r)
-    if ((code >= 0x00 && code <= 0x08) ||
+    if (code === 0xFFFD) {
+      replacementChars++;
+    } else if ((code >= 0x00 && code <= 0x08) ||
         code === 0x0B || code === 0x0C ||
         (code >= 0x0E && code <= 0x1F) ||
         code === 0x7F) {
@@ -191,6 +203,11 @@ export function detectBinaryContent(text: string): BinaryDetectionResult {
   const pct = nonPrintable / text.length;
   if (pct > 0.05) {
     return { binary: true, reason: `${(pct * 100).toFixed(1)}% non-printable characters`, nonPrintablePct: pct };
+  }
+
+  const replacementPct = replacementChars / text.length;
+  if (replacementPct > 0.05) {
+    return { binary: true, reason: `${(replacementPct * 100).toFixed(1)}% replacement characters (invalid UTF-8)`, nonPrintablePct: 0 };
   }
 
   return { binary: false, reason: "", nonPrintablePct: pct };
@@ -228,7 +245,11 @@ const BINARY_READ_EXTENSION_GROUPS: [string[], string][] = [
   [[".mp3", ".wav", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm"], "Media file — inspect via bash (ffprobe, etc.)"],
   [[".ttf", ".otf", ".woff", ".woff2", ".eot"], "Font file — inspect via bash (fc-scan, etc.)"],
   [[".blend", ".sketch", ".fig"], "Design file — use an appropriate CLI via bash"],
-  [[".dwg", ".dxf", ".step", ".stp", ".iges", ".igs", ".stl", ".3mf", ".obj"], "CAD file — use an appropriate CLI via bash"],
+  // Only .dwg and .3mf are blocked: they are always binary. ASCII-capable CAD
+  // formats (.stl/.obj/.step/.iges/.dxf) are excluded — the read tool handles
+  // their text variants fine, and the tool_result content sniff catches the
+  // binary variants (e.g. binary STL, which always contains null bytes).
+  [[".dwg", ".3mf"], "CAD file — use an appropriate CLI via bash"],
   [[".epub", ".mobi"], "E-book file — extract via bash (ebook-convert, pandoc)"],
 ];
 
@@ -283,6 +304,11 @@ function triggerCompaction(
           pi.sendUserMessage(`[Gallop] Resume: ${task}`, { deliverAs: "steer" });
         }, 200);
       }
+    },
+    onError: () => {
+      // Compaction failed or was cancelled — don't keep a stale pending task
+      // that would show "(will resume)" on a later unrelated compaction.
+      pendingTask = null;
     },
   });
 }
@@ -372,13 +398,14 @@ async function handleCircuitBreaker(
   } else {
     // No UI — just step back. Reset totalBlocks too, otherwise the next block
     // immediately re-trips the breaker and spams the steer message every call.
+    const enforced = totalBlocks;
     blockedPatterns.clear();
     failureEscalation.clear();
     repetitiveEscalation.clear();
     totalBlocks = 0;
     circuitBreakerTripped = false;
     pi.sendUserMessage(
-      `[Gallop] Circuit breaker: ${totalBlocks} blocks enforced. Stepping back (no UI).`,
+      `[Gallop] Circuit breaker: ${enforced} blocks enforced. Stepping back (no UI).`,
       { deliverAs: "steer" },
     );
   }
@@ -718,7 +745,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
       } else {
         binarySuppressionEnabled = !binarySuppressionEnabled;
       }
-      saveBinarySuppressionSetting(binarySuppressionEnabled);
+      saveToggleSetting(BINARY_SUPPRESSION_KEY, binarySuppressionEnabled);
       const status = binarySuppressionEnabled ? "enabled" : "disabled";
 
       if (ctx.hasUI) {
@@ -742,7 +769,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
       } else {
         readGuardEnabled = !readGuardEnabled;
       }
-      saveReadGuardSetting(readGuardEnabled);
+      saveToggleSetting(READ_GUARD_KEY, readGuardEnabled);
       const status = readGuardEnabled ? "enabled" : "disabled";
 
       if (ctx.hasUI) {
@@ -753,8 +780,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, _ctx) => {
     resetAllState();
-    binarySuppressionEnabled = loadBinarySuppressionSetting();
-    readGuardEnabled = loadReadGuardSetting();
+    binarySuppressionEnabled = loadToggleSetting(BINARY_SUPPRESSION_KEY, true);
+    readGuardEnabled = loadToggleSetting(READ_GUARD_KEY, true);
   });
 
   // ── Stall detection ──
@@ -820,15 +847,24 @@ export default function gallopExtension(pi: ExtensionAPI) {
       if (stopReason === "aborted" || stopReason === "error") return;
 
       // Normal tool call flow: LLM stops with stopReason "toolUse" to let the tool run.
-      if (lastItemIsToolUse(event.message) && stopReason === "toolUse") return;
-
-      if (Date.now() < cooldownUntil) return;
-      cooldownUntil = Date.now() + 10_000;
+      if (lastItemIsToolUse(event.message) && stopReason === "toolUse") {
+        // Healthy handoff — resets the consecutive-stall streak.
+        stallCount = 0;
+        stallStopNotified = false;
+        return;
+      }
 
       stallCount++;
       const reason = lastItemIsThinking(event.message)
         ? "stopped mid-thought"
         : "stopped after tool call";
+
+      // Count every stall so fast stuck loops still escalate, but throttle
+      // resume messages to one per 10s so a stuck loop doesn't spam.
+      const messageAllowed = Date.now() >= cooldownUntil;
+      if (messageAllowed) {
+        cooldownUntil = Date.now() + 10_000;
+      }
 
       // Escalate based on consecutive stall count
       if (stallCount >= STALL_STOP) {
@@ -847,20 +883,24 @@ export default function gallopExtension(pi: ExtensionAPI) {
       }
 
       if (stallCount >= STALL_WARN) {
-        const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason}). This is stall #${stallCount} — if generation keeps stopping, consider compacting or restarting.`;
-        pi.sendUserMessage(msg, { deliverAs: "steer" });
+        if (messageAllowed) {
+          const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason}). This is stall #${stallCount} — if generation keeps stopping, consider compacting or restarting.`;
+          pi.sendUserMessage(msg, { deliverAs: "steer" });
 
-        if (ctx.hasUI) {
-          ctx.ui.notify(`Gallop: repeated stall #${stallCount} (${reason})`, "warning");
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Gallop: repeated stall #${stallCount} (${reason})`, "warning");
+          }
         }
         return;
       }
 
-      const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason})`;
-      pi.sendUserMessage(msg, { deliverAs: "steer" });
+      if (messageAllowed) {
+        const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason})`;
+        pi.sendUserMessage(msg, { deliverAs: "steer" });
 
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Gallop: ${reason} (stopReason: ${stopReason})`, "info");
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Gallop: ${reason} (stopReason: ${stopReason})`, "info");
+        }
       }
     } else {
       // Non-stall message — reset stall counter
@@ -1018,8 +1058,9 @@ export default function gallopExtension(pi: ExtensionAPI) {
         .map(b => b.toString(16).padStart(2, "0"))
         .join(" ");
 
-      // Strip control chars (except newlines/tabs) to extract readable lines
-      const cleaned = fullText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+      // Strip control chars (except newlines/tabs) and U+FFFD replacement
+      // chars to extract readable lines
+      const cleaned = fullText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFD]/g, "");
       const lines = cleaned.split("\n")
         .map(l => l.trim())
         .filter(l => l.length > 0)
@@ -1095,18 +1136,23 @@ export default function gallopExtension(pi: ExtensionAPI) {
           // Extract error fingerprint from result content
           const fingerprint = extractErrorFingerprint(event.result);
 
-          // Record the failure
-          failureHistory.push({
-            command: normalized,
-            fingerprint,
-            turnIndex: currentTurnIndex,
-          });
+          // Skip Gallop-generated failures: blocked calls still emit
+          // tool_execution_end with the block reason as the error result, and
+          // recording those would pollute the loop history with block text.
+          if (!fingerprint.startsWith("[gallop]")) {
+            // Record the failure
+            failureHistory.push({
+              command: normalized,
+              fingerprint,
+              turnIndex: currentTurnIndex,
+            });
 
-          // Prune old entries outside the window
-          pruneFailureHistory(failureHistory, currentTurnIndex, FAILURE_WINDOW_TURNS);
+            // Prune old entries outside the window
+            pruneFailureHistory(failureHistory, currentTurnIndex, FAILURE_WINDOW_TURNS);
 
-          // Check for failure loop
-          checkFailureLoop(normalized, fingerprint, ctx, pi);
+            // Check for failure loop
+            checkFailureLoop(normalized, fingerprint, ctx, pi);
+          }
         }
       }
     }
@@ -1115,11 +1161,15 @@ export default function gallopExtension(pi: ExtensionAPI) {
     if (event.isError) {
       const argFingerprint = normalizeToolArgs(event.toolName, pending?.args);
       const error = extractErrorFingerprint(event.result);
-      lastFailedToolCall = {
-        toolName: event.toolName,
-        fingerprint: `${event.toolName}:${argFingerprint}`,
-        error,
-      };
+      // Skip Gallop-generated failures (blocks, circuit breaker) — the block
+      // interceptor already handles those; mismatch detection would only add noise.
+      lastFailedToolCall = error.startsWith("[gallop]")
+        ? null
+        : {
+            toolName: event.toolName,
+            fingerprint: `${event.toolName}:${argFingerprint}`,
+            error,
+          };
     } else {
       // Success clears mismatch tracking
       lastFailedToolCall = null;
@@ -1131,8 +1181,16 @@ export default function gallopExtension(pi: ExtensionAPI) {
     // same command isn't flagged as a repetitive success.
     if (event.toolName === "bash" && event.isError) {
       repetitiveCallState = null;
-    } else if (repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
-      checkRepetitiveCall(repetitiveCallState.fingerprint, repetitiveCallState.count, pi, ctx);
+    } else {
+      if (!event.isError) {
+        // A successful call breaks the streak — clear escalation so a later
+        // legitimate re-use of the same fingerprint isn't hard-blocked from an
+        // earlier streak. Mirrors the failure-loop success clearing above.
+        repetitiveEscalation.clear();
+      }
+      if (repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
+        checkRepetitiveCall(repetitiveCallState.fingerprint, repetitiveCallState.count, pi, ctx);
+      }
     }
 
     pendingToolCalls.delete(event.toolCallId);
@@ -1146,6 +1204,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
       ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", `⟳ Compacting${resumePart}...`)}`);
       // Clear status if compaction is cancelled
       event.signal.addEventListener("abort", () => {
+        pendingTask = null;
         if (ctx.hasUI) {
           ctx.ui.setStatus("compact", undefined);
         }

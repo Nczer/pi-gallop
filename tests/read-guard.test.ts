@@ -35,10 +35,21 @@ describe("matchBinaryReadPath", () => {
 		expect(matchBinaryReadPath("lib.dll")).not.toBeNull();
 	});
 
-	it("matches CAD files", () => {
-		expect(matchBinaryReadPath("model.step")).not.toBeNull();
-		expect(matchBinaryReadPath("part.stl")).not.toBeNull();
+	it("blocks always-binary CAD formats", () => {
 		expect(matchBinaryReadPath("drawing.dwg")).not.toBeNull();
+		expect(matchBinaryReadPath("model.3mf")).not.toBeNull();
+	});
+
+	it("passes ASCII-capable CAD formats — Layer 2 content sniff handles binary variants", () => {
+		// STL/OBJ/STEP/IGES/DXF are frequently plain text that the read tool
+		// handles fine; binary variants (e.g. binary STL) are caught at
+		// tool_result by the null-byte sniff.
+		expect(matchBinaryReadPath("model.stl")).toBeNull();
+		expect(matchBinaryReadPath("mesh.obj")).toBeNull();
+		expect(matchBinaryReadPath("assembly.step")).toBeNull();
+		expect(matchBinaryReadPath("part.stp")).toBeNull();
+		expect(matchBinaryReadPath("surf.iges")).toBeNull();
+		expect(matchBinaryReadPath("dwg.dxf")).toBeNull();
 	});
 
 	it("does NOT match image formats the read tool handles natively", () => {

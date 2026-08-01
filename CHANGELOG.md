@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.6.0
+
+### Fixed
+- **Sticky repetitive-call blocks** — a blocked fingerprint stayed hard-blocked for the whole session (until compaction/restart), so a legitimate later re-use of the same call (e.g. `npm run build` after editing files) was blocked on first occurrence with a misleading message. A successful call now clears the repetitive escalation state, mirroring the failure-loop success clearing.
+- **Settings clobber risk** — Gallop wrote pi's own `~/.pi/agent/settings.json` with an unlocked read-modify-write, racing pi's locked writes (proper-lockfile) and risking lost keys or corrupted JSON. Toggles now live in `~/.pi/agent/gallop.json`; legacy values in settings.json are migrated on first load.
+- **Read guard false positives on ASCII CAD formats** — `.stl`, `.obj`, `.step`, `.iges`, `.dxf` are often plain text and are no longer blocked; binary variants (binary STL etc.) are caught by the result sniff. `.dwg` and `.3mf` remain blocked.
+- **Binary sniff missed U+FFFD walls** — the read tool decodes bytes via `buffer.toString("utf-8")`, so null-free binaries become walls of U+FFFD replacement chars with no control characters left to flag. `detectBinaryContent` now flags >5% replacement characters, and suppressed summaries strip them from the preview.
+- **No-UI circuit breaker message said "0 blocks enforced"** — the count is now captured before the state reset.
+- **Blocked calls polluted failure-loop history** — blocked calls still emit `tool_execution_end` with the block reason as the error result; those are no longer recorded as failures or fed to mismatch detection (fingerprints starting with `[gallop]` are skipped).
+- **Stall escalation didn't match README** — normal `toolUse` handoffs now reset the consecutive-stall streak, and stalls within the 10s message cooldown still count toward escalation, so fast stuck loops escalate to stop instead of resuming forever.
+- **Stale pending task after cancelled compaction** — `pendingTask` is cleared when compaction is aborted or errors, so a later unrelated compaction no longer shows "(will resume)" for an old task.
+
+### Changed
+- Dead block thresholds (7) replaced with the effective 5.
+
 ## v1.5.0
 
 ### Added
