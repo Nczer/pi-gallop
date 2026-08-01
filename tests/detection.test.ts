@@ -191,6 +191,36 @@ describe("normalizeToolArgs", () => {
 		expect(normalizeToolArgs("read", "string")).toBe("{}");
 		expect(normalizeToolArgs("bash", 42)).toBe("{}");
 	});
+
+	it("fingerprints edit calls by path plus oldText region tags", () => {
+		const fp1 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "first region" }] });
+		const fp2 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "second region" }] });
+		expect(fp1).not.toBe(fp2);
+	});
+
+	it("is stable for identical edit region tags", () => {
+		const fp1 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "foo()" }, { oldText: "bar()" }] });
+		const fp2 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "foo()" }, { oldText: "bar()" }] });
+		expect(fp1).toBe(fp2);
+	});
+
+	it("collapses formatting-only differences in region tags", () => {
+		// region tags are a short sanitized prefix — indentation/whitespace
+		// differences collapse (intentional fuzzy matching)
+		const fp1 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "  const x = 1;" }] });
+		const fp2 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "const x=1" }] });
+		expect(fp1).toBe(fp2);
+	});
+
+	it("distinguishes edits in different files", () => {
+		const fp1 = normalizeToolArgs("edit", { path: "src/a.ts", edits: [{ oldText: "foo()" }] });
+		const fp2 = normalizeToolArgs("edit", { path: "src/b.ts", edits: [{ oldText: "foo()" }] });
+		expect(fp1).not.toBe(fp2);
+	});
+
+	it("handles edit calls without an edits array", () => {
+		expect(normalizeToolArgs("edit", { path: "src/a.ts" })).toBe("src/a.ts:");
+	});
 });
 
 // ── detectBinaryContent ──
@@ -252,7 +282,7 @@ describe("lastItemIsThinking", () => {
 	});
 
 	it("returns false for string content", () => {
-		expect(lastItemIsThinking({ content: "hello" })).toBe(false);
+		expect(lastItemIsThinking({ content: "hello" } as any)).toBe(false);
 	});
 
 	it("returns false for missing content", () => {
@@ -283,7 +313,7 @@ describe("lastItemIsToolUse", () => {
 	});
 
 	it("returns false for string content", () => {
-		expect(lastItemIsToolUse({ content: "hello" })).toBe(false);
+		expect(lastItemIsToolUse({ content: "hello" } as any)).toBe(false);
 	});
 
 	it("returns false for missing content", () => {

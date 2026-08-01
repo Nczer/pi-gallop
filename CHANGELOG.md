@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.6.1
+
+### Fixed
+- **Repetitive-call "nudge+" level dead for successful streaks** — the v1.6.0 success-clearing wiped the current streak's escalation entry too, so count 4 sent a plain nudge instead of the escalated "previous nudge was ignored" warning. Success now clears only entries for *other* fingerprints, keeping the active streak's nudge → nudge+ → block ladder intact while still un-sticking unrelated blocked calls.
+
+### Tests
+- Added `escalate()` engine tests (level transitions, immediate escalation, max-level silence, below-threshold decay, UI notifications with severity) and `normalizeToolArgs` coverage for the `edit` branch.
+
 ## v1.6.0
 
 ### Fixed

@@ -105,9 +105,9 @@ let currentTurnIndex = 0;
 
 // ── Escalation state ──
 
-type EscalationLevel = "nudge" | "nudge_plus" | "block";
+export type EscalationLevel = "nudge" | "nudge_plus" | "block";
 
-interface EscalationEntry {
+export interface EscalationEntry {
   level: EscalationLevel;
   nudgeCount: number;
 }
@@ -525,7 +525,7 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
  * Repeated failures at the same level escalate immediately (previous warning ignored).
  * Callers provide a message builder for their context.
  */
-function escalate(
+export function escalate(
   fingerprint: string,
   count: number,
   threshold: number,
@@ -1183,10 +1183,14 @@ export default function gallopExtension(pi: ExtensionAPI) {
       repetitiveCallState = null;
     } else {
       if (!event.isError) {
-        // A successful call breaks the streak — clear escalation so a later
-        // legitimate re-use of the same fingerprint isn't hard-blocked from an
-        // earlier streak. Mirrors the failure-loop success clearing above.
-        repetitiveEscalation.clear();
+        // A successful call breaks the streak for OTHER fingerprints — clear
+        // their escalation so a later legitimate re-use isn't hard-blocked from
+        // an earlier streak. Keep the current fingerprint's entry so its own
+        // ladder (nudge → nudge+ → block) continues uninterrupted.
+        const current = repetitiveCallState?.fingerprint;
+        for (const key of repetitiveEscalation.keys()) {
+          if (key !== current) repetitiveEscalation.delete(key);
+        }
       }
       if (repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
         checkRepetitiveCall(repetitiveCallState.fingerprint, repetitiveCallState.count, pi, ctx);
