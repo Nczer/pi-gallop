@@ -728,6 +728,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
           type: "text",
           text: `Compacting (${reason})${resumeNote}.`,
         }],
+        terminate: true,
       };
     },
   });
