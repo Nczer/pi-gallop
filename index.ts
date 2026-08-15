@@ -721,12 +721,15 @@ export default function gallopExtension(pi: ExtensionAPI) {
       // to nudge the agent to continue.
       triggerCompaction(ctx, pi, undefined, pendingTask);
 
-      const resumeNote = pendingTask ? ` → ${pendingTask}` : "";
+      // Do NOT echo the pending task in the tool result: the tool call's own
+      // arguments (kept in the post-compaction tail) already carry it, and the
+      // [Gallop] Resume user message repeats it after compaction. Echoing here
+      // would put the full task text a third time in model context.
       return {
         details: {},
         content: [{
           type: "text",
-          text: `Compacting (${reason})${resumeNote}.`,
+          text: `Compacting (${reason}).`,
         }],
         terminate: true,
       };
