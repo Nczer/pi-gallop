@@ -147,7 +147,11 @@ deterministic, so the prefix stays cache-stable.
 `/qcompact [focus]` steers the live model to write the checkpoint and call
 `request_compact` (same cache-warm path); if the model does not call the tool by
 `message_end`, gallop falls back to `ctx.compact()` (pi's native one-shot), so
-`/qcompact` always compacts. A re-entrancy guard skips re-triggered
+`/qcompact` always compacts. A `message_end` that carries a pending
+`request_compact` call is not treated as non-compliance — pi emits
+`message_end` *before* pending tools execute, and the tool triggers the
+in-session compact itself a moment later (firing the native fallback first
+would abort the pending call and lose the checkpoint). A re-entrancy guard skips re-triggered
 `ctx.compact()` calls while a compact is in flight (pi would throw
 "Already compacted"), re-armed at each new user turn.
 

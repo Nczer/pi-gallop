@@ -958,9 +958,24 @@ ${CHECKPOINT_FORMAT}
     // (non-compliant model), compact anyway with pi's native one-shot, so
     // /qcompact always compacts. (If the model did call the tool, compaction is
     // already in flight — triggerCompaction's guard makes this a no-op.)
+    //
+    // EXCEPTION: pi emits message_end BEFORE pending tool calls execute (the
+    // agent-loop emits it at the end of streamAssistantResponse, then runs the
+    // tools). If request_compact is among the pending calls, it executes a
+    // moment later and triggers the proper in-session compact itself. Firing
+    // the native fallback now would start an un-stashed compact first: pi's
+    // compact() aborts the run, killing the pending tool call, and the tool's
+    // own trigger would be blocked by the re-entrancy guard. Keep the steering
+    // armed and re-check at the next message_end.
     if (qcompactSteering) {
-      qcompactSteering = false;
-      triggerCompaction(ctx, pi, undefined, true);
+      const pendingRequestCompact = Array.isArray(event.message.content) &&
+        event.message.content.some(
+          (b: any) => b?.type === "toolCall" && b?.name === "request_compact",
+        );
+      if (!pendingRequestCompact) {
+        qcompactSteering = false;
+        triggerCompaction(ctx, pi, undefined, true);
+      }
       return;
     }
 

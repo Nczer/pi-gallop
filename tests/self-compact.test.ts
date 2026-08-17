@@ -334,6 +334,52 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
+  it("does not fire the native fallback when message_end carries a pending request_compact tool call", async () => {
+    await commands.get("qcompact").handler(null, ctx);
+
+    // pi emits message_end BEFORE the pending tool call executes; the tool runs
+    // next and must trigger the proper in-session compact itself.
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I'll write the checkpoint now." },
+          { type: "toolCall", id: "c1", name: "request_compact", arguments: { message: "qcompact", summary: LONG_SUMMARY, continue: true } },
+        ],
+      },
+    }, ctx);
+
+    // The fallback must NOT have started an un-stashed native compact...
+    expect(ctx.compact).not.toHaveBeenCalled();
+
+    // ...the pending tool call executes right after and triggers the in-session
+    // compact with the stashed summary.
+    await callTool({ message: "qcompact", summary: LONG_SUMMARY, continue: true });
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    const result = await handlers.get("session_before_compact")({
+      preparation: prep(emptyOps()),
+      signal: new AbortController().signal,
+    }, ctx);
+    expect(result?.compaction?.summary).toContain(LONG_SUMMARY);
+  });
+
+  it("still falls back to a native compact when the pending tool call is not request_compact", async () => {
+    await commands.get("qcompact").handler(null, ctx);
+
+    // The model keeps working with other tools instead of calling request_compact.
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } }],
+      },
+    }, ctx);
+
+    // Non-compliant: the pending call is not request_compact → compact anyway.
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses /qcompact while a compact is running", async () => {
     const uiCtx = { ...ctx, hasUI: true, ui: { notify: vi.fn() } };
     await callTool({ message: "bloat", summary: LONG_SUMMARY });

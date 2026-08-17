@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.1
+
+### Fixed
+- **`/qcompact` native fallback fired before the model's `request_compact` call executed** — pi emits `message_end` *before* pending tool calls run, so the "model did not comply" fallback saw the steering still armed, started an un-stashed native compact, and pi's `compact()` (which aborts the run first) killed the pending `request_compact` tool call — the tool result became `Operation aborted`, its trigger was blocked by the re-entrancy guard, and the compaction entry was a stale native one-shot rewrite instead of the model's checkpoint. The fallback now skips `message_end`s that carry a pending `request_compact` tool call (keeping the steering armed for the next `message_end`); any other pending tool call or text end still falls back immediately.
+
+### Tests
+- Added 2 regression tests: pending `request_compact` defers the fallback (the subsequent tool execution triggers the in-session compact with the stashed summary), and a non-`request_compact` pending call still triggers the native fallback.
+
 ## v2.0.0
 
 ### Changed
