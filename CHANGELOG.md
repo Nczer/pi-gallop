@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.0.0
+
+### Changed
+- **Self-compact: the model writes the checkpoint summary in-session** — `request_compact` now requires a `summary` argument written by the live model (pi's checkpoint format, focused on older work since the recent ~20k tokens are kept verbatim). Summarization happens inside the session as a normal turn, so that LLM call rides the session's cached prompt prefix (cache-warm) — no subprocess, no cold prefill of the flattened conversation. Gallop stashes the summary and returns it as a custom `CompactionResult` in `session_before_compact` (with pi's file-list sections appended), so pi skips its one-shot summarizer.
+- **`reason`/`pending` replaced by `message`/`continue`** — `message` is a short user-visible string carried by the tool result (`Compacting (<message>).`); the summary is no longer echoed in the result. `continue` (boolean) replaces the free-text resume task: when `true`, one fixed generic steer is injected after compaction (`[Gallop] Compact done — proceed as commanded.`) — the checkpoint's Next Steps section carries the actual "what next", so no custom resume text is ever written or re-sent (the old `pending` text appeared up to three times in context).
+- **`/qcompact` restored** — steers the live model to write the checkpoint and call `request_compact` (same cache-warm path, optional focus argument); if the model does not call the tool by `message_end`, gallop falls back to `ctx.compact()` (pi's native one-shot), so `/qcompact` always compacts.
+- **Fallback chain** — native `/compact`, auto threshold, overflow recovery, a summary under 200 chars, or a user abort all return `undefined` from `session_before_compact`, so pi's native one-shot runs and compaction always works.
+
+### Fixed
+- **"Already compacted" re-entrancy** — `ctx.compact()` internally aborts the run executing `request_compact`, which can re-trigger a compaction while the last session entry is still the compaction entry (pi then throws "Already compacted"). A `compactionInFlight` guard skips redundant triggers; it is re-armed only at true new-turn boundaries (new user message, `/qcompact`, new session) — not on `session_compact` or compact complete/error, so the guard stays active through the whole re-trigger window.
+
+### Notes
+- **`request_compact` summary-arg pruning** — the checkpoint text also exists as the tool call's `summary` argument in the kept tail (~1k duplicated tokens on every request). A `context` handler prunes that argument from each LLM request once the exact text is verifiably carried by the compaction summary (byte-identical prefix match — gallop appends the file sections after the text, never before). Pre-compact tree views (no `compactionSummary` message), earlier compactions' tool calls, and newer aborted calls fail the check and keep their full argument. The session file is never touched (the TUI transcript still shows the full summary); the rewrite is deterministic, so the prefix stays cache-stable. Out-of-band forking would remove the tail copy by construction but costs a subprocess and byte-identical-prompt fragility (any drift in the serialized tools array cold-prefills the whole fork request, as observed live); the in-session design was kept deliberately.
+- The `[Gallop] Resume: <task>` injection is gone (no more free-text resume task); the fixed `[Gallop] Compact done — proceed as commanded.` steer is distinct from stall-detection resume messages.
+
+### Tests
+- Rewrote `self-compact.test.ts` (110 tests passing total): file-list helpers, tool behavior (stashing, terminate result, message defaulting, no summary echo, `continue` on/off), `session_before_compact` (custom compaction with file ops, native fallback for missing/short summaries, abort-listener register/cleanup, no stale-summary reuse), re-entrancy guard, `/qcompact` (steering content, focus, non-compliance fallback, no double-compact on compliance, refusal while running), state reset on `session_compact`, and the `context` summary-arg pruning handler (prune on verbatim carry, no-op without a compaction summary, non-matching/too-short args intact, multi-call selection, non-array content tolerated).
+
 ## v1.6.1
 
 ### Fixed

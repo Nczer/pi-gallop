@@ -109,13 +109,47 @@ Detects when the LLM acknowledges an error in its thinking but then calls the sa
 - One-shot: clears after firing or on any successful tool call
 - Operates independently of failure-loop and repetitive-call escalation
 
-### Compaction + Resume
+### Self-Compaction (cache-friendly)
 
-LLM can request compaction via the `request_compact` tool. After compaction completes, injects a resume message with the pending task.
+The LLM can request compaction via the `request_compact` tool and write the
+checkpoint summary itself — the summarization happens inside the live session
+(a normal turn), so that LLM call rides the session's cached prompt prefix with
+no cold prefill. Gallop stashes the summary and returns it as a custom
+`CompactionResult` in `session_before_compact` (with pi's file-list sections
+appended), so pi skips its one-shot summarizer (which cold-prefills the
+flattened conversation). If no usable summary is stashed (native `/compact`,
+auto threshold, overflow recovery, or a summary under 200 chars) or the user
+aborts, gallop returns `undefined` and pi's native one-shot runs — compaction
+always works.
 
-- `reason` — why compaction was requested
-- `pending` — task to resume after compaction
-- `customInstructions` — directions for the summarizer
+Tool arguments:
+
+- `message` — brief user-visible message shown in the tool result (`Compacting (<message>).`)
+- `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
+  Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
+  older work, since the recent ~20k tokens are kept verbatim. Stays in the kept tail
+  as the tool call's arguments — one copy, the price of in-session summarization.
+- `continue` (boolean) — if `true`, a fixed generic steer
+  (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
+  the checkpoint's Next Steps section tells the agent what to do next. Omitted/`false`
+  = the agent stops and you take the next step. No custom resume text is ever written
+  or re-sent.
+
+Once the checkpoint has become the compaction summary, a `context` handler
+prunes the `request_compact` tool call's `summary` argument from every LLM
+request (otherwise the ~1k-token text is duplicated in the kept tail on each
+call) — but only when the exact text is verifiably carried by a
+`compactionSummary` message in context, so pre-compact tree views, earlier
+compactions' calls, and aborted calls keep their full argument. The session
+file and TUI transcript always retain the full summary; the rewrite is
+deterministic, so the prefix stays cache-stable.
+
+`/qcompact [focus]` steers the live model to write the checkpoint and call
+`request_compact` (same cache-warm path); if the model does not call the tool by
+`message_end`, gallop falls back to `ctx.compact()` (pi's native one-shot), so
+`/qcompact` always compacts. A re-entrancy guard skips re-triggered
+`ctx.compact()` calls while a compact is in flight (pi would throw
+"Already compacted"), re-armed at each new user turn.
 
 Compaction resets all escalation state (blocks, nudges, stall count).
 
