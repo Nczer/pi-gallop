@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.0.2
+
+### Changed
+- **`/qcompact` steering message simplified** — it no longer embeds the full checkpoint format (~1k tokens); the format lives only in the `request_compact` tool description (system prompt), which the steering message now references. Saves duplicated tokens on every `/qcompact` steer.
+
 ## v2.0.1
 
 ### Fixed

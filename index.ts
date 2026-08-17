@@ -362,8 +362,9 @@ function triggerCompaction(
 /** Below this length a stashed summary is rejected (pi's one-shot runs instead). */
 const MIN_SUMMARY_LENGTH = 200;
 
-/** The exact checkpoint format the model must use. Shared by the tool
- *  description and the /qcompact steering message so both stay in sync. */
+/** The exact checkpoint format the model must use. Carried by the
+ *  request_compact tool description (system prompt); the /qcompact steering
+ *  message references it instead of duplicating it. */
 const CHECKPOINT_FORMAT = `## Goal
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
@@ -923,7 +924,7 @@ ${CHECKPOINT_FORMAT}
       qcompactSteering = true;
       const focusPart = focus ? ` Extra focus for the summary: ${focus}.` : "";
       pi.sendUserMessage(
-        `[Gallop] /qcompact: context compaction is requested. Write the checkpoint summary now and call request_compact with message="qcompact", continue=true, and summary=<your checkpoint>. ${CHECKPOINT_FORMAT}.${focusPart}`,
+        `[Gallop] /qcompact: context compaction is requested. Write the checkpoint summary now, in the exact checkpoint format given in the request_compact tool description, and call request_compact with message="qcompact", continue=true, and summary=<your checkpoint>.${focusPart}`,
         { deliverAs: "steer" },
       );
       if (ctx.hasUI) {

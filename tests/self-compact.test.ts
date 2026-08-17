@@ -293,8 +293,11 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(opts).toEqual({ deliverAs: "steer" });
     expect(text).toContain("/qcompact");
     expect(text).toContain("request_compact");
-    expect(text).toContain("## Goal");
-    expect(text).toContain("## Next Steps");
+    // The checkpoint format lives in the tool description (system prompt) only —
+    // the steering message references it, not duplicates it.
+    expect(text).toContain("tool description");
+    expect(text).not.toContain("## Goal");
+    expect(text).not.toContain("## Next Steps");
     expect(text).toContain("Extra focus for the summary: the parser.");
     // No compact yet — the model's turn produces the summary first.
     expect(ctx.compact).not.toHaveBeenCalled();
