@@ -23,6 +23,7 @@ The summary includes:
 - Hex head preview (first 64 bytes)
 - **First 3 and last 5 readable lines** (control chars stripped) so you can verify the command ran correctly
 - Total line count when output exceeds 8 readable lines
+- Toggle with `/gallop-binary [on|off]` (persisted, default on, in the same `~/.pi/agent/gallop.json`)
 
 ### Stall Detection
 
