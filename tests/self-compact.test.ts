@@ -460,7 +460,7 @@ describe("context handler (summary-arg pruning)", () => {
     expect(result).toBeDefined();
     const [compMsg, compactCall, other] = result.messages;
     expect(compMsg.role).toBe("compactionSummary");
-    expect(compactCall.content[1].arguments.summary).toBe("[moved into the compaction summary]");
+    expect(compactCall.content[1].arguments.summary).toBe("[omitted — full summary text is in the compaction summary at the top of context]");
     expect(compactCall.content[1].arguments.message).toBe("bloat"); // other args untouched
     expect(compactCall.content[0]).toEqual({ type: "text", text: "compacting" });
     expect(other).toEqual(otherToolCall()); // unrelated tool calls untouched
@@ -498,7 +498,7 @@ describe("context handler (summary-arg pruning)", () => {
 
     expect(result).toBeDefined();
     expect(result.messages[1].content[1].arguments.summary).toBe(otherCheckpoint);
-    expect(result.messages[2].content[1].arguments.summary).toBe("[moved into the compaction summary]");
+    expect(result.messages[2].content[1].arguments.summary).toBe("[omitted — full summary text is in the compaction summary at the top of context]");
   });
 
   it("handles messages without array content and non-matching roles", async () => {
@@ -511,6 +511,6 @@ describe("context handler (summary-arg pruning)", () => {
       ],
     }, ctx);
     expect(result).toBeDefined();
-    expect(result.messages[3].content[1].arguments.summary).toBe("[moved into the compaction summary]");
+    expect(result.messages[3].content[1].arguments.summary).toBe("[omitted — full summary text is in the compaction summary at the top of context]");
   });
 });

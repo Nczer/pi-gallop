@@ -842,9 +842,10 @@ ${CHECKPOINT_FORMAT}
       // processes a tool result and generates extra tokens before compaction.
       triggerCompaction(ctx, pi, undefined, params?.continue === true);
 
-      // Do NOT echo the summary in the tool result: the tool call's own arguments
-      // (kept in the post-compaction tail) already carry it. The user-visible
-      // message is the short 'message' argument only.
+      // Do NOT echo the summary in the tool result: after compaction the
+      // checkpoint lives in the compaction entry (top of context), and the
+      // context handler below prunes the duplicated `summary` argument from the
+      // tool call anyway. The user-visible message is the short 'message' arg.
       return {
         details: {},
         content: [{
@@ -1459,7 +1460,11 @@ ${CHECKPOINT_FORMAT}
           msgChanged = true;
           return {
             ...block,
-            arguments: { ...block.arguments, summary: "[moved into the compaction summary]" },
+            // Elision marker (not content): the full text is in the compaction
+            // entry at the top of context, so the argument is shortened to avoid
+            // re-sending it in every request. Worded so a resumed model can't
+            // mistake it for a value it itself passed.
+            arguments: { ...block.arguments, summary: "[omitted — full summary text is in the compaction summary at the top of context]" },
           };
         }
         return block;
