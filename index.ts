@@ -5,6 +5,8 @@
  * - Detects stalled generation (stopped mid-thinking or mid-tool-call) and sends resume
  * - Detects repetitive command failure loops and nudges the agent to change strategy
  * - LLM can trigger compaction via `request_compact` with an in-session checkpoint summary
+ * - Nudges the LLM to self-compact as the context nears its limit — pi's automatic
+ *   compaction stays enabled as the backstop for non-compliant or overflowing runs
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
@@ -67,22 +69,39 @@ let sawAssistantMessage = false;
  *  CompactionResult so pi skips its one-shot summarizer (a cold prefill of the
  *  flattened conversation). Null → pi's native one-shot. */
 let selfSummary: string | null = null;
-/** True while a /qcompact steering message is in flight (the live model has been
- *  asked to write the checkpoint and call request_compact but hasn't yet). Cleared
- *  on message_end (with a native compact fallback if the model did not comply),
- *  on compaction abort, and on session reset. */
-let qcompactSteering = false;
-/** Re-entrancy guard for ctx.compact(). ctx.compact() internally aborts the run
- *  executing request_compact, which can re-trigger a compaction (tool re-execution)
- *  while the last session entry is still the compaction entry — at which point pi
- *  throws "Already compacted". Set when a compact actually starts; cleared only at
- *  a true new-turn boundary (a new user message, a /qcompact command, or a new
- *  session) — NOT on session_compact or compact complete/error. */
+/** A compact was requested during the last run but has not run yet. Set when
+ *  request_compact executes ({ continue } from the tool arg). Consumed by the
+ *  agent_settled handler, which triggers the compact. Deferring to agent_settled is what makes
+ *  the trigger race-free: pi's automatic threshold compaction runs in the post-run
+ *  loop, BEFORE the settled event. If it fired, it consumed the stashed summary
+ *  via session_before_compact and session_compact cleared this flag — the manual
+ *  compact that would otherwise hit pi's "Already compacted" error is never
+ *  started. Cleared by session_compact (a compaction already did the work) and by
+ *  session reset. */
+let pendingCompact: { continue: boolean } | null = null;
+/** Re-entrancy guard for ctx.compact(). Set when a compact actually starts;
+ *  cleared only at a true new-turn boundary (a new user message or a new
+ *  session) — NOT on session_compact or compact complete/error.
+ *  Belt-and-braces: the deferred trigger already makes double-compaction a no-op,
+ *  this stops a redundant second ctx.compact() (and its continue message) in the
+ *  window before the next user turn. */
 let compactionInFlight = false;
 /** True while a ctx.compact() call is actually executing (from trigger to
- *  session_compact / onError). Lets /qcompact tell "compact running" apart from
- *  the post-compaction re-trigger window. */
+ *  session_compact / onError). Distinguishes "compact running" from the
+ *  post-compaction re-trigger window. */
 let compactionRunning = false;
+/** Context-pressure nudge state, one nudge per compaction cycle. "idle" →
+ *  advisory nudge just above pi's automatic threshold (reserveTokens +
+ *  NUDGE_BUFFER, or a fixed 16k when auto-compact is disabled); "nudged" →
+ *  silence — pi's automatic compaction is the backstop (or nothing, if it is
+ *  disabled). Reset on every compaction and session reset. */
+let contextNudgeState: "idle" | "nudged" = "idle";
+/** Buffer above pi's automatic threshold for the self-compact nudge — the
+ *  model gets one more message of warning before the native backstop fires. */
+const NUDGE_BUFFER = 2_048;
+/** Nudge threshold when pi's automatic compaction is disabled — no backstop
+ *  exists, so a fixed 16k (pi's default reserve). */
+const NUDGE_DISABLED_AT = 16_000;
 let binarySuppressionEnabled = true;
 let readGuardEnabled = true;
 
@@ -309,16 +328,27 @@ export function lastItemIsToolUse(message: { content?: unknown[] }): boolean {
   return typeof last === "object" && last !== null && (last as any).type === "toolCall";
 }
 
+const CONTINUE_STEER_MESSAGE = "[Gallop] Compact done — proceed as commanded.";
+
+/** Inject the generic proceed message a beat after compaction completes — the
+ *  checkpoint's Next Steps section carries the actual "what next", so no custom
+ *  resume text is ever written or re-sent. */
+function scheduleContinueSteer(pi: ExtensionAPI): void {
+  setTimeout(() => {
+    pi.sendUserMessage(CONTINUE_STEER_MESSAGE, { deliverAs: "steer" });
+  }, 200);
+}
+
 function triggerCompaction(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
   instructions?: string,
   continueAfter: boolean = false,
 ): void {
-  // Re-entrancy guard: ctx.compact() aborts the current run, which can re-trigger
-  // this function (tool re-execution) while the last session entry is still the
-  // compaction entry — pi would then throw "Already compacted". The first compact
-  // is already doing the work, so skip the redundant second trigger.
+  // Re-entrancy guard: skip a redundant second trigger while a compact from the
+  // previous turn boundary is still settling. (The deferred agent_settled trigger
+  // already prevents the automatic-threshold double-compact; this covers any
+  // other re-trigger before the next user message.)
   if (compactionInFlight) {
     return;
   }
@@ -327,18 +357,13 @@ function triggerCompaction(
   ctx.compact({
     customInstructions: instructions,
     onComplete: () => {
-      // `continue`: inject a GENERIC proceed message — the checkpoint's Next Steps
-      // section carries the actual "what next", so no custom resume text is ever
-      // written or re-sent.
       if (continueAfter) {
-        setTimeout(() => {
-          pi.sendUserMessage("[Gallop] Compact done — proceed as commanded.", { deliverAs: "steer" });
-        }, 200);
+        scheduleContinueSteer(pi);
       }
     },
     onError: () => {
-      // Compaction failed or was cancelled — mark it as no longer running so
-      // /qcompact can re-arm the guard on a later attempt.
+      // Compaction failed or was cancelled — mark it as no longer running so a
+      // later attempt isn't blocked.
       compactionRunning = false;
     },
   });
@@ -350,8 +375,21 @@ function triggerCompaction(
 // `summary` argument — a normal session turn, so that LLM call rides the
 // session's cached prompt prefix (no cold prefill). The summary is stashed and
 // returned by session_before_compact as a custom CompactionResult, so pi skips
-// its one-shot summarizer (a cold prefill of the flattened conversation). The
-// summary text would stay in the kept tail as the tool call's arguments —
+// its one-shot summarizer (a cold prefill of the flattened conversation).
+//
+// The compact itself is DEFERRED to agent_settled, not fired inside the tool's
+// execute. ctx.compact() first awaits the agent to become idle, which happens
+// only AFTER pi's post-run loop — where the automatic threshold compaction
+// runs. Firing from execute when the run's final usage crossed the threshold
+// would therefore always double-compact: the automatic compact completes first
+// (consuming the stashed summary), then the manual one throws "Already
+// compacted" and the TUI shows an error. Deferring to agent_settled (which
+// fires after the post-run loop) makes the outcome deterministic: automatic
+// compaction already ran → session_compact cleared the pending state → no
+// trigger; nothing ran → the deferred trigger compacts now, with the stashed
+// summary if the model called the tool, pi's native one-shot otherwise.
+//
+// The summary text would stay in the kept tail as the tool call's arguments —
 // duplicated on every request — but the `context` handler below prunes that
 // argument from LLM context once the text is safely carried by the compaction
 // summary itself (session file untouched). On abort, or when no usable
@@ -363,8 +401,7 @@ function triggerCompaction(
 const MIN_SUMMARY_LENGTH = 200;
 
 /** The exact checkpoint format the model must use. Carried by the
- *  request_compact tool description (system prompt); the /qcompact steering
- *  message references it instead of duplicating it. */
+ *  request_compact tool description (system prompt). */
 const CHECKPOINT_FORMAT = `## Goal
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
@@ -413,6 +450,107 @@ export function computeSelfCompactFileLists(fileOps: SelfCompactFileOps): { read
   const readFiles = [...fileOps.read].filter((f) => !modified.has(f)).sort();
   const modifiedFiles = [...modified].sort();
   return { readFiles, modifiedFiles };
+}
+
+/** Count context tokens the way pi's threshold check does
+ *  (calculateContextTokens, not exported from the package). */
+export function contextTokensFromUsage(usage: {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  totalTokens?: number;
+} | undefined): number {
+  if (!usage) return 0;
+  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+/** Pi's compaction settings, as gallop needs them. The extension API does not
+ *  expose settings, so read the settings.json files directly (read-only —
+ *  gallop never writes pi's files): global `~/.pi/agent/settings.json` plus
+ *  project `<cwd>/.pi/settings.json`, merged per key with the project winning
+ *  (mirrors pi's FileSettingsStorage; same reader shape as the context
+ *  extension). Missing/unparseable files fall back to pi's defaults. */
+export interface PiCompactionSettings {
+  reserveTokens: number;
+  enabled: boolean;
+}
+
+const PI_COMPACTION_DEFAULTS: PiCompactionSettings = { reserveTokens: 16_384, enabled: true };
+
+export function readPiCompactionSettings(
+  cwd: string,
+  globalPath: string = path.join(os.homedir(), ".pi", "agent", "settings.json"),
+): PiCompactionSettings {
+  const readCompaction = (file: string): { reserveTokens?: number; enabled?: boolean } | undefined => {
+    try {
+      const data: any = JSON.parse(readFileSync(file, "utf8"));
+      return data?.compaction && typeof data.compaction === "object" ? data.compaction : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const global = readCompaction(globalPath) ?? {};
+  const project = readCompaction(path.join(cwd, ".pi", "settings.json")) ?? {};
+  return {
+    reserveTokens: project.reserveTokens ?? global.reserveTokens ?? PI_COMPACTION_DEFAULTS.reserveTokens,
+    enabled: project.enabled ?? global.enabled ?? PI_COMPACTION_DEFAULTS.enabled,
+  };
+}
+
+/** Remaining-token threshold at which gallop nudges the model to self-compact:
+ *  just above pi's automatic threshold (reserveTokens + NUDGE_BUFFER) when
+ *  auto-compact is on, or a fixed 16k when it is off (nothing else would
+ *  fire). */
+export function nudgeThreshold(settings: PiCompactionSettings = PI_COMPACTION_DEFAULTS): number {
+  return settings.enabled ? settings.reserveTokens + NUDGE_BUFFER : NUDGE_DISABLED_AT;
+}
+
+/**
+ * Nudge the LLM to self-compact as the context nears its limit: one advisory
+ * steer per compaction cycle, just above pi's automatic threshold (or at a
+ * fixed 16k when auto-compact is disabled — then no backstop exists). A
+ * compliant model compacts cache-warm before the native backstop takes over;
+ * after the nudge, silence — the backstop (or overflow) decides. Like the old
+ * per-turn context-usage injection (removed in v1.3 as ambient noise), this
+ * rides the session's cached prompt prefix — but it fires at most once per
+ * compaction cycle instead of every turn.
+ */
+function checkContextNudge(
+  message: {
+    stopReason?: string;
+    usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number };
+  },
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): void {
+  if (circuitBreakerHalted) return;              // agent halted — a steer would restart a run where every tool is blocked
+  if (pendingCompact) return;                     // a compact request is already pending
+  if (compactionRunning) return;                 // compact in flight — usage about to drop
+  if (message.stopReason === "aborted" || message.stopReason === "error") return;
+  const window = ctx.model?.contextWindow ?? 0;
+  const tokens = contextTokensFromUsage(message.usage);
+  if (window <= 0 || tokens <= 0) return;
+  const remaining = window - tokens;
+
+  const settings = readPiCompactionSettings(ctx.cwd);
+  if (remaining > nudgeThreshold(settings)) return;
+  if (contextNudgeState === "nudged") return;    // one nudge per compaction cycle
+  contextNudgeState = "nudged";
+
+  const k = Math.max(1, Math.round(remaining / 1000));
+  if (settings.enabled) {
+    const m = Math.max(1, Math.round(settings.reserveTokens / 1000));
+    pi.sendUserMessage(
+      `[Gallop] Context is nearly full (~${k}k tokens remaining; pi's automatic compaction triggers at ~${m}k). If the current work is at a sensible pause point, write a checkpoint summary and call request_compact now so the summary stays cache-warm.`,
+      { deliverAs: "steer" },
+    );
+  } else {
+    pi.sendUserMessage(
+      `[Gallop] Context is nearly full (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call request_compact now — a context overflow would otherwise abort the run.`,
+      { deliverAs: "steer" },
+    );
+  }
 }
 
 /** Append pi-style <read-files>/<modified-files> sections to a summary.
@@ -534,7 +672,8 @@ function resetAllState(): void {
   cooldownUntil = 0;
   sawAssistantMessage = false;
   selfSummary = null;
-  qcompactSteering = false;
+  pendingCompact = null;
+  contextNudgeState = "idle";
 
   pendingToolCalls.clear();
   failureHistory.length = 0;
@@ -805,7 +944,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     name: "request_compact",
     label: "Request Compact",
     description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
-- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, or session is long.
+- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, the session is long, or a [Gallop] context-pressure notice asks you to.
 - Write the checkpoint summary yourself in the 'summary' argument, in this exact format:
 
 ${CHECKPOINT_FORMAT}
@@ -829,18 +968,21 @@ ${CHECKPOINT_FORMAT}
       },
       required: ["summary"],
     },
-    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean }, _signal, _onUpdate, ctx) {
+    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean }, _signal, _onUpdate, _ctx) {
       const message = params?.message || "model-initiated";
 
       // Stash the model's checkpoint for session_before_compact. A too-short summary
       // falls back to pi's native one-shot there, so compaction always works.
       const summary = (params?.summary || "").trim();
       selfSummary = summary.length >= MIN_SUMMARY_LENGTH ? summary : null;
-      qcompactSteering = false;
 
-      // Trigger compaction immediately inside the tool execute, so the LLM never
-      // processes a tool result and generates extra tokens before compaction.
-      triggerCompaction(ctx, pi, undefined, params?.continue === true);
+      // Defer the actual compact to agent_settled (the run ends right after this
+      // terminate result). If the run's final usage crossed pi's automatic
+      // threshold, pi's post-run compaction consumes the stashed summary first
+      // and session_compact clears pendingCompact — no double trigger, no
+      // "Already compacted" error. Otherwise the settled handler triggers the
+      // compact here with the stashed summary.
+      pendingCompact = { continue: params?.continue === true };
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the
@@ -903,37 +1045,6 @@ ${CHECKPOINT_FORMAT}
     },
   });
 
-  // ── /qcompact: user-initiated compact ──
-  // Steers the live model to write the checkpoint and call request_compact —
-  // the model's turn is a normal session request, so the summary is generated
-  // cache-warm. If the model does not call the tool by message_end, the
-  // message_end handler falls back to ctx.compact() (pi's native one-shot), so
-  // /qcompact always compacts.
-  pi.registerCommand("qcompact", {
-    description: "Compact now: asks the live model to write a cache-warm checkpoint summary and call request_compact (native one-shot fallback if it does not comply). Optional argument = extra focus for the summary.",
-    handler: async (args, ctx) => {
-      const focus = (args ?? "").trim();
-      if (compactionRunning) {
-        if (ctx.hasUI) {
-          ctx.ui.notify("Gallop: compact already in progress", "info");
-        }
-        return;
-      }
-      // /qcompact is an explicit new user compaction request — a new-turn boundary,
-      // so re-arm the re-entrancy guard.
-      compactionInFlight = false;
-      qcompactSteering = true;
-      const focusPart = focus ? ` Extra focus for the summary: ${focus}.` : "";
-      pi.sendUserMessage(
-        `[Gallop] /qcompact: context compaction is requested. Write the checkpoint summary now, in the exact checkpoint format given in the request_compact tool description, and call request_compact with message="qcompact", continue=true, and summary=<your checkpoint>.${focusPart}`,
-        { deliverAs: "steer" },
-      );
-      if (ctx.hasUI) {
-        ctx.ui.notify("Gallop: /qcompact — asking the model to write the checkpoint", "info");
-      }
-    },
-  });
-
   pi.on("session_start", async (_event, _ctx) => {
     resetAllState();
     binarySuppressionEnabled = loadToggleSetting(BINARY_SUPPRESSION_KEY, true);
@@ -955,31 +1066,15 @@ ${CHECKPOINT_FORMAT}
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant" || !sawAssistantMessage) return;
 
-    // /qcompact fallback: the steering message told the live model to write the
-    // checkpoint and call request_compact. If this run ended without the call
-    // (non-compliant model), compact anyway with pi's native one-shot, so
-    // /qcompact always compacts. (If the model did call the tool, compaction is
-    // already in flight — triggerCompaction's guard makes this a no-op.)
-    //
-    // EXCEPTION: pi emits message_end BEFORE pending tool calls execute (the
-    // agent-loop emits it at the end of streamAssistantResponse, then runs the
-    // tools). If request_compact is among the pending calls, it executes a
-    // moment later and triggers the proper in-session compact itself. Firing
-    // the native fallback now would start an un-stashed compact first: pi's
-    // compact() aborts the run, killing the pending tool call, and the tool's
-    // own trigger would be blocked by the re-entrancy guard. Keep the steering
-    // armed and re-check at the next message_end.
-    if (qcompactSteering) {
-      const pendingRequestCompact = Array.isArray(event.message.content) &&
-        event.message.content.some(
-          (b: any) => b?.type === "toolCall" && b?.name === "request_compact",
-        );
-      if (!pendingRequestCompact) {
-        qcompactSteering = false;
-        triggerCompaction(ctx, pi, undefined, true);
-      }
-      return;
-    }
+    // ── Context-pressure nudge ──
+    checkContextNudge(event.message, ctx, pi);
+
+    // request_compact: message_end triggers nothing. pi emits message_end
+    // BEFORE pending tool calls execute, and pi's automatic threshold
+    // compaction (when the run crossed it) runs in the post-run loop — both are
+    // resolved deterministically at agent_settled, where the deferred trigger
+    // compacts with the stashed summary, or skips entirely when a compaction
+    // already ran.
 
     // Circuit breaker tripped — no more stall intervention
     if (circuitBreakerTripped) return;
@@ -1094,6 +1189,26 @@ ${CHECKPOINT_FORMAT}
       stallCount = 0;
       stallStopNotified = false;
     }
+  });
+
+  // ── Deferred compact trigger ──
+  // agent_settled fires only after the post-run loop has completed — i.e. AFTER
+  // pi's automatic threshold compaction had its chance to run (it consumes the
+  // stashed summary via session_before_compact and clears pendingCompact via
+  // session_compact). Triggering the requested compact HERE, instead of inside
+  // the tool's execute, is what makes the race a no-op: a compaction that
+  // already ran leaves nothing pending, so the manual compact that would
+  // otherwise throw "Already compacted" is never started.
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!pendingCompact) return;
+    const continueAfter = pendingCompact.continue;
+    pendingCompact = null;
+    // Second line of defense (session_compact normally already cleared the
+    // pending state): if the branch already ends in a compaction entry — e.g.
+    // a user /compact in the same window — there is nothing to compact.
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    if (branch[branch.length - 1]?.type === "compaction") return;
+    triggerCompaction(ctx, pi, undefined, continueAfter);
   });
 
   // ── Turn tracking ──
@@ -1403,7 +1518,6 @@ ${CHECKPOINT_FORMAT}
     // unconditionally (not gated on hasUI) so a headless abort can't leave it.
     const onAbort = (): void => {
       selfSummary = null;
-      qcompactSteering = false;
       if (ctx.hasUI) {
         ctx.ui.setStatus("compact", undefined);
       }
@@ -1480,7 +1594,16 @@ ${CHECKPOINT_FORMAT}
     if (ctx.hasUI) {
       ctx.ui.setStatus("compact", undefined);
     }
+    // If this compaction satisfied a pending request — e.g. pi's automatic
+    // threshold compaction consumed the stashed summary before the deferred
+    // trigger could run — deliver the proceed message here; the deferred
+    // trigger will be a no-op. (The manual path delivers its own via
+    // onComplete; its pending state is already cleared by then.)
+    const continueAfter = pendingCompact?.continue ?? false;
     // Reset all Gallop state after compaction to avoid stale state
     resetAllState();
+    if (continueAfter) {
+      scheduleContinueSteer(pi);
+    }
   });
 }

@@ -136,6 +136,18 @@ Tool arguments:
   = the agent stops and you take the next step. No custom resume text is ever written
   or re-sent.
 
+The compact itself is **deferred to pi's `agent_settled` event** (emitted after
+the post-run loop). `ctx.compact()` first awaits the agent to go idle, which
+only happens *after* pi's automatic threshold compaction ran — so firing it
+inside the tool's `execute` at the moment a run's final usage crossed that
+threshold would always double-compact: the automatic compact consumes the
+stashed checkpoint first, then the manual one throws "Already compacted" and
+the TUI shows an error. Deferring makes the race a no-op — if the automatic
+compact (or a user `/compact`) ran first, `session_compact` clears the pending
+state and the deferred trigger skips (a second check that the branch does not
+already end in a compaction entry); in that race case the `continue` steer is
+sent from `session_compact` instead of the manual `onComplete`.
+
 Once the checkpoint has become the compaction summary, a `context` handler
 prunes the `request_compact` tool call's `summary` argument from every LLM
 request (otherwise the ~1k-token text is duplicated in the kept tail on each
@@ -145,16 +157,32 @@ compactions' calls, and aborted calls keep their full argument. The session
 file and TUI transcript always retain the full summary; the rewrite is
 deterministic, so the prefix stays cache-stable.
 
-`/qcompact [focus]` steers the live model to write the checkpoint and call
-`request_compact` (same cache-warm path); if the model does not call the tool by
-`message_end`, gallop falls back to `ctx.compact()` (pi's native one-shot), so
-`/qcompact` always compacts. A `message_end` that carries a pending
-`request_compact` call is not treated as non-compliance — pi emits
-`message_end` *before* pending tools execute, and the tool triggers the
-in-session compact itself a moment later (firing the native fallback first
-would abort the pending call and lose the checkpoint). A re-entrancy guard skips re-triggered
-`ctx.compact()` calls while a compact is in flight (pi would throw
-"Already compacted"), re-armed at each new user turn.
+`message_end` triggers nothing (pi emits it *before* pending tools execute) —
+every compact request resolves deterministically at `agent_settled`. A
+re-entrancy guard skips re-triggered `ctx.compact()` calls while a compact is
+in flight (pi would throw "Already compacted"), re-armed at each new user
+turn.
+
+`/qcompact` (v2.0.0–v2.0.2) is gone: the context-pressure nudge below asks the
+model to compact itself as the context fills, and pi's native `/compact`
+remains for an immediate user-initiated compact (cold one-shot — the trade for
+not needing a live-model checkpoint turn).
+
+### Context-pressure nudge
+
+As the context nears its limit, gallop steers the live model to self-compact:
+one advisory steer per compaction cycle (state resets on `session_compact`),
+placed just above pi's automatic threshold — `reserveTokens + 2k` (default ~18k
+remaining) when auto-compact is on, or a fixed 16k when it is off (then no
+backstop exists, and an overflow would abort the run). The threshold reads pi's
+compaction settings from the global + project `settings.json` (merged per key,
+project wins — same read-only reader shape as the context extension, falling
+back to pi's defaults), so it tracks a custom `reserveTokens` and stays
+proportionate on small context windows (e.g. 64k). After the nudge, silence —
+pi's automatic compaction (which also drives overflow recovery, so it stays
+enabled as the backstop) decides. No nudge while a compact is pending or in
+flight, when a message ends in aborted/error, or when the circuit breaker has
+halted the agent.
 
 Compaction resets all escalation state (blocks, nudges, stall count).
 

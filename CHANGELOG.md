@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.1.0
+
+### Fixed
+- **Double compact at the automatic threshold ("Compaction failed: Already compacted")** — when a run's final usage crossed pi's automatic threshold (default 16k remaining), the `request_compact` compact — fired inside the tool's `execute` — always lost the race: `ctx.compact()` first awaits the agent to go idle, which only happens AFTER pi's post-run loop where the automatic compact runs. The automatic compact consumed the stashed checkpoint first, then the manual compact threw "Already compacted" and the TUI showed an error. The compact is now deferred: the tool stashes the summary, marks the request pending, and returns `terminate: true`; the actual `ctx.compact()` fires on `agent_settled` (emitted after the post-run loop). If the automatic compact ran first, `session_compact` clears the pending state and the deferred trigger is a no-op (a second check that the branch does not already end in a compaction entry). In the race case the `continue` steer is sent from `session_compact` instead of the (never-run) manual `onComplete`. `message_end` now triggers nothing (pi emits it *before* pending tool calls execute), so the v2.0.1 pending-call special case is gone with it.
+
+### Added
+- **Context-pressure nudge** — as the context nears its limit, gallop steers the live model to self-compact: one advisory steer per compaction cycle, placed just above pi's automatic threshold — `reserveTokens + 2k` (default ~18k remaining) when auto-compact is on, or a fixed 16k when it is off (no backstop exists then, and an overflow would abort the run). The threshold reads pi's compaction settings from the global + project `settings.json` (merged per key, project wins — same read-only reader shape as the context extension, falling back to pi's defaults), so it tracks a custom `reserveTokens` and stays proportionate on small (e.g. 64k) context windows. After the nudge, silence — pi's automatic compaction (which also drives overflow recovery, so it stays enabled as the backstop) decides. No nudge while a compact is pending or in flight, when a message ends in aborted/error, or when the circuit breaker has halted the agent.
+
+### Removed
+- **`/qcompact`** — superseded by the context-pressure nudge (the model is asked to compact itself as the context fills) and pi's native `/compact` (immediate, cold one-shot). With it goes the non-compliance fallback path and its `qcompactSteering` state.
+
+### Tests
+- Rewrote the self-compact suite for the deferred semantics (stashes + defers to `agent_settled`, re-entrancy guard, `message_end` with a pending `request_compact` triggers nothing, state reset on `session_compact`, branch-ending check, and the 16k race regression — automatic compact consumes the stashed summary → deferred trigger is a no-op, continue steer sent from `session_compact`). New `context-pressure nudge` suite (threshold math from settings — per-key merge, project override, disabled → 16k, missing/malformed fallback; one nudge on the enabled and disabled paths, reset after compaction, skip conditions) and `contextTokensFromUsage` units. 118 tests total.
+
 ## v2.0.2
 
 ### Changed

@@ -1,7 +1,13 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import gallopExtension, {
   computeSelfCompactFileLists,
   appendSelfCompactFileOps,
+  contextTokensFromUsage,
+  readPiCompactionSettings,
+  nudgeThreshold,
 } from "../index";
 
 // ── computeSelfCompactFileLists ──
@@ -54,20 +60,19 @@ describe("appendSelfCompactFileOps", () => {
   });
 });
 
-// ── Integration: request_compact tool + session_before_compact / qcompact wiring ──
+// ── Integration: request_compact tool + session_before_compact wiring ──
 
 function makeMockPi() {
   const handlers = new Map<string, any>();
   const tools = new Map<string, any>();
-  const commands = new Map<string, any>();
   const pi = {
     on: vi.fn((name: string, handler: any) => { handlers.set(name, handler); }),
     registerTool: vi.fn((tool: any) => { tools.set(tool.name, tool); }),
-    registerCommand: vi.fn((name: string, cmd: any) => { commands.set(name, cmd); }),
+    registerCommand: vi.fn(),
     sendUserMessage: vi.fn(),
     appendEntry: vi.fn(),
   };
-  return { pi, handlers, tools, commands };
+  return { pi, handlers, tools };
 }
 
 /** A valid (>200 char) checkpoint summary in the exact format. */
@@ -102,17 +107,21 @@ describe("self-compact wiring (in-session summary)", () => {
   let pi: any;
   let handlers: Map<string, any>;
   let tools: Map<string, any>;
-  let commands: Map<string, any>;
   let ctx: any;
 
   beforeEach(() => {
-    ({ pi, handlers, tools, commands } = makeMockPi());
+    ({ pi, handlers, tools } = makeMockPi());
     gallopExtension(pi);
     ctx = {
       compact: vi.fn(),
       hasUI: false,
       cwd: "/tmp/gallop-test",
-      sessionManager: { getSessionFile: () => "/tmp/gallop-test/session.jsonl" },
+      sessionManager: {
+        getSessionFile: () => "/tmp/gallop-test/session.jsonl",
+        // Branch does not end in a compaction entry (nothing compacted yet).
+        // Override in tests that simulate a completed compaction.
+        getBranch: vi.fn(() => []),
+      },
     };
     // Reset shared module state (no disk I/O) so each test is independent.
     // compactionInFlight is deliberately NOT in resetAllState (it stays active through
@@ -120,6 +129,9 @@ describe("self-compact wiring (in-session summary)", () => {
     void handlers.get("session_compact")(null, { hasUI: false });
     void handlers.get("message_start")({ message: { role: "user" } }, ctx);
   });
+
+  /** Run settles — the deferred compact trigger point (after pi's post-run loop). */
+  const settle = () => handlers.get("agent_settled")(null, ctx);
 
   const prep = (fileOps: any) => ({
     firstKeptEntryId: "entry-123",
@@ -137,16 +149,22 @@ describe("self-compact wiring (in-session summary)", () => {
 
   // ── request_compact tool ──
 
-  it("stashes the summary, triggers compact, and returns the short message with terminate", async () => {
+  it("stashes the summary, defers the compact to agent_settled, and returns the short message with terminate", async () => {
     const result = await callTool({ message: "context bloat", summary: LONG_SUMMARY });
 
-    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    // No compact during execute — the run ends (terminate) and pi's post-run
+    // loop (automatic threshold compaction) gets its chance first.
+    expect(ctx.compact).not.toHaveBeenCalled();
     expect(result.terminate).toBe(true);
     const text = result.content[0].text;
     expect(text).toBe("Compacting (context bloat).");
     // The summary must NOT be echoed in the tool result — the tool call's own
     // arguments (kept in the tail) already carry it.
     expect(text).not.toContain("## Goal");
+
+    // Run settles without a compaction having run → deferred trigger fires.
+    await settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
   it("defaults the message to 'model-initiated' when omitted", async () => {
@@ -156,6 +174,7 @@ describe("self-compact wiring (in-session summary)", () => {
 
   it("injects the generic proceed message after compaction when continue is true", async () => {
     await callTool({ message: "bloat", summary: LONG_SUMMARY, continue: true });
+    await settle();
     const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
     opts.onComplete();
@@ -167,6 +186,7 @@ describe("self-compact wiring (in-session summary)", () => {
 
   it("does not inject anything after compaction when continue is false or omitted", async () => {
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await settle();
     const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
     opts.onComplete();
@@ -177,6 +197,7 @@ describe("self-compact wiring (in-session summary)", () => {
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
     ctx.compact.mockClear();
     await callTool({ message: "bloat", summary: LONG_SUMMARY, continue: false });
+    await settle();
     const opts2 = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
     opts2.onComplete();
@@ -269,96 +290,47 @@ describe("self-compact wiring (in-session summary)", () => {
 
   // ── re-entrancy ──
 
-  it("ignores a re-triggered request_compact while a compact is in flight", async () => {
+  it("blocks a redundant trigger while a compact is in flight; a new user turn re-arms", async () => {
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
-    // Simulate the tool re-executing after ctx.compact()'s internal abort.
+    // Another request before any user turn: the guard blocks the redundant
+    // trigger (and its continue message).
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
     // A new user turn re-arms the guard — the next request is honored.
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(2);
   });
 
-  // ── /qcompact ──
+  // ── message_end behavior ──
 
-  it("steers the live model to write the checkpoint and call request_compact", async () => {
-    await commands.get("qcompact").handler("the parser", ctx);
-
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    const [text, opts] = pi.sendUserMessage.mock.calls[0];
-    expect(opts).toEqual({ deliverAs: "steer" });
-    expect(text).toContain("/qcompact");
-    expect(text).toContain("request_compact");
-    // The checkpoint format lives in the tool description (system prompt) only —
-    // the steering message references it, not duplicates it.
-    expect(text).toContain("tool description");
-    expect(text).not.toContain("## Goal");
-    expect(text).not.toContain("## Next Steps");
-    expect(text).toContain("Extra focus for the summary: the parser.");
-    // No compact yet — the model's turn produces the summary first.
-    expect(ctx.compact).not.toHaveBeenCalled();
-  });
-
-  it("omits the focus sentence when no argument is given", async () => {
-    await commands.get("qcompact").handler("", ctx);
-    const [text] = pi.sendUserMessage.mock.calls[0];
-    expect(text).not.toContain("Extra focus");
-  });
-
-  it("falls back to a native compact when the model does not comply by message_end", async () => {
-    await commands.get("qcompact").handler(null, ctx);
-    expect(ctx.compact).not.toHaveBeenCalled();
-
-    // The run ends with an assistant message that did NOT call request_compact.
-    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
-    await handlers.get("message_end")({ message: { role: "assistant", content: [{ type: "text", text: "hmm" }] } }, ctx);
-
-    expect(ctx.compact).toHaveBeenCalledTimes(1);
-    // No stashed summary → native one-shot.
-    const result = await handlers.get("session_before_compact")(
-      { preparation: prep(emptyOps()), signal: new AbortController().signal },
-      ctx,
-    );
-    expect(result).toBeUndefined();
-  });
-
-  it("does not double-compact when the model complies (tool call after steering)", async () => {
-    await commands.get("qcompact").handler(null, ctx);
-    await callTool({ message: "qcompact", summary: LONG_SUMMARY, continue: true });
-    expect(ctx.compact).toHaveBeenCalledTimes(1);
-
-    // The run ends (aborted by the tool's compact) — the fallback must be a no-op.
-    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
-    await handlers.get("message_end")({ message: { role: "assistant", content: [] } }, ctx);
-    expect(ctx.compact).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not fire the native fallback when message_end carries a pending request_compact tool call", async () => {
-    await commands.get("qcompact").handler(null, ctx);
-
-    // pi emits message_end BEFORE the pending tool call executes; the tool runs
-    // next and must trigger the proper in-session compact itself.
+  it("message_end with a pending request_compact triggers nothing; the tool stashes and settle compacts", async () => {
+    // pi emits message_end BEFORE the pending tool call executes: nothing may
+    // trigger here (an un-stashed compact would race the tool's stashed one).
     await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
     await handlers.get("message_end")({
       message: {
         role: "assistant",
         content: [
           { type: "text", text: "I'll write the checkpoint now." },
-          { type: "toolCall", id: "c1", name: "request_compact", arguments: { message: "qcompact", summary: LONG_SUMMARY, continue: true } },
+          { type: "toolCall", id: "c1", name: "request_compact", arguments: { message: "context bloat", summary: LONG_SUMMARY, continue: true } },
         ],
       },
     }, ctx);
-
-    // The fallback must NOT have started an un-stashed native compact...
     expect(ctx.compact).not.toHaveBeenCalled();
 
-    // ...the pending tool call executes right after and triggers the in-session
-    // compact with the stashed summary.
-    await callTool({ message: "qcompact", summary: LONG_SUMMARY, continue: true });
+    // The pending tool call executes right after and stashes the summary.
+    await callTool({ message: "context bloat", summary: LONG_SUMMARY, continue: true });
+    expect(ctx.compact).not.toHaveBeenCalled();
+
+    // Settle → deferred trigger compacts with the stashed summary.
+    await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
     const result = await handlers.get("session_before_compact")({
       preparation: prep(emptyOps()),
@@ -367,42 +339,231 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(result?.compaction?.summary).toContain(LONG_SUMMARY);
   });
 
-  it("still falls back to a native compact when the pending tool call is not request_compact", async () => {
-    await commands.get("qcompact").handler(null, ctx);
-
-    // The model keeps working with other tools instead of calling request_compact.
-    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
-    await handlers.get("message_end")({
-      message: {
-        role: "assistant",
-        content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } }],
-      },
-    }, ctx);
-
-    // Non-compliant: the pending call is not request_compact → compact anyway.
-    expect(ctx.compact).toHaveBeenCalledTimes(1);
-  });
-
-  it("refuses /qcompact while a compact is running", async () => {
-    const uiCtx = { ...ctx, hasUI: true, ui: { notify: vi.fn() } };
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
-
-    await commands.get("qcompact").handler(null, uiCtx);
-    expect(ctx.compact).toHaveBeenCalledTimes(1); // refused, no new compact
-    expect(uiCtx.ui.notify).toHaveBeenCalledWith("Gallop: compact already in progress", "info");
-  });
-
   // ── session_compact ──
 
-  it("clears compaction state on session_compact so /qcompact works again", async () => {
+  it("clears compaction state on session_compact so a new request works again", async () => {
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
     await handlers.get("session_compact")(null, { hasUI: false });
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
 
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(2);
+  });
+
+  // ── the threshold race (request_compact vs pi's automatic compaction) ──
+
+  it("does not double-compact when pi's automatic compaction ran first (the 16k race)", async () => {
+    // LLM calls request_compact right as the run's final usage crosses pi's
+    // automatic threshold. The automatic compact runs in pi's post-run loop,
+    // BEFORE agent_settled — it consumes the stashed summary (cache-warm, no
+    // cold prefill) and session_compact clears the pending state.
+    await callTool({ message: "model-initiated", summary: LONG_SUMMARY, continue: true });
+    expect(ctx.compact).not.toHaveBeenCalled();
+
+    const auto = await handlers.get("session_before_compact")(
+      { preparation: prep(emptyOps()), signal: new AbortController().signal },
+      ctx,
+    );
+    expect(auto?.compaction?.summary).toContain(LONG_SUMMARY);
+
+    pi.sendUserMessage.mockClear();
+    await handlers.get("session_compact")(null, ctx);
+
+    // Settle: deferred trigger is a no-op — no second compact, no
+    // "Already compacted" error. The continue message comes from the
+    // session_compact handler (the manual onComplete never ran).
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+    await flushTimers();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+  });
+
+  it("skips the deferred trigger when the branch already ends in a compaction entry", async () => {
+    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    // A compaction completed in the same window but its session_compact event
+    // did not reach our state (defensive path): the branch check catches it.
+    ctx.sessionManager.getBranch.mockReturnValue([{ type: "compaction", summary: "x" }]);
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+});
+
+// ── contextTokensFromUsage ──
+
+describe("contextTokensFromUsage", () => {
+  it("prefers totalTokens, else sums the parts; undefined → 0", () => {
+    expect(
+      contextTokensFromUsage({ totalTokens: 100, input: 10, output: 2, cacheRead: 3, cacheWrite: 4 }),
+    ).toBe(100);
+    expect(contextTokensFromUsage({ input: 10, output: 2, cacheRead: 3, cacheWrite: 4 })).toBe(19);
+    expect(contextTokensFromUsage(undefined)).toBe(0);
+  });
+});
+
+// ── context-pressure nudge ──
+
+describe("context-pressure nudge", () => {
+  const WINDOW = 200_000;
+  let pi: any;
+  let handlers: Map<string, any>;
+  let tools: Map<string, any>;
+  let ctx: any;
+  let tmpHome: string;
+  let tmpCwd: string;
+
+  beforeEach(() => {
+    ({ pi, handlers, tools } = makeMockPi());
+    gallopExtension(pi);
+    // Isolate pi's settings read (gallop merges global + project settings.json,
+    // the global path coming from $HOME).
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-nudge-home-"));
+    tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-nudge-cwd-"));
+    vi.stubEnv("HOME", tmpHome);
+    ctx = {
+      compact: vi.fn(),
+      hasUI: false,
+      cwd: tmpCwd,
+      model: { contextWindow: WINDOW },
+      sessionManager: { getSessionFile: () => "/tmp/gallop-test/session.jsonl", getBranch: vi.fn(() => []) },
+    };
+    void handlers.get("session_compact")(null, { hasUI: false });
+    void handlers.get("message_start")({ message: { role: "user" } }, ctx);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const writeSettings = (settings: unknown, scope: "global" | "project" = "project") => {
+    const dir = scope === "global" ? path.join(tmpHome, ".pi", "agent") : path.join(tmpCwd, ".pi");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "settings.json"), typeof settings === "string" ? settings : JSON.stringify(settings));
+  };
+
+  /** Global path that does not exist — unit tests scope to it explicitly. */
+  const missingGlobal = () => path.join(tmpHome, "missing-settings.json");
+
+  /** assistant message whose usage leaves `remaining` tokens of the window. */
+  const usageMsg = (remaining: number) => ({
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "working" }],
+      stopReason: "stop",
+      usage: {
+        input: WINDOW - remaining,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: WINDOW - remaining,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    },
+  });
+
+  const endTurn = async (remaining: number) => {
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")(usageMsg(remaining), ctx);
+  };
+
+  const nudgeSteers = () =>
+    pi.sendUserMessage.mock.calls
+      .map(([t]) => t)
+      .filter((t) => t.startsWith("[Gallop] Context"));
+
+  const resetState = async () => {
+    void handlers.get("session_compact")(null, { hasUI: false });
+    await handlers.get("message_start")({ message: { role: "user" } }, ctx);
+  };
+
+  // ── threshold math (unit) ──
+
+  it("defaults (no settings files): enabled, 16k reserve → nudges at 18,432 remaining", () => {
+    expect(readPiCompactionSettings(tmpCwd, missingGlobal())).toEqual({ reserveTokens: 16_384, enabled: true });
+    expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(18_432);
+  });
+
+  it("follows a custom reserveTokens (auto-compact on → reserve + 2k)", () => {
+    writeSettings({ compaction: { reserveTokens: 30_000 } });
+    expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(32_048);
+  });
+
+  it("merges per key with the project file winning; disabled → fixed 16k", () => {
+    writeSettings({ compaction: { reserveTokens: 30_000 } }, "global");
+    writeSettings({ compaction: { enabled: false } }, "project");
+    // Default global path = the stubbed $HOME (writeSettings' global scope).
+    const s = readPiCompactionSettings(tmpCwd);
+    expect(s).toEqual({ reserveTokens: 30_000, enabled: false });
+    expect(nudgeThreshold(s)).toBe(16_000);
+  });
+
+  it("treats missing or malformed settings files as pi's defaults", () => {
+    writeSettings("{ broken json");
+    expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(18_432);
+  });
+
+  // ── nudge message path ──
+
+  it("nudges once just above the automatic threshold and does not repeat", async () => {
+    // Default settings: nudge at 18,432 remaining.
+    await endTurn(19_000);
+    expect(nudgeSteers()).toHaveLength(0);
+
+    await endTurn(18_000);
+    expect(nudgeSteers()).toHaveLength(1);
+    expect(nudgeSteers()[0]).toContain("~18k tokens remaining");
+    expect(nudgeSteers()[0]).toContain("automatic compaction triggers at ~16k");
+
+    // Deeper still — silence, the backstop is just below.
+    await endTurn(15_000);
+    expect(nudgeSteers()).toHaveLength(1);
+  });
+
+  it("nudges at 16k when auto-compact is disabled", async () => {
+    writeSettings({ compaction: { enabled: false } });
+    await endTurn(17_000);
+    expect(nudgeSteers()).toHaveLength(0);
+
+    await endTurn(15_000);
+    expect(nudgeSteers()).toHaveLength(1);
+    expect(nudgeSteers()[0]).toContain("~15k tokens remaining");
+    expect(nudgeSteers()[0]).toContain("automatic compaction is disabled");
+  });
+
+  it("resets after a compaction (fresh cycle)", async () => {
+    await endTurn(18_000);
+    await resetState();
+    await endTurn(15_000);
+    expect(nudgeSteers()).toHaveLength(2);
+  });
+
+  it("does not nudge while a compact is pending or on aborted/error messages", async () => {
+    // 15k is below every threshold — only the skip conditions are under test.
+    // pending compact
+    await resetState();
+    await tools.get("request_compact").execute("id1", { summary: LONG_SUMMARY }, new AbortController().signal, undefined, ctx);
+    await endTurn(15_000);
+    expect(nudgeSteers()).toHaveLength(0);
+
+    // aborted / error messages never count
+    await resetState();
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({ message: { ...usageMsg(15_000).message, stopReason: "aborted" } }, ctx);
+    await handlers.get("message_end")({ message: { ...usageMsg(14_000).message, stopReason: "error" } }, ctx);
+    expect(nudgeSteers()).toHaveLength(0);
+  });
+
+  it("does not nudge without a model or usage", async () => {
+    const noModel = { ...ctx, model: undefined };
+    await handlers.get("message_start")({ message: { role: "assistant" } }, noModel);
+    await handlers.get("message_end")(usageMsg(15_000), noModel);
+    expect(nudgeSteers()).toHaveLength(0);
   });
 });
 
