@@ -402,7 +402,11 @@ const MIN_SUMMARY_LENGTH = 200;
 
 /** The exact checkpoint format the model must use. Carried by the
  *  request_compact tool description (system prompt). */
-const CHECKPOINT_FORMAT = `## Goal
+/** Checkpoint summary format. The kept-tail line is parameterized: pi's
+ *  compaction.keepRecentTokens (default 20k) is user-configurable, and the
+ *  guidance must match what pi will actually keep verbatim. */
+export function checkpointFormat(keepRecentTokens: number = PI_COMPACTION_DEFAULTS.keepRecentTokens): string {
+  return `## Goal
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
 ## Constraints & Preferences
@@ -430,9 +434,10 @@ const CHECKPOINT_FORMAT = `## Goal
 - [Or "(none)" if not applicable]
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.
-Focus on OLDER work — the most recent ~20k tokens are kept verbatim, so do not restate
+Focus on OLDER work — the most recent ~${Math.round(keepRecentTokens / 1000)}k tokens are kept verbatim, so do not restate
 what is already recent. If a previous checkpoint summary is present in the conversation,
 fold its still-relevant content into this one.`;
+}
 
 /** Shape of pi's FileOperations (read/written/edited path sets). Structurally
  *  compatible with the package's FileOperations type. */
@@ -474,15 +479,16 @@ export function contextTokensFromUsage(usage: {
 export interface PiCompactionSettings {
   reserveTokens: number;
   enabled: boolean;
+  keepRecentTokens: number;
 }
 
-const PI_COMPACTION_DEFAULTS: PiCompactionSettings = { reserveTokens: 16_384, enabled: true };
+const PI_COMPACTION_DEFAULTS: PiCompactionSettings = { reserveTokens: 16_384, enabled: true, keepRecentTokens: 20_000 };
 
 export function readPiCompactionSettings(
   cwd: string,
   globalPath: string = path.join(os.homedir(), ".pi", "agent", "settings.json"),
 ): PiCompactionSettings {
-  const readCompaction = (file: string): { reserveTokens?: number; enabled?: boolean } | undefined => {
+  const readCompaction = (file: string): { reserveTokens?: number; enabled?: boolean; keepRecentTokens?: number } | undefined => {
     try {
       const data: any = JSON.parse(readFileSync(file, "utf8"));
       return data?.compaction && typeof data.compaction === "object" ? data.compaction : undefined;
@@ -495,6 +501,7 @@ export function readPiCompactionSettings(
   return {
     reserveTokens: project.reserveTokens ?? global.reserveTokens ?? PI_COMPACTION_DEFAULTS.reserveTokens,
     enabled: project.enabled ?? global.enabled ?? PI_COMPACTION_DEFAULTS.enabled,
+    keepRecentTokens: project.keepRecentTokens ?? global.keepRecentTokens ?? PI_COMPACTION_DEFAULTS.keepRecentTokens,
   };
 }
 
@@ -938,16 +945,21 @@ function checkFailureLoop(
 // ── Main extension ──
 
 export default function gallopExtension(pi: ExtensionAPI) {
+  // The checkpoint guidance must name the tail pi actually keeps: the user
+  // may customize compaction.keepRecentTokens (default 20k). Read at
+  // registration time — a changed setting takes effect on the next /reload,
+  // like the rest of the extension's load-time state.
+  const keepRecentTokens = readPiCompactionSettings(process.cwd()).keepRecentTokens;
   // ── Tool: LLM can request compaction ──
 
   pi.registerTool({
     name: "request_compact",
     label: "Request Compact",
     description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
-- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, the session is long, or a [Gallop] context-pressure notice asks you to.
+- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, a planned task finished and another is queued (compact at the boundary — the next task starts on a fresh context), the session is long, or a [Gallop] context-pressure notice asks you to.
 - Write the checkpoint summary yourself in the 'summary' argument, in this exact format:
 
-${CHECKPOINT_FORMAT}
+${checkpointFormat(keepRecentTokens)}
 - 'message': brief user-visible message shown while compacting.
 - 'continue': pass true to keep working right after compaction — a generic proceed message is injected. The checkpoint's Next Steps section tells you what to do next. Omit or pass false when the task is done or the user takes the next step.`,
     parameters: {

@@ -128,13 +128,20 @@ Tool arguments:
 - `message` — brief user-visible message shown in the tool result (`Compacting (<message>).`)
 - `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
   Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
-  older work, since the recent ~20k tokens are kept verbatim. Stays in the kept tail
-  as the tool call's arguments — one copy, the price of in-session summarization.
+  older work, since the recent tokens up to pi's `compaction.keepRecentTokens`
+  (default ~20k, user-configurable) are kept verbatim — the tool description names
+  the configured value. Stays in the kept tail as the tool call's arguments — one
+  copy, the price of in-session summarization.
 - `continue` (boolean) — if `true`, a fixed generic steer
   (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
   the checkpoint's Next Steps section tells the agent what to do next. Omitted/`false`
   = the agent stops and you take the next step. No custom resume text is ever written
   or re-sent.
+
+The tool description also suggests compacting at task boundaries: when a planned
+task finished and another is queued, the checkpoint becomes the handoff for the
+next task (which starts on a fresh context) instead of the next task inheriting
+the previous one's tool-call history.
 
 The compact itself is **deferred to pi's `agent_settled` event** (emitted after
 the post-run loop). `ctx.compact()` first awaits the agent to go idle, which

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Task-boundary compaction hint** — `request_compact`'s "Call when" guidance now includes a proactive trigger for multi-task sessions: when a planned task finished and another is queued, write the checkpoint now (with `continue: true`) so the next task starts on a fresh context. The pattern proved in the field: a three-task session compacted at every boundary — the checkpoint summary plus the verbatim tail is a complete handoff, and the KV cache is rebuilt by compaction anyway, so a boundary compact costs nothing relative to running hot until the pressure nudge fires.
+
+### Changed
+- **Checkpoint format names the actual kept-tail size** — pi's `compaction.keepRecentTokens` (default 20k) is user-configurable, but the checkpoint guidance hardcoded "~20k tokens are kept verbatim", which misinforms the model when it differs (over- or under-summarizing). `readPiCompactionSettings` now reads `keepRecentTokens` too, and the tool description names the configured value (read at registration — a changed value takes effect on the next /reload, like the rest of the extension's load-time state). `checkpointFormat()` is exported for tests.
+
+### Tests
+- `keepRecentTokens` merge/fallback units (project wins over global, 20k default) and `checkpointFormat` interpolation. 120 tests total.
+
 ## v2.1.0
 
 ### Fixed

@@ -4,34 +4,6 @@ Backlog of improvement items for gallop, each recorded with the evidence that
 motivated it. When an item is implemented it moves to CHANGELOG.md and is
 removed from here.
 
-## Self-compact: compact at task boundaries
-
-**Observed (2026-08, three-task session that compacted between each task).**
-For a multi-task session with an explicit task list, compacting at every task
-boundary beat waiting for context pressure:
-
-- Post-compact context is the checkpoint summary + the most recent ~20k
-  tokens verbatim. The next task starts with a fresh, plan-carrying context
-  and without the previous task's tool-call history (the actual bloat).
-- The KV cache is rebuilt by compaction anyway, so a boundary compact costs
-  nothing relative to running hot until the pressure nudge fires near the
-  limit.
-- The checkpoint summary *is* the handoff: with complete Progress / Key
-  Decisions / Next Steps sections, the next task's work is self-contained.
-
-**Change.** The `request_compact` description's "Call when" list (index.ts)
-is reactive — bloat symptoms (edit tool failing on text matching, large
-diffs accumulated), a long session, the context-pressure notice. Add a
-proactive trigger, e.g.:
-
-> a planned task finished and another is queued (e.g. the next item in
-> project memory) — write the checkpoint now with `continue: true` so the
-> next task starts on a fresh context.
-
-No change to the post-compact continue steer: it is deliberately generic
-(`[Gallop] Compact done — proceed as commanded.`) and the checkpoint's Next
-Steps section carries the specifics.
-
 ## Self-compact: the checkpoint-elision incident
 
 **Incident (2026-08, same session).** After a compaction, the model saw the
@@ -67,3 +39,17 @@ its quality is entirely the model's. Options if it matters in practice:
    code alone.
 
 Recommendation: 2, until the incident recurs in a gallop-only session.
+
+## Pi-core candidate: keepRecentTokens should adapt to the window
+
+`compaction.keepRecentTokens` (the verbatim tail pi keeps after compaction,
+default 20k) is user-configurable in settings.json, so gallop no longer
+needs a knob for it — the checkpoint guidance now names the configured
+value (Unreleased changelog). What remains is the *default* being a fixed
+number: on a 200k window 20k is ~10% of the window (fine — roughly the
+last 5–10 tool cycles, or one large file read); on a 64k window it is ~31%
+of the window, leaving little headroom after the summary. A proportional
+default (e.g. `max(8k, 10% of window)`) would adapt without configuration.
+Candidate for a pi-core issue, not a gallop change. The LLM has no concept
+of the tail size — the model only sees what the tail happens to contain, so
+this is a harness compression parameter, not something the model tunes.

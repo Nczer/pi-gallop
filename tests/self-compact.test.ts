@@ -8,6 +8,7 @@ import gallopExtension, {
   contextTokensFromUsage,
   readPiCompactionSettings,
   nudgeThreshold,
+  checkpointFormat,
 } from "../index";
 
 // ── computeSelfCompactFileLists ──
@@ -484,9 +485,23 @@ describe("context-pressure nudge", () => {
 
   // ── threshold math (unit) ──
 
-  it("defaults (no settings files): enabled, 16k reserve → nudges at 18,432 remaining", () => {
-    expect(readPiCompactionSettings(tmpCwd, missingGlobal())).toEqual({ reserveTokens: 16_384, enabled: true });
+  it("defaults (no settings files): enabled, 16k reserve, 20k kept tail → nudges at 18,432 remaining", () => {
+    expect(readPiCompactionSettings(tmpCwd, missingGlobal())).toEqual({ reserveTokens: 16_384, enabled: true, keepRecentTokens: 20_000 });
     expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(18_432);
+  });
+
+  it("follows a custom keepRecentTokens (project wins over global; falls back to 20k)", () => {
+    expect(readPiCompactionSettings(tmpCwd, missingGlobal()).keepRecentTokens).toBe(20_000);
+    writeSettings({ compaction: { keepRecentTokens: 40_000 } }, "global");
+    expect(readPiCompactionSettings(tmpCwd).keepRecentTokens).toBe(40_000);
+    writeSettings({ compaction: { keepRecentTokens: 8_000 } }, "project");
+    expect(readPiCompactionSettings(tmpCwd).keepRecentTokens).toBe(8_000);
+  });
+
+  it("checkpointFormat names the kept tail it will actually keep", () => {
+    expect(checkpointFormat()).toContain("~20k tokens are kept verbatim");
+    expect(checkpointFormat(40_000)).toContain("~40k tokens are kept verbatim");
+    expect(checkpointFormat(8_000)).toContain("~8k tokens are kept verbatim");
   });
 
   it("follows a custom reserveTokens (auto-compact on → reserve + 2k)", () => {
@@ -499,7 +514,7 @@ describe("context-pressure nudge", () => {
     writeSettings({ compaction: { enabled: false } }, "project");
     // Default global path = the stubbed $HOME (writeSettings' global scope).
     const s = readPiCompactionSettings(tmpCwd);
-    expect(s).toEqual({ reserveTokens: 30_000, enabled: false });
+    expect(s).toEqual({ reserveTokens: 30_000, enabled: false, keepRecentTokens: 20_000 });
     expect(nudgeThreshold(s)).toBe(16_000);
   });
 
