@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 
 // ── Persisted settings ──
 
@@ -942,6 +943,42 @@ function checkFailureLoop(
   );
 }
 
+// ── request_compact rendering (TUI + /export HTML) ──
+// Without renderCall/renderResult, pi's /export HTML falls into its default
+// case — JSON.stringify(args), i.e. the full checkpoint summary dumped in
+// every export (native tools like read/bash ship one-line renderers instead).
+// These renderers keep the native look: a one-line title plus the short
+// result line. The checkpoint itself is deliberately NOT rendered here — the
+// [compaction] entry right below the call already carries it (Ctrl+O in the
+// TUI, click in the export), and showing it in the tool view would print the
+// same text twice under the same expand toggle.
+// Structural theme type: pi's Theme satisfies it; keeps the helpers free of
+// a pi-internal Theme import.
+
+interface CompactRenderTheme {
+  fg: (name: string, text: string) => string;
+  bold?: (text: string) => string;
+}
+
+function formatCompactCallLine(theme: CompactRenderTheme): string {
+  const bold = theme.bold ?? ((s: string) => s);
+  return theme.fg("toolTitle", bold("request_compact"));
+}
+
+function formatCompactResultText(
+  theme: CompactRenderTheme,
+  result: { content?: Array<{ type: string; text?: string }> } | undefined,
+  options: { isPartial?: boolean },
+): string {
+  if (options.isPartial) return theme.fg("warning", "Compacting…");
+  const text = (result?.content ?? [])
+    .filter((block) => block?.type === "text")
+    .map((block) => String(block.text ?? ""))
+    .join("\n")
+    .trim();
+  return text ? theme.fg("toolOutput", text) : "";
+}
+
 // ── Main extension ──
 
 export default function gallopExtension(pi: ExtensionAPI) {
@@ -1008,6 +1045,19 @@ ${checkpointFormat(keepRecentTokens)}
         }],
         terminate: true,
       };
+    },
+    renderCall(
+      _args: { message?: string; summary?: string },
+      theme: CompactRenderTheme,
+    ) {
+      return new Text(formatCompactCallLine(theme), 0, 0);
+    },
+    renderResult(
+      result: { content?: Array<{ type: string; text?: string }> },
+      options: { isPartial?: boolean },
+      theme: CompactRenderTheme,
+    ) {
+      return new Text(formatCompactResultText(theme, result, options), 0, 0);
     },
   });
 
