@@ -468,7 +468,8 @@ export function contextTokensFromUsage(usage: {
   totalTokens?: number;
 } | undefined): number {
   if (!usage) return 0;
-  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  const sum = (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+  return usage.totalTokens ?? sum;
 }
 
 /** Pi's compaction settings, as gallop needs them. The extension API does not
