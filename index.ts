@@ -391,9 +391,9 @@ function triggerCompaction(
 // summary if the model called the tool, pi's native one-shot otherwise.
 //
 // The summary text would stay in the kept tail as the tool call's arguments —
-// duplicated on every request — but the `context` handler below prunes that
-// argument from LLM context once the text is safely carried by the compaction
-// summary itself (session file untouched). On abort, or when no usable
+// duplicated on every request — but the `context` handler below drops the
+// whole request_compact exchange from LLM context once the text is safely
+// carried by the compaction summary itself (session file untouched). On abort, or when no usable
 // summary is stashed (native /compact, auto threshold, overflow recovery, or a
 // too-short summary), the handler returns undefined and pi uses its native
 // one-shot — compaction always works.
@@ -623,6 +623,24 @@ export function extractErrorFingerprint(result: any): string {
 }
 
 /**
+ * Clear block state after the breaker steps back. Resets totalBlocks too,
+ * otherwise the next block immediately re-trips the breaker and spams the
+ * steer message every call.
+ */
+function stepBackAfterBlocks(pi: ExtensionAPI, note: string): void {
+  const enforced = totalBlocks;
+  blockedPatterns.clear();
+  failureEscalation.clear();
+  repetitiveEscalation.clear();
+  totalBlocks = 0;
+  circuitBreakerTripped = false;
+  pi.sendUserMessage(
+    `[Gallop] Circuit breaker: ${enforced} blocks enforced. Stepping back${note}.`,
+    { deliverAs: "steer" },
+  );
+}
+
+/**
  * Handle circuit breaker: pause agent with a UI dialog, let user decide.
  */
 async function handleCircuitBreaker(
@@ -640,34 +658,33 @@ async function handleCircuitBreaker(
     );
 
     if (choice === "Stop") {
-      // Block all further tool calls — agent will halt and return to prompt
+      // Block all further tool calls — agent will halt and return to prompt.
+      // A plain user message does NOT unblock (only /compact, /new, or a
+      // breaker reset call resetAllState), so the wording must not promise
+      // otherwise.
       circuitBreakerHalted = true;
       pi.sendUserMessage(
-        `[Gallop] Circuit breaker: agent halted by user. You can type a new message, or use /compact / /new.`,
+        `[Gallop] Circuit breaker: agent halted by user. Tools stay blocked until you use /compact or /new.`,
         { deliverAs: "steer" },
       );
-      return { block: true, reason: `[Gallop] Circuit breaker: agent halted by user. Type a message or use /compact / /new.` };
+      return { block: true, reason: `[Gallop] Circuit breaker: agent halted by user. Use /compact or /new to unblock tools.` };
     }
 
-    // "Continue" — full reset, fresh Gallop state
-    resetAllState();
-    pi.sendUserMessage(
-      `[Gallop] Circuit breaker: blocks cleared by user. Continuing.`,
-      { deliverAs: "steer" },
-    );
+    if (choice === "Continue") {
+      // "Continue" — full reset, fresh Gallop state
+      resetAllState();
+      pi.sendUserMessage(
+        `[Gallop] Circuit breaker: blocks cleared by user. Continuing.`,
+        { deliverAs: "steer" },
+      );
+    } else {
+      // Dialog dismissed with no choice — step back rather than claiming the
+      // user cleared the blocks.
+      stepBackAfterBlocks(pi, " (dialog dismissed)");
+    }
   } else {
-    // No UI — just step back. Reset totalBlocks too, otherwise the next block
-    // immediately re-trips the breaker and spams the steer message every call.
-    const enforced = totalBlocks;
-    blockedPatterns.clear();
-    failureEscalation.clear();
-    repetitiveEscalation.clear();
-    totalBlocks = 0;
-    circuitBreakerTripped = false;
-    pi.sendUserMessage(
-      `[Gallop] Circuit breaker: ${enforced} blocks enforced. Stepping back (no UI).`,
-      { deliverAs: "steer" },
-    );
+    // No UI — just step back.
+    stepBackAfterBlocks(pi, " (no UI)");
   }
 
   // Let this tool call through
@@ -986,7 +1003,10 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // The checkpoint guidance must name the tail pi actually keeps: the user
   // may customize compaction.keepRecentTokens (default 20k). Read at
   // registration time — a changed setting takes effect on the next /reload,
-  // like the rest of the extension's load-time state.
+  // like the rest of the extension's load-time state. The extension factory
+  // gets no session ctx, so the project-scope lookup uses process.cwd() (the
+  // session cwd for a normal pi launch); the nudge threshold below still
+  // reads ctx.cwd live.
   const keepRecentTokens = readPiCompactionSettings(process.cwd()).keepRecentTokens;
   // ── Tool: LLM can request compaction ──
 
@@ -1036,8 +1056,8 @@ ${checkpointFormat(keepRecentTokens)}
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the
-      // context handler below prunes the duplicated `summary` argument from the
-      // tool call anyway. The user-visible message is the short 'message' arg.
+      // context handler below drops the whole request_compact exchange from
+      // LLM context anyway. The user-visible message is the short 'message' arg.
       return {
         details: {},
         content: [{
@@ -1129,6 +1149,10 @@ ${checkpointFormat(keepRecentTokens)}
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant" || !sawAssistantMessage) return;
 
+    // Circuit breaker tripped — no more auto-intervention, including the
+    // context nudge (a steer would restart a run gallop is backing off from).
+    if (circuitBreakerTripped) return;
+
     // ── Context-pressure nudge ──
     checkContextNudge(event.message, ctx, pi);
 
@@ -1140,7 +1164,6 @@ ${checkpointFormat(keepRecentTokens)}
     // already ran.
 
     // Circuit breaker tripped — no more stall intervention
-    if (circuitBreakerTripped) return;
     sawAssistantMessage = false;
 
     // ── Reasoning-action mismatch detection ──
@@ -1276,8 +1299,14 @@ ${checkpointFormat(keepRecentTokens)}
 
   // ── Turn tracking ──
 
-  pi.on("turn_start", async (event: { turnIndex: number }) => {
-    currentTurnIndex = event.turnIndex;
+  // Monotonic counter, NOT pi's turnIndex: pi resets it to 0 on every
+  // agent_start (including agent.continue() runs), which would leave
+  // failureHistory entries from the previous run un-prunable and counted
+  // into the new run's window. Counting turns ourselves keeps the failure
+  // window "last N turns" across runs. resetAllState zeroes it together with
+  // failureHistory on session start / compaction.
+  pi.on("turn_start", async () => {
+    currentTurnIndex += 1;
   });
 
   // ── Tool call interceptor: enforce blocks ──
@@ -1285,7 +1314,7 @@ ${checkpointFormat(keepRecentTokens)}
   pi.on("tool_call", async (event, ctx) => {
     // User halted via circuit breaker — block everything
     if (circuitBreakerHalted) {
-      return { block: true, reason: `[Gallop] Agent halted by user (circuit breaker). Type a message or use /compact / /new.` };
+      return { block: true, reason: `[Gallop] Agent halted by user (circuit breaker). Use /compact or /new to unblock tools.` };
     }
     // Circuit breaker tripped — no more auto-intervention
     if (circuitBreakerTripped) return;
@@ -1523,12 +1552,14 @@ ${checkpointFormat(keepRecentTokens)}
     }
 
     // ── Track last failed tool call for mismatch detection ──
+    const error = event.isError ? extractErrorFingerprint(event.result) : "";
+    // Gallop-generated failures (blocks, circuit breaker) — the block
+    // interceptor already handles those; mismatch and repetitive detection
+    // would only add noise on top of gallop's own signal.
+    const isGallopBlock = error.startsWith("[gallop]");
     if (event.isError) {
       const argFingerprint = normalizeToolArgs(event.toolName, pending?.args);
-      const error = extractErrorFingerprint(event.result);
-      // Skip Gallop-generated failures (blocks, circuit breaker) — the block
-      // interceptor already handles those; mismatch detection would only add noise.
-      lastFailedToolCall = error.startsWith("[gallop]")
+      lastFailedToolCall = isGallopBlock
         ? null
         : {
             toolName: event.toolName,
@@ -1541,10 +1572,19 @@ ${checkpointFormat(keepRecentTokens)}
     }
 
     // ── Repetitive-call detection ──
-    // Skip when bash just failed — failure-loop handler already covered it.
-    // Reset the consecutive counter on bash failure so a later success with the
-    // same command isn't flagged as a repetitive success.
-    if (event.toolName === "bash" && event.isError) {
+    // Gallop-blocked calls (e.g. the read guard) are invisible to the ladder:
+    // the block reason is the only signal for them (it already tells the model
+    // what to do), so a blocked call neither starts a streak nor extends one —
+    // undo the increment tool_execution_start made for it.
+    if (isGallopBlock) {
+      if (repetitiveCallState && pending && repetitiveCallState.fingerprint === pending.fingerprint) {
+        repetitiveCallState.count -= 1;
+        if (repetitiveCallState.count === 0) repetitiveCallState = null;
+      }
+    } else if (event.toolName === "bash" && event.isError) {
+      // Bash failure: the failure-loop handler already covered it. Reset the
+      // consecutive counter so a later success with the same command isn't
+      // flagged as a repetitive success.
       repetitiveCallState = null;
     } else {
       if (!event.isError) {
@@ -1576,11 +1616,11 @@ ${checkpointFormat(keepRecentTokens)}
     if (ctx.hasUI) {
       ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", "⟳ Compacting...")}`);
     }
-    // If compaction is cancelled, discard the stashed checkpoint — otherwise a
-    // later, unrelated compaction would reuse a stale summary. Registered
-    // unconditionally (not gated on hasUI) so a headless abort can't leave it.
+    // The stash is consumed eagerly below (nulled before the result is
+    // returned), so a cancelled compaction can't leak the summary into a
+    // later, unrelated compaction. The abort listener only clears the status
+    // line — registered unconditionally so a headless abort can't leave it.
     const onAbort = (): void => {
-      selfSummary = null;
       if (ctx.hasUI) {
         ctx.ui.setStatus("compact", undefined);
       }
@@ -1603,52 +1643,99 @@ ${checkpointFormat(keepRecentTokens)}
     }
   });
 
-  // ── context: prune the request_compact summary arg from LLM context ──
+  // ── context: drop the request_compact exchange from LLM context ──
   // After a self-compact, the checkpoint text appears twice in every request:
   // as the compaction summary (pi renders compaction entries as messages with
   // role "compactionSummary") and as the `summary` argument of the
   // request_compact tool call in the kept tail (~1k duplicated tokens per
-  // request). Prune the argument here — but only when that exact text is
+  // request). Worse, the half-elided call is actively confusing: the resumed
+  // model reads its own compact call in its own history and second-guesses
+  // whether it wrote the arguments wrong. So when the exact text is
   // verifiably carried by a compaction summary in context (gallop appends the
   // file sections after the summary text, so a byte-identical prefix match is
-  // exact). Pre-compact tree views (no compactionSummary message), tool calls
-  // from earlier compactions, and newer aborted calls all fail the check →
-  // their arguments stay intact. The session file is never touched (the TUI
-  // transcript still shows the full summary) and the rewrite is deterministic,
-  // so the prefix stays cache-stable.
+  // exact), DROP THE WHOLE EXCHANGE — the assistant message carrying the call
+  // and its paired toolResult. Pre-compact tree views (no compactionSummary
+  // message), calls from earlier compactions whose text isn't carried, and
+  // newer aborted calls all fail the check → their exchanges stay intact
+  // (on the native-fallback path the arg is the model's real short text, a
+  // true record, and there is nothing to dedupe). A request_compact toolResult
+  // whose call is no longer in context (the cut point split the compact turn)
+  // is dropped as an orphan — a toolResult with no paired toolCall is an API
+  // error. The session file is never touched (the TUI transcript still shows
+  // the full summary) and the rewrite is deterministic, so the prefix stays
+  // cache-stable.
   pi.on("context", (event) => {
     const messagesIn = event.messages as any[];
-    const lastCompaction = messagesIn.find(
-      (m) => m?.role === "compactionSummary" && typeof m?.summary === "string",
-    ) as { summary: string } | undefined;
-    if (!lastCompaction) return;
-    let changed = false;
-    const messages = messagesIn.map((msg) => {
-      if (!Array.isArray(msg?.content)) return msg;
-      let msgChanged = false;
-      const content = msg.content.map((block: any) => {
-        if (block?.type !== "toolCall" || block.name !== "request_compact") return block;
+    // Collect ALL compaction summaries in context: an earlier compaction entry
+    // can sit inside the newest compaction's kept tail, so context may carry
+    // several compactionSummary messages. A request_compact exchange is
+    // droppable whenever ANY of them carries its text verbatim — the call that
+    // was compacted most recently matches the newest, a call from an earlier
+    // task still in the tail matches the older one.
+    const compactionSummaries: string[] = [];
+    for (const m of messagesIn) {
+      if (m?.role === "compactionSummary" && typeof m?.summary === "string") {
+        compactionSummaries.push((m as { summary: string }).summary);
+      }
+    }
+    if (compactionSummaries.length === 0) return;
+
+    // request_compact call ids present in context (orphan detection) and the
+    // subset whose summary text is verifiably carried by a compaction summary
+    // (drop candidates).
+    const callIdsInContext = new Set<string>();
+    const prunableCallIds = new Set<string>();
+    for (const msg of messagesIn) {
+      if (!Array.isArray(msg?.content)) continue;
+      for (const block of msg.content) {
+        if (block?.type !== "toolCall" || block.name !== "request_compact") continue;
+        if (typeof block.id !== "string") continue;
+        callIdsInContext.add(block.id);
         const summary = block.arguments?.summary;
         if (
           typeof summary === "string" &&
           summary.length >= MIN_SUMMARY_LENGTH &&
-          lastCompaction.summary.startsWith(summary)
+          compactionSummaries.some((s) => s.startsWith(summary))
         ) {
-          msgChanged = true;
-          return {
-            ...block,
-            // Elision marker (not content): the full text is in the compaction
-            // entry at the top of context, so the argument is shortened to avoid
-            // re-sending it in every request. Worded so a resumed model can't
-            // mistake it for a value it itself passed.
-            arguments: { ...block.arguments, summary: "[omitted — full summary text is in the compaction summary at the top of context]" },
-          };
+          prunableCallIds.add(block.id);
         }
-        return block;
-      });
-      if (msgChanged) changed = true;
-      return msgChanged ? { ...msg, content } : msg;
-    });
+      }
+    }
+
+    let changed = false;
+    const messages: any[] = [];
+    for (const msg of messagesIn) {
+      // The paired toolResult of a dropped call → drop. An orphaned
+      // request_compact toolResult (call summarized out of the window) → drop:
+      // without its toolCall it would be an API error.
+      if (msg?.role === "toolResult" && msg?.toolName === "request_compact") {
+        const id = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+        if (!id || !callIdsInContext.has(id) || prunableCallIds.has(id)) {
+          changed = true;
+          continue;
+        }
+      }
+      if (!Array.isArray(msg?.content)) {
+        messages.push(msg);
+        continue;
+      }
+      const blocks = msg.content as any[];
+      const isPrunable = (b: any) => b?.type === "toolCall" && typeof b?.id === "string" && prunableCallIds.has(b.id);
+      if (!blocks.some(isPrunable)) {
+        messages.push(msg);
+        continue;
+      }
+      if (blocks.some((b) => b?.type === "toolCall" && !isPrunable(b))) {
+        // Batched with other tool calls: keep the message and the siblings
+        // (their results stay), drop only the compact call block.
+        messages.push({ ...msg, content: blocks.filter((b) => !isPrunable(b)) });
+        changed = true;
+        continue;
+      }
+      // Otherwise the message is the compact exchange itself (optionally with
+      // explanatory text) → drop the whole message.
+      changed = true;
+    }
     return changed ? { messages } : undefined;
   });
 

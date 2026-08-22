@@ -582,9 +582,10 @@ describe("context-pressure nudge", () => {
   });
 });
 
-// ── context handler: pruning the request_compact summary arg from LLM context ──
 
-describe("context handler (summary-arg pruning)", () => {
+// ── context handler: dropping the request_compact exchange from LLM context ──
+
+describe("context handler (request_compact exchange pruning)", () => {
   let pi: any;
   let handlers: Map<string, any>;
   let ctx: any;
@@ -595,6 +596,8 @@ describe("context handler (summary-arg pruning)", () => {
     ctx = { hasUI: false };
   });
 
+  const emptyFileOps = { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() };
+
   const compactionSummaryMsg = (summary: string) => ({
     role: "compactionSummary",
     summary,
@@ -602,12 +605,19 @@ describe("context handler (summary-arg pruning)", () => {
     timestamp: Date.now(),
   });
 
-  const requestCompactCall = (summary: string) => ({
+  const requestCompactCall = (summary: string, id = "tc1") => ({
     role: "assistant",
     content: [
       { type: "text", text: "compacting" },
-      { type: "toolCall", id: "tc1", name: "request_compact", arguments: { message: "bloat", summary } },
+      { type: "toolCall", id, name: "request_compact", arguments: { message: "bloat", summary } },
     ],
+  });
+
+  const compactToolResult = (toolCallId = "tc1") => ({
+    role: "toolResult",
+    toolCallId,
+    toolName: "request_compact",
+    content: [{ type: "text", text: "Compacting (bloat)." }],
   });
 
   const otherToolCall = () => ({
@@ -616,12 +626,14 @@ describe("context handler (summary-arg pruning)", () => {
   });
 
   it("returns undefined (no rewrite) when no compaction summary is in context", async () => {
-    // Pre-compact tree view / aborted compact: the arg is the only copy.
-    const result = await handlers.get("context")({ messages: [requestCompactCall(LONG_SUMMARY)] }, ctx);
+    // Pre-compact tree view / aborted compact: the exchange is the only record.
+    const result = await handlers.get("context")({
+      messages: [requestCompactCall(LONG_SUMMARY), compactToolResult()],
+    }, ctx);
     expect(result).toBeUndefined();
   });
 
-  it("prunes the summary arg when it is carried verbatim by the compaction summary", async () => {
+  it("drops the whole exchange when it is carried verbatim by the compaction summary", async () => {
     // Gallop appends file sections after the summary text — the compaction
     // summary starts with the exact arg text.
     const compactionSummary = appendSelfCompactFileOps(LONG_SUMMARY, {
@@ -630,51 +642,129 @@ describe("context handler (summary-arg pruning)", () => {
       edited: new Set<string>(),
     });
     const result = await handlers.get("context")({
-      messages: [compactionSummaryMsg(compactionSummary), requestCompactCall(LONG_SUMMARY), otherToolCall()],
+      messages: [compactionSummaryMsg(compactionSummary), requestCompactCall(LONG_SUMMARY), compactToolResult(), otherToolCall()],
     }, ctx);
 
     expect(result).toBeDefined();
-    const [compMsg, compactCall, other] = result.messages;
-    expect(compMsg.role).toBe("compactionSummary");
-    expect(compactCall.content[1].arguments.summary).toBe("[omitted — full summary text is in the compaction summary at the top of context]");
-    expect(compactCall.content[1].arguments.message).toBe("bloat"); // other args untouched
-    expect(compactCall.content[0]).toEqual({ type: "text", text: "compacting" });
-    expect(other).toEqual(otherToolCall()); // unrelated tool calls untouched
+    // Both the call and its toolResult are gone; the rest is untouched.
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].role).toBe("compactionSummary");
+    expect(result.messages[1]).toEqual(otherToolCall());
+    expect(result.messages.some((m: any) => m?.toolName === "request_compact")).toBe(false);
   });
 
-  it("does not prune a summary that the compaction summary does not carry", async () => {
+  it("keeps a call whose summary the compaction summary does not carry", async () => {
     // e.g. an EARLIER compaction's tool call still in the kept tail, or a newer
-    // aborted call: its text is not in the (latest) compaction summary.
+    // aborted call: its text is not in the (latest) compaction summary. The
+    // call AND its result stay (true record, valid pairing).
     const result = await handlers.get("context")({
       messages: [
-        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() })),
+        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         requestCompactCall("A completely different checkpoint that was never compacted.".padEnd(250, "x")),
+        compactToolResult(),
       ],
     }, ctx);
     expect(result).toBeUndefined();
   });
 
-  it("does not prune too-short summaries (below MIN_SUMMARY_LENGTH)", async () => {
+  it("keeps too-short exchanges intact (native-fallback path)", async () => {
+    // Below MIN_SUMMARY_LENGTH the stashed summary was NOT used — pi's native
+    // one-shot ran, so the arg is the model's real short text, not a duplicate.
     const short = "too short";
     const result = await handlers.get("context")({
-      messages: [compactionSummaryMsg(short), requestCompactCall(short)],
+      messages: [compactionSummaryMsg("A native one-shot summary that does not carry the short arg at all."), requestCompactCall(short), compactToolResult()],
     }, ctx);
     expect(result).toBeUndefined();
   });
 
-  it("prunes only the matching call when multiple request_compact calls are present", async () => {
+  it("drops only the matching exchange when multiple request_compact calls are present", async () => {
     const otherCheckpoint = "Another checkpoint summary, long enough to matter. ".repeat(5); // >200 chars
     const result = await handlers.get("context")({
       messages: [
-        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() })),
-        requestCompactCall(otherCheckpoint), // not the compacted one → intact
-        requestCompactCall(LONG_SUMMARY), // the compacted one → pruned
+        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+        requestCompactCall(otherCheckpoint, "tc2"), // not the compacted one → intact
+        compactToolResult("tc2"),
+        requestCompactCall(LONG_SUMMARY, "tc1"), // the compacted one → dropped
+        compactToolResult("tc1"),
       ],
     }, ctx);
 
     expect(result).toBeDefined();
+    expect(result.messages).toHaveLength(3);
     expect(result.messages[1].content[1].arguments.summary).toBe(otherCheckpoint);
-    expect(result.messages[2].content[1].arguments.summary).toBe("[omitted — full summary text is in the compaction summary at the top of context]");
+    expect(result.messages[2]).toEqual(compactToolResult("tc2"));
+  });
+
+  it("drops the newest compacted exchange when an older compaction entry sits in the kept tail", async () => {
+    // Task-boundary compaction: the previous compaction entry falls inside
+    // the newest compaction's kept tail, so context holds TWO compaction
+    // summary messages. The just-compacted exchange must still be dropped —
+    // the older summary does not carry its text (the .find()-first bug).
+    const oldCheckpoint = "Old checkpoint from a previous task, long enough to matter. ".repeat(4);
+    const result = await handlers.get("context")({
+      messages: [
+        compactionSummaryMsg(oldCheckpoint),
+        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+        requestCompactCall(LONG_SUMMARY),
+        compactToolResult(),
+      ],
+    }, ctx);
+
+    expect(result).toBeDefined();
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.every((m: any) => m.role !== "assistant" && m.toolName !== "request_compact")).toBe(true);
+  });
+
+  it("drops a call from an earlier compaction when its entry is still in the kept tail", async () => {
+    // The older compaction entry's summary is still carried by context, so
+    // the earlier call's text is verifiably present — drop it too.
+    const oldCheckpoint = "Old checkpoint from a previous task, long enough to matter. ".repeat(4);
+    const result = await handlers.get("context")({
+      messages: [
+        compactionSummaryMsg(oldCheckpoint),
+        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+        requestCompactCall(oldCheckpoint),
+        compactToolResult(),
+      ],
+    }, ctx);
+
+    expect(result).toBeDefined();
+    expect(result.messages).toHaveLength(2);
+  });
+
+  it("drops an orphaned request_compact toolResult whose call was summarized out of the window", async () => {
+    // The cut point split the compact turn: the call landed in the summarized
+    // prefix, only its result survives in the kept tail. Without its toolCall
+    // the result would be an API error — drop it.
+    const result = await handlers.get("context")({
+      messages: [compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)), compactToolResult("tc1")],
+    }, ctx);
+
+    expect(result).toBeDefined();
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("compactionSummary");
+  });
+
+  it("keeps sibling tool calls in a batched message, dropping only the compact block", async () => {
+    const result = await handlers.get("context")({
+      messages: [
+        compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+        {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "tc2", name: "bash", arguments: { command: "ls" } },
+            { type: "toolCall", id: "tc1", name: "request_compact", arguments: { message: "bloat", summary: LONG_SUMMARY } },
+          ],
+        },
+        { role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] },
+        compactToolResult("tc1"),
+      ],
+    }, ctx);
+
+    expect(result).toBeDefined();
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[1].content).toEqual([{ type: "toolCall", id: "tc2", name: "bash", arguments: { command: "ls" } }]);
+    expect(result.messages[2]).toEqual({ role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] });
   });
 
   it("handles messages without array content and non-matching roles", async () => {
@@ -682,11 +772,13 @@ describe("context handler (summary-arg pruning)", () => {
       messages: [
         compactionSummaryMsg(LONG_SUMMARY),
         { role: "user", content: "plain string content, not an array" },
-        { role: "toolResult", content: [{ type: "text", text: "Compacting (bloat)." }] },
+        { role: "toolResult", toolCallId: "tc9", toolName: "bash", content: [{ type: "text", text: "ok" }] },
         requestCompactCall(LONG_SUMMARY),
+        compactToolResult(),
       ],
     }, ctx);
     expect(result).toBeDefined();
-    expect(result.messages[3].content[1].arguments.summary).toBe("[omitted — full summary text is in the compaction summary at the top of context]");
+    expect(result.messages).toHaveLength(3); // compactionSummary, user, bash result
+    expect(result.messages[2]).toEqual({ role: "toolResult", toolCallId: "tc9", toolName: "bash", content: [{ type: "text", text: "ok" }] });
   });
 });
