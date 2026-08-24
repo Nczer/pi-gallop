@@ -581,6 +581,46 @@ describe("context-pressure nudge", () => {
     await handlers.get("message_end")(usageMsg(15_000), noModel);
     expect(nudgeSteers()).toHaveLength(0);
   });
+
+  it("does not nudge when the ending message itself calls request_compact (message_end precedes tool execution)", async () => {
+    // Real pi order: message_end fires BEFORE the message's tool calls execute,
+    // so pendingCompact is still null — only the message's content reveals the
+    // en-route compact. Regression: the nudge steer landed around the
+    // compaction boundary, telling the model to call a tool it just called.
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        ...usageMsg(8_000).message,
+        content: [
+          { type: "text", text: "context is hot — checkpointing" },
+          { type: "toolCall", id: "c1", name: "request_compact", arguments: { summary: LONG_SUMMARY } },
+        ],
+        stopReason: "toolUse",
+      },
+    }, ctx);
+    expect(nudgeSteers()).toHaveLength(0);
+
+    // The tool then executes; a same-cycle endTurn is held by the pending guard.
+    await tools.get("request_compact").execute("id1", { summary: LONG_SUMMARY }, new AbortController().signal, undefined, ctx);
+    await endTurn(7_000);
+    expect(nudgeSteers()).toHaveLength(0);
+  });
+
+  it("the request_compact skip is message-scoped: a fresh cycle still nudges", async () => {
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        ...usageMsg(8_000).message,
+        content: [{ type: "toolCall", id: "c1", name: "request_compact", arguments: { summary: LONG_SUMMARY } }],
+        stopReason: "toolUse",
+      },
+    }, ctx);
+    expect(nudgeSteers()).toHaveLength(0);
+
+    await resetState();
+    await endTurn(15_000);
+    expect(nudgeSteers()).toHaveLength(1);
+  });
 });
 
 

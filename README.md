@@ -196,8 +196,11 @@ back to pi's defaults), so it tracks a custom `reserveTokens` and stays
 proportionate on small context windows (e.g. 64k). After the nudge, silence —
 pi's automatic compaction (which also drives overflow recovery, so it stays
 enabled as the backstop) decides. No nudge while a compact is pending or in
-flight, when a message ends in aborted/error, or when the circuit breaker has
-halted the agent.
+flight — including an en-route one whose `request_compact` call sits in the
+very message being judged (pi emits `message_end` before that call executes, so
+the state flags are not set yet — the message content is the signal) — when a
+message ends in aborted/error, or when the circuit breaker has halted the
+agent.
 
 Compaction resets all escalation state (blocks, nudges, stall count).
 

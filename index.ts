@@ -329,6 +329,19 @@ export function lastItemIsToolUse(message: { content?: unknown[] }): boolean {
   return typeof last === "object" && last !== null && (last as any).type === "toolCall";
 }
 
+/** True when the message contains a request_compact tool call. pi emits
+ *  message_end BEFORE the message's tool calls execute, so this is how the
+ *  nudge path sees an en-route compact — pendingCompact is only set later,
+ *  in the tool's execute. */
+export function messageContainsRequestCompact(message: { content?: unknown[] }): boolean {
+  if (!Array.isArray(message.content)) return false;
+  return message.content.some(
+    (item) =>
+      typeof item === "object" && item !== null &&
+      (item as any).type === "toolCall" && (item as any).name === "request_compact",
+  );
+}
+
 const CONTINUE_STEER_MESSAGE = "[Gallop] Compact done — proceed as commanded.";
 
 /** Inject the generic proceed message a beat after compaction completes — the
@@ -539,6 +552,7 @@ function checkContextNudge(
   message: {
     stopReason?: string;
     usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number };
+    content?: unknown[];
   },
   ctx: ExtensionContext,
   pi: ExtensionAPI,
@@ -546,6 +560,12 @@ function checkContextNudge(
   if (circuitBreakerHalted) return;              // agent halted — a steer would restart a run where every tool is blocked
   if (pendingCompact) return;                     // a compact request is already pending
   if (compactionRunning) return;                 // compact in flight — usage about to drop
+  // pi emits message_end BEFORE this message's tool calls execute — a message
+  // containing request_compact has a compact en route the two state guards
+  // above cannot see yet (execute runs after this event). Skip, or the nudge
+  // steer lands around the compaction boundary: "call request_compact now"
+  // right after the model just called it.
+  if (messageContainsRequestCompact(message)) return;
   if (message.stopReason === "aborted" || message.stopReason === "error") return;
   const window = ctx.model?.contextWindow ?? 0;
   const tokens = contextTokensFromUsage(message.usage);
