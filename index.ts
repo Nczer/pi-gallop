@@ -1049,7 +1049,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
 ${checkpointFormat(keepRecentTokens)}
 - 'message': brief user-visible message shown while compacting.
-- 'continue': pass true to keep working right after compaction — a generic proceed message is injected. The checkpoint's Next Steps section tells you what to do next. Omit or pass false when the task is done or the user takes the next step.`,
+- 'continue': defaults to true — work resumes right after compaction (a generic proceed message is injected; the checkpoint's Next Steps say what to do). Pass false only when the task is done or the user takes the next step.`,
     parameters: {
       type: "object",
       properties: {
@@ -1063,7 +1063,7 @@ ${checkpointFormat(keepRecentTokens)}
         },
         continue: {
           type: "boolean",
-          description: "Whether the agent should continue working right after compaction",
+          description: "Whether the agent should continue working right after compaction (default: true — pass false to stop)",
         },
       },
       required: ["summary"],
@@ -1082,7 +1082,10 @@ ${checkpointFormat(keepRecentTokens)}
       // and session_compact clears pendingCompact — no double trigger, no
       // "Already compacted" error. Otherwise the settled handler triggers the
       // compact here with the stashed summary.
-      pendingCompact = { continue: params?.continue === true };
+      // Default continue: an omitted argument keeps working. The failure costs
+      // are asymmetric — a mistaken continue costs one idle "nothing to do"
+      // turn; a mistaken stop strands the in-flight task at the boundary.
+      pendingCompact = { continue: params?.continue !== false };
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the

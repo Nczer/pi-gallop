@@ -149,6 +149,13 @@ describe("self-compact wiring (in-session summary)", () => {
 
   const flushTimers = (ms = 250) => new Promise<void>((r) => setTimeout(r, ms));
 
+  /**
+   * Simulate the compact completing (test hygiene): consumes any residual
+   * pending request at the real session boundary, so the NEXT test's
+   * beforeEach doesn't inherit its continue steer on a fresh mock.
+   */
+  const compactDone = () => handlers.get("session_compact")(null, { hasUI: false });
+
   // ── request_compact tool ──
 
   it("stashes the summary, defers the compact to agent_settled, and returns the short message with terminate", async () => {
@@ -172,6 +179,7 @@ describe("self-compact wiring (in-session summary)", () => {
   it("defaults the message to 'model-initiated' when omitted", async () => {
     const result = await callTool({ summary: LONG_SUMMARY });
     expect(result.content[0].text).toBe("Compacting (model-initiated).");
+    await settle(); // consume the pending request — a real run always settles
   });
 
   it("injects the generic proceed message after compaction when continue is true", async () => {
@@ -186,23 +194,26 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(pi.sendUserMessage.mock.calls[0][1]).toEqual({ deliverAs: "steer" });
   });
 
-  it("does not inject anything after compaction when continue is false or omitted", async () => {
+  it("injects the proceed message when continue is omitted (default true)", async () => {
     await callTool({ message: "bloat", summary: LONG_SUMMARY });
     await settle();
     const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
     opts.onComplete();
     await flushTimers();
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+  });
 
-    // And with continue: false explicitly (re-arm the guard — no user turn in between).
+  it("does not inject anything after compaction when continue is false", async () => {
+    // Re-arm the guard (a user turn ends the previous cycle).
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
     ctx.compact.mockClear();
     await callTool({ message: "bloat", summary: LONG_SUMMARY, continue: false });
     await settle();
-    const opts2 = ctx.compact.mock.calls[0][0];
+    const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
-    opts2.onComplete();
+    opts.onComplete();
     await flushTimers();
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
@@ -239,6 +250,7 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(result.compaction.summary).toContain("<read-files>\nb.ts\n</read-files>");
     expect(result.compaction.summary).toContain("<modified-files>\na.ts\nc.ts\n</modified-files>");
     expect(result.compaction.details).toEqual({ readFiles: ["b.ts"], modifiedFiles: ["a.ts", "c.ts"] });
+    compactDone();
   });
 
   it("returns undefined (pi's native one-shot) when no summary is stashed — native /compact path", async () => {
@@ -256,6 +268,7 @@ describe("self-compact wiring (in-session summary)", () => {
       ctx,
     );
     expect(result).toBeUndefined();
+    compactDone();
   });
 
   it("discards the stashed summary on abort so a later compact doesn't reuse it", async () => {
@@ -274,6 +287,7 @@ describe("self-compact wiring (in-session summary)", () => {
       ctx,
     );
     expect(second).toBeUndefined();
+    compactDone();
   });
 
   it("registers its abort handler on the signal and removes it again on the way out", async () => {
@@ -288,6 +302,7 @@ describe("self-compact wiring (in-session summary)", () => {
     await handlers.get("session_before_compact")({ preparation: prep(emptyOps()), signal }, ctx);
     expect(added).toEqual(["abort"]);
     expect(removed).toEqual(["abort"]);
+    compactDone();
   });
 
   // ── re-entrancy ──
