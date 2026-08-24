@@ -391,15 +391,25 @@ function triggerCompaction(
 // summary if the model called the tool, pi's native one-shot otherwise.
 //
 // The summary text would stay in the kept tail as the tool call's arguments —
-// duplicated on every request — but the `context` handler below drops the
-// whole request_compact exchange from LLM context once the text is safely
-// carried by the compaction summary itself (session file untouched). On abort, or when no usable
-// summary is stashed (native /compact, auto threshold, overflow recovery, or a
-// too-short summary), the handler returns undefined and pi uses its native
+// duplicated on every request — and the exchange (call + "Compacting (…)" result)
+// would read as an unfulfilled compact request. The `context` handler below
+// replaces it with a short completion marker once a compaction summary is in
+// context (session file untouched; per-path rules there). When no usable summary
+// is stashed (native /compact, auto threshold, overflow recovery, or a too-short
+// summary), session_before_compact returns undefined and pi uses its native
 // one-shot — compaction always works.
 
 /** Below this length a stashed summary is rejected (pi's one-shot runs instead). */
 const MIN_SUMMARY_LENGTH = 200;
+
+/** The in-context completion marker that replaces a request_compact exchange
+ *  once the compaction has run (see the `context` handler). A fixed string —
+ *  the rewrite must be deterministic or the request prefix loses cache
+ *  stability. "summary" (not "checkpoint"): on the native-fallback path the
+ *  top summary is pi's one-shot, not the model's checkpoint. Revocable by
+ *  design — a later task that fills the context again may compact again. */
+export const COMPACT_DONE_MARKER =
+  "[Gallop] Compaction complete — the summary at the top of context is your current state. Do not call request_compact again unless context pressure returns.";
 
 /** The exact checkpoint format the model must use. Carried by the
  *  request_compact tool description (system prompt). */
@@ -1056,8 +1066,8 @@ ${checkpointFormat(keepRecentTokens)}
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the
-      // context handler below drops the whole request_compact exchange from
-      // LLM context anyway. The user-visible message is the short 'message' arg.
+      // context handler below replaces the request_compact exchange with the
+      // completion marker anyway. The user-visible message is the short 'message' arg.
       return {
         details: {},
         content: [{
@@ -1643,35 +1653,53 @@ ${checkpointFormat(keepRecentTokens)}
     }
   });
 
-  // ── context: drop the request_compact exchange from LLM context ──
+  // ── context: replace the request_compact exchange with a completion marker ──
   // After a self-compact, the checkpoint text appears twice in every request:
   // as the compaction summary (pi renders compaction entries as messages with
   // role "compactionSummary") and as the `summary` argument of the
   // request_compact tool call in the kept tail (~1k duplicated tokens per
-  // request). Worse, the half-elided call is actively confusing: the resumed
-  // model reads its own compact call in its own history and second-guesses
-  // whether it wrote the arguments wrong. So when the exact text is
-  // verifiably carried by a compaction summary in context (gallop appends the
-  // file sections after the summary text, so a byte-identical prefix match is
-  // exact), DROP THE WHOLE EXCHANGE — the assistant message carrying the call
-  // and its paired toolResult. Pre-compact tree views (no compactionSummary
-  // message), calls from earlier compactions whose text isn't carried, and
-  // newer aborted calls all fail the check → their exchanges stay intact
-  // (on the native-fallback path the arg is the model's real short text, a
-  // true record, and there is nothing to dedupe). A request_compact toolResult
-  // whose call is no longer in context (the cut point split the compact turn)
-  // is dropped as an orphan — a toolResult with no paired toolCall is an API
-  // error. The session file is never touched (the TUI transcript still shows
-  // the full summary) and the rewrite is deterministic, so the prefix stays
-  // cache-stable.
+  // request). The exchange is also a liability — dropping it outright (the
+  // previous behavior) left the nudge that triggered the compact ("…call
+  // request_compact now") standing in the tail as an unfulfilled instruction
+  // while its fulfillment was gone, and a `continue: false` compact delivers
+  // no other completion signal. The resumed model then rationally re-requested
+  // (field: two back-to-back double-compacts, the second preempting the user's
+  // "proceed to phase 2"). So the exchange is REPLACED, not deleted:
+  //
+  //  - Carried verbatim (gallop appends the file sections after the summary
+  //    text, so a byte-identical prefix match is exact): the assistant message
+  //    carrying the call is rewritten to COMPACT_DONE_MARKER and the paired
+  //    toolResult is dropped. The marker closes the loop in place — right
+  //    after the work, before the user's next message — and points to the
+  //    summary at the top of context.
+  //  - Not carried (native-fallback: a too-short/absent summary, so pi's
+  //    one-shot ran): the call stays as a true record of the model's short
+  //    text, but its "Compacting (…)" result reads as in-progress — rewrite
+  //    just the result text to the marker once any compaction summary is in
+  //    context. (Edge: an ABORTED botched compact with an OLDER compaction in
+  //    context is marked done too; a missed re-request then waits for the next
+  //    pressure point — pi's overflow recovery still backstops.)
+  //  - Batched with sibling tool calls: the message, siblings and their
+  //    results stay; the compact block drops and the marker is appended as a
+  //    text block so the completion remains visible.
+  //  - Orphaned toolResult (the cut point split the compact turn): dropped,
+  //    no marker — a toolResult without its toolCall is an API error, and the
+  //    top summary already says compaction happened.
+  //
+  // Pre-compact tree views (no compactionSummary message) and aborted compacts
+  // leave everything intact — on abort "Compacting (…)" is true, and a
+  // re-request is the correct recovery. The triggering nudge is left untouched
+  // (a live post-compaction nudge is indistinguishable from a stale one in the
+  // rendered context); with the marker present it reads as fulfilled. The
+  // session file is never touched (the TUI transcript still shows the full
+  // summary) and the rewrite is deterministic, so the prefix stays cache-stable.
   pi.on("context", (event) => {
     const messagesIn = event.messages as any[];
     // Collect ALL compaction summaries in context: an earlier compaction entry
     // can sit inside the newest compaction's kept tail, so context may carry
-    // several compactionSummary messages. A request_compact exchange is
-    // droppable whenever ANY of them carries its text verbatim — the call that
-    // was compacted most recently matches the newest, a call from an earlier
-    // task still in the tail matches the older one.
+    // several compactionSummary messages. A carried check matches ANY of them —
+    // the call that was compacted most recently matches the newest, a call
+    // from an earlier task still in the tail matches the older one.
     const compactionSummaries: string[] = [];
     for (const m of messagesIn) {
       if (m?.role === "compactionSummary" && typeof m?.summary === "string") {
@@ -1680,11 +1708,15 @@ ${checkpointFormat(keepRecentTokens)}
     }
     if (compactionSummaries.length === 0) return;
 
-    // request_compact call ids present in context (orphan detection) and the
-    // subset whose summary text is verifiably carried by a compaction summary
-    // (drop candidates).
+    // Classify every request_compact call in context (also feeds orphan
+    // detection):
+    //  - carried: its summary text is verifiably in a compaction summary →
+    //    replace the exchange with the marker (dedupe + completion closure)
+    //  - fallback: not carried → keep the call, mark its result done
     const callIdsInContext = new Set<string>();
-    const prunableCallIds = new Set<string>();
+    // Carried calls get the exchange replaced; every OTHER request_compact call
+    // in context is a native-fallback call (result gets marked done).
+    const carriedCallIds = new Set<string>();
     for (const msg of messagesIn) {
       if (!Array.isArray(msg?.content)) continue;
       for (const block of msg.content) {
@@ -1697,7 +1729,7 @@ ${checkpointFormat(keepRecentTokens)}
           summary.length >= MIN_SUMMARY_LENGTH &&
           compactionSummaries.some((s) => s.startsWith(summary))
         ) {
-          prunableCallIds.add(block.id);
+          carriedCallIds.add(block.id);
         }
       }
     }
@@ -1705,35 +1737,42 @@ ${checkpointFormat(keepRecentTokens)}
     let changed = false;
     const messages: any[] = [];
     for (const msg of messagesIn) {
-      // The paired toolResult of a dropped call → drop. An orphaned
-      // request_compact toolResult (call summarized out of the window) → drop:
-      // without its toolCall it would be an API error.
+      // request_compact toolResult: orphan (call summarized out of the window)
+      // → drop (an unpaired toolResult is an API error); paired with a carried
+      // call → drop (the marker message carries the closure); paired with a
+      // fallback call → rewrite the in-progress text to the marker.
       if (msg?.role === "toolResult" && msg?.toolName === "request_compact") {
         const id = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
-        if (!id || !callIdsInContext.has(id) || prunableCallIds.has(id)) {
+        if (!id || !callIdsInContext.has(id) || carriedCallIds.has(id)) {
           changed = true;
           continue;
         }
+        messages.push({ ...msg, content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+        changed = true;
+        continue;
       }
       if (!Array.isArray(msg?.content)) {
         messages.push(msg);
         continue;
       }
       const blocks = msg.content as any[];
-      const isPrunable = (b: any) => b?.type === "toolCall" && typeof b?.id === "string" && prunableCallIds.has(b.id);
-      if (!blocks.some(isPrunable)) {
+      const isCarried = (b: any) => b?.type === "toolCall" && typeof b?.id === "string" && carriedCallIds.has(b.id);
+      if (!blocks.some(isCarried)) {
         messages.push(msg);
         continue;
       }
-      if (blocks.some((b) => b?.type === "toolCall" && !isPrunable(b))) {
+      if (blocks.some((b) => b?.type === "toolCall" && !isCarried(b))) {
         // Batched with other tool calls: keep the message and the siblings
-        // (their results stay), drop only the compact call block.
-        messages.push({ ...msg, content: blocks.filter((b) => !isPrunable(b)) });
+        // (their results stay), drop only the compact call block, and append
+        // the marker so the compact's completion stays visible.
+        messages.push({ ...msg, content: [...blocks.filter((b) => !isCarried(b)), { type: "text", text: COMPACT_DONE_MARKER }] });
         changed = true;
         continue;
       }
       // Otherwise the message is the compact exchange itself (optionally with
-      // explanatory text) → drop the whole message.
+      // explanatory text — the checkpoint carries it) → replace the whole
+      // message with the completion marker.
+      messages.push({ ...msg, content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
       changed = true;
     }
     return changed ? { messages } : undefined;

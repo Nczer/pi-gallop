@@ -156,13 +156,21 @@ already end in a compaction entry); in that race case the `continue` steer is
 sent from `session_compact` instead of the manual `onComplete`.
 
 Once the checkpoint has become the compaction summary, a `context` handler
-prunes the `request_compact` tool call's `summary` argument from every LLM
-request (otherwise the ~1k-token text is duplicated in the kept tail on each
-call) — but only when the exact text is verifiably carried by a
-`compactionSummary` message in context, so pre-compact tree views, earlier
-compactions' calls, and aborted calls keep their full argument. The session
-file and TUI transcript always retain the full summary; the rewrite is
-deterministic, so the prefix stays cache-stable.
+replaces the `request_compact` exchange in every LLM request — the exchange
+would otherwise duplicate the ~1k-token summary in the kept tail *and* read
+as an unfulfilled request (the resumed model re-requested compaction, with
+the triggering pressure nudge still standing in the tail). When the summary
+text is verifiably carried by a `compactionSummary` message in context, the
+assistant message carrying the call is rewritten to a fixed completion marker
+(“Compaction complete — the summary at the top of context is your current
+state. Do not call request_compact again unless context pressure returns.”)
+and the paired toolResult is dropped. A call whose text is NOT carried
+(native-fallback compact) keeps its call as a true record and only gets its
+in-progress “Compacting (…)” result text marked done. Pre-compact tree views
+and aborted compacts (no `compactionSummary` in context) are left intact, so
+a re-request after an aborted compact is still the correct recovery. The
+session file and TUI transcript always retain the full summary; the rewrite
+is deterministic, so the prefix stays cache-stable.
 
 `message_end` triggers nothing (pi emits it *before* pending tools execute) —
 every compact request resolves deterministically at `agent_settled`. A

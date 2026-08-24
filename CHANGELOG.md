@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- **Double compact after a `continue: false` self-compact** — the context handler's exchange pruning removed the model's compact call *and* its result while the pressure nudge that triggered it ("…call request_compact now") stayed in the kept tail — an instruction with no visible fulfillment (and `continue: false` delivers no other completion signal; the nudge even renders *after* the compaction summary, so it looks freshly issued). The resumed model re-requested compaction; a field session showed two back-to-back double-compacts, the second preempting the user's "proceed to phase 2". The exchange is now replaced with a fixed in-context completion marker (`COMPACT_DONE_MARKER`: "Compaction complete — the summary at the top of context is your current state. Do not call request_compact again unless context pressure returns.") in assistant position: verbatim-carried call → the call message becomes the marker and the result drops; native-fallback (short/absent summary) → the call stays as a true record and only the in-progress "Compacting (…)" result text is rewritten; batched calls keep their siblings and get the marker appended as a text block; orphaned results still drop. No compaction summary in context (abort / pre-compact tree view) → nothing changes, so a re-request after an aborted compact remains the correct recovery. The triggering nudge is left untouched (a live post-compaction nudge is indistinguishable from a stale one in the rendered context) — with the marker present it reads as fulfilled. Documented edge: an aborted *botched* compact with an older compaction in context is marked done; a missed re-request then waits for the next pressure point (pi's overflow recovery backstops).
+
 ### Added
 - **Task-boundary compaction hint** — `request_compact`'s "Call when" guidance now includes a proactive trigger for multi-task sessions: when a planned task finished and another is queued, write the checkpoint now (with `continue: true`) so the next task starts on a fresh context. The pattern proved in the field: a three-task session compacted at every boundary — the checkpoint summary plus the verbatim tail is a complete handoff, and the KV cache is rebuilt by compaction anyway, so a boundary compact costs nothing relative to running hot until the pressure nudge fires.
 
@@ -9,7 +12,7 @@
 - **Checkpoint format names the actual kept-tail size** — pi's `compaction.keepRecentTokens` (default 20k) is user-configurable, but the checkpoint guidance hardcoded "~20k tokens are kept verbatim", which misinforms the model when it differs (over- or under-summarizing). `readPiCompactionSettings` now reads `keepRecentTokens` too, and the tool description names the configured value (read at registration — a changed value takes effect on the next /reload, like the rest of the extension's load-time state). `checkpointFormat()` is exported for tests.
 
 ### Tests
-- `keepRecentTokens` merge/fallback units (project wins over global, 20k default) and `checkpointFormat` interpolation. 120 tests total.
+- `keepRecentTokens` merge/fallback units (project wins over global, 20k default) and `checkpointFormat` interpolation. Marker-handler suite: carried exchange → marker (with the field double-compact repro — nudge in tail stays, exchange becomes the marker), native-fallback result rewrite, multi-call mixed carried/fallback, two-compaction tail, batched siblings + appended marker, orphan drop, no-compaction no-rewrite. 136 tests total.
 
 ## v2.1.0
 
