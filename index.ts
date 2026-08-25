@@ -471,11 +471,11 @@ const MIN_SUMMARY_LENGTH = 200;
 export const COMPACT_DONE_MARKER =
   "[Gallop] Compaction complete — the summary at the top of context is your current state. Do not call request_compact again unless context pressure returns.";
 
-/** The exact checkpoint format the model must use. Carried by the
- *  request_compact tool description (system prompt). */
-/** Checkpoint summary format. The kept-tail line is parameterized: pi's
- *  compaction.keepRecentTokens (default 20k) is user-configurable, and the
- *  guidance must match what pi will actually keep verbatim. */
+/** Checkpoint summary format — the exact format the model must use, carried
+ *  by the request_compact tool description (system prompt). The kept-tail
+ *  line is parameterized: pi's compaction.keepRecentTokens (default 20k) is
+ *  user-configurable, and the guidance must match what pi will actually keep
+ *  verbatim. */
 export function checkpointFormat(keepRecentTokens: number = PI_COMPACTION_DEFAULTS.keepRecentTokens): string {
   return `## Goal
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
@@ -734,7 +734,6 @@ export function normalizeCommand(command: string): string {
 export function extractErrorFingerprint(result: any): string {
   if (!result) return "unknown";
 
-  // Try to get text content from result
   let text = "";
   if (Array.isArray(result.content)) {
     text = result.content
@@ -749,11 +748,9 @@ export function extractErrorFingerprint(result: any): string {
 
   if (!text.trim()) return "empty-output";
 
-  // Extract last meaningful line as fingerprint
   const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
   if (lines.length === 0) return "empty-output";
 
-  // Take the last line (typically the error message) and truncate to 120 chars
   const lastLine = lines[lines.length - 1];
   return lastLine.length > 120 ? lastLine.slice(0, 120).toLowerCase() : lastLine.toLowerCase();
 }
@@ -807,7 +804,6 @@ async function handleCircuitBreaker(
     }
 
     if (choice === "Continue") {
-      // "Continue" — full reset, fresh Gallop state
       resetAllState();
       pi.sendUserMessage(
         `[Gallop] Circuit breaker: blocks cleared by user. Continuing.`,
@@ -819,11 +815,9 @@ async function handleCircuitBreaker(
       stepBackAfterBlocks(pi, " (dialog dismissed)");
     }
   } else {
-    // No UI — just step back.
     stepBackAfterBlocks(pi, " (no UI)");
   }
 
-  // Let this tool call through
   return {};
 }
 
@@ -861,15 +855,15 @@ function resetAllState(): void {
   llmAcknowledgedError = false;
 }
 
-/**
- * Prune failure history to keep only entries within the window.
- */
 /** Check if thinking content contains error/strategy keywords */
 function thinkingAcknowledgesError(text: string): boolean {
   const lower = text.toLowerCase();
   return ERROR_ACK_KEYWORDS.some(keyword => lower.includes(keyword));
 }
 
+/**
+ * Prune failure history to keep only entries within the window.
+ */
 export function pruneFailureHistory(
   failureHistory: { turnIndex: number }[],
   currentTurnIndex: number,
@@ -898,7 +892,8 @@ function stableStringify(value: unknown): string {
 
 /**
  * Normalize tool arguments into a stable fingerprint string.
- * For read: just the path. For bash: the command. For others: stable JSON of args.
+ * read: path (+ offset/limit when given); bash: normalized command;
+ * edit: path + per-edit oldText region tags; others: stable JSON of args.
  */
 export function normalizeToolArgs(toolName: string, args: unknown): string {
   if (!args || typeof args !== "object") return "{}";
@@ -1296,8 +1291,6 @@ ${checkpointFormat(keepRecentTokens)}
     },
   });
 
-  // ── Session lifecycle ──
-
   // ── Gallop-read-guard command ──
 
   pi.registerCommand("gallop-read-guard", {
@@ -1319,6 +1312,8 @@ ${checkpointFormat(keepRecentTokens)}
       }
     },
   });
+
+  // ── Session lifecycle ──
 
   pi.on("session_start", async (_event, _ctx) => {
     resetAllState();
@@ -1355,7 +1350,6 @@ ${checkpointFormat(keepRecentTokens)}
     // compacts with the stashed summary, or skips entirely when a compaction
     // already ran.
 
-    // Circuit breaker tripped — no more stall intervention
     sawAssistantMessage = false;
 
     // ── Reasoning-action mismatch detection ──
@@ -1426,7 +1420,6 @@ ${checkpointFormat(keepRecentTokens)}
         cooldownUntil = Date.now() + 10_000;
       }
 
-      // Escalate based on consecutive stall count
       if (stallCount >= STALL_STOP) {
         // Stop sending resumes — context is likely corrupted.
         // Notify once; further stalls stay silent so the notice itself doesn't loop.
@@ -1463,7 +1456,6 @@ ${checkpointFormat(keepRecentTokens)}
         }
       }
     } else {
-      // Non-stall message — reset stall counter
       stallCount = 0;
       stallStopNotified = false;
     }
@@ -1587,7 +1579,6 @@ ${checkpointFormat(keepRecentTokens)}
       if (repEntry && repEntry.level === "block") {
         totalBlocks++;
 
-        // Circuit breaker
         if (totalBlocks >= CIRCUIT_BREAKER_BLOCKS) {
           return handleCircuitBreaker(ctx, pi);
         }
@@ -1622,7 +1613,6 @@ ${checkpointFormat(keepRecentTokens)}
     const content = event.content;
     if (!Array.isArray(content)) return;
 
-    // Collect all text from content
     let fullText = "";
     for (const item of content) {
       if (item && typeof item === "object" && item.type === "text" && typeof item.text === "string") {
@@ -1733,27 +1723,22 @@ ${checkpointFormat(keepRecentTokens)}
           failureEscalation.clear();
           blockedPatterns.clear();
         } else {
-          // Normalize the command for comparison
           const normalized = normalizeCommand(rawCommand);
 
-          // Extract error fingerprint from result content
           const fingerprint = extractErrorFingerprint(event.result);
 
           // Skip Gallop-generated failures: blocked calls still emit
           // tool_execution_end with the block reason as the error result, and
           // recording those would pollute the loop history with block text.
           if (!fingerprint.startsWith("[gallop]")) {
-            // Record the failure
             failureHistory.push({
               command: normalized,
               fingerprint,
               turnIndex: currentTurnIndex,
             });
 
-            // Prune old entries outside the window
             pruneFailureHistory(failureHistory, currentTurnIndex, FAILURE_WINDOW_TURNS);
 
-            // Check for failure loop
             checkFailureLoop(normalized, fingerprint, ctx, pi);
           }
         }
@@ -1776,7 +1761,6 @@ ${checkpointFormat(keepRecentTokens)}
             error,
           };
     } else {
-      // Success clears mismatch tracking
       lastFailedToolCall = null;
     }
 
