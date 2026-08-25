@@ -266,11 +266,6 @@ export function detectBinaryContent(text: string): BinaryDetectionResult {
   return { binary: false, reason: "", nonPrintablePct: pct };
 }
 
-/** @deprecated Use detectBinaryContent() for result with reason */
-export function isBinaryContent(text: string): boolean {
-  return detectBinaryContent(text).binary;
-}
-
 // ── Read guard: binary file blocking ──
 
 /** Result from matching a read path against known binary extensions */
