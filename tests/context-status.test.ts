@@ -34,40 +34,48 @@ describe("formatTokenCount", () => {
 // ── contextStatusAdvice tiers ──
 
 describe("contextStatusAdvice", () => {
-  it("headroom OK above 2× the nudge threshold", () => {
-    // default threshold 18_432; 2× = 36_864
-    expect(contextStatusAdvice(50_000, DEFAULTS)).toBe("Advice: headroom OK.");
-    expect(contextStatusAdvice(36_865, DEFAULTS)).toBe("Advice: headroom OK.");
+  it("headroom OK above 2× the nudge threshold (and under the soft size tier)", () => {
+    // default threshold 18_432; 2× = 36_864; soft tier at 100k used
+    expect(contextStatusAdvice(50_000, 40_000, DEFAULTS)).toBe("Advice: headroom OK.");
+    expect(contextStatusAdvice(36_865, 90_000, DEFAULTS)).toBe("Advice: headroom OK.");
   });
 
   it("pressure building between the threshold and 2× it", () => {
-    expect(contextStatusAdvice(30_000, DEFAULTS)).toContain("pressure building");
-    expect(contextStatusAdvice(18_433, DEFAULTS)).toContain("pressure building");
+    // remaining tier wins over the size tier, even for a large context
+    expect(contextStatusAdvice(30_000, 150_000, DEFAULTS)).toContain("pressure building");
+    expect(contextStatusAdvice(18_433, 150_000, DEFAULTS)).toContain("pressure building");
   });
 
   it("near the backstop at or below the threshold (auto-compact on)", () => {
-    expect(contextStatusAdvice(18_432, DEFAULTS)).toBe(
+    expect(contextStatusAdvice(18_432, 180_000, DEFAULTS)).toBe(
       "Advice: near the backstop — call request_compact now if at a pause point.",
     );
-    expect(contextStatusAdvice(0, DEFAULTS)).toContain("near the backstop");
+    expect(contextStatusAdvice(0, 200_000, DEFAULTS)).toContain("near the backstop");
   });
 
   it("names the missing backstop when auto-compact is off", () => {
     // disabled → fixed 16k threshold
-    expect(contextStatusAdvice(15_000, { ...DEFAULTS, enabled: false })).toBe(
+    expect(contextStatusAdvice(15_000, 180_000, { ...DEFAULTS, enabled: false })).toBe(
       "Advice: near the limit and auto-compact is off — call request_compact now if at a pause point.",
     );
     // disabled → 2× fixed 16k = 32k still counts as pressure building
-    expect(contextStatusAdvice(17_000, { ...DEFAULTS, enabled: false })).toContain("pressure building");
-    expect(contextStatusAdvice(33_000, { ...DEFAULTS, enabled: false })).toBe("Advice: headroom OK.");
+    expect(contextStatusAdvice(17_000, 180_000, { ...DEFAULTS, enabled: false })).toContain("pressure building");
+    expect(contextStatusAdvice(33_000, 90_000, { ...DEFAULTS, enabled: false })).toBe("Advice: headroom OK.");
+  });
+
+  it("suggests compacting a large context with otherwise-OK headroom", () => {
+    expect(contextStatusAdvice(100_000, 100_001, DEFAULTS)).toContain("large context");
+    expect(contextStatusAdvice(100_000, 142_300, DEFAULTS)).toContain("~142.3k used");
+    // exactly at the soft tier is not large
+    expect(contextStatusAdvice(100_000, 100_000, DEFAULTS)).toBe("Advice: headroom OK.");
   });
 
   it("tracks a custom reserveTokens", () => {
     const s = { ...DEFAULTS, reserveTokens: 8_000 };
     // threshold 10_048; 2× = 20_096
-    expect(contextStatusAdvice(10_048, s)).toContain("near the backstop");
-    expect(contextStatusAdvice(15_000, s)).toContain("pressure building");
-    expect(contextStatusAdvice(20_097, s)).toBe("Advice: headroom OK.");
+    expect(contextStatusAdvice(10_048, 190_000, s)).toContain("near the backstop");
+    expect(contextStatusAdvice(15_000, 190_000, s)).toContain("pressure building");
+    expect(contextStatusAdvice(20_097, 90_000, s)).toBe("Advice: headroom OK.");
   });
 });
 
@@ -83,7 +91,17 @@ describe("buildContextStatusText", () => {
     expect(lines).toHaveLength(3);
     expect(lines[0]).toBe("142.3k / 200k tokens (71.2%) — 57.7k remaining");
     expect(lines[1]).toBe("Thresholds: gallop nudge ~18.4k remaining · pi auto-compact ~16.4k remaining");
-    expect(lines[2]).toBe("Advice: headroom OK.");
+    expect(lines[2]).toBe(
+      "Advice: large context (~142.3k used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call request_compact at this boundary.",
+    );
+  });
+
+  it("stays headroom OK below the soft size tier", () => {
+    const text = buildContextStatusText(
+      { tokens: 80_000, contextWindow: WINDOW, percent: 40 },
+      DEFAULTS,
+    );
+    expect(text.split("\n")[2]).toBe("Advice: headroom OK.");
   });
 
   it("reports no data when pi has no usage or window", () => {
@@ -186,7 +204,7 @@ describe("context_status tool (integration)", () => {
     expect(lines[0]).toBe("142.3k / 200k tokens (71.2%) — 57.7k remaining");
     expect(lines[1]).toContain("gallop nudge ~18.4k");
     expect(lines[1]).toContain("pi auto-compact ~16.4k");
-    expect(lines[2]).toBe("Advice: headroom OK.");
+    expect(lines[2]).toContain("large context (~142.3k used)");
   });
 
   it("reports the just-compacted window when pi's usage is null", async () => {

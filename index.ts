@@ -116,6 +116,11 @@ const NUDGE_BUFFER = 2_048;
 /** Nudge threshold when pi's automatic compaction is disabled — no backstop
  *  exists, so a fixed 16k (pi's default reserve). */
 const NUDGE_DISABLED_AT = 16_000;
+/** Context size (tokens used) beyond which context_status suggests a
+ *  compaction even with ample headroom — models (especially local ones)
+ *  perform best under ~100k. Suggestion only: the model decides whether the
+ *  next task still needs the current window. */
+export const SOFT_NUDGE_TOKENS = 100_000;
 let binarySuppressionEnabled = true;
 let readGuardEnabled = true;
 
@@ -588,11 +593,12 @@ export function formatTokenCount(n: number): string {
   return `${Math.round(n)}`;
 }
 
-/** The context_status advice line: one deterministic tier from the remaining
- *  distance to the nudge threshold — the model gets a recommendation, not raw
- *  math to interpret. Tiers: > 2× threshold → headroom OK; (threshold, 2×] →
- *  pressure building; ≤ threshold → near the backstop. */
-export function contextStatusAdvice(remaining: number, settings: PiCompactionSettings): string {
+/** The context_status advice line: one deterministic tier — the model gets a
+ *  recommendation, not raw math to interpret. Tiers: > 2× threshold → headroom
+ *  OK; (threshold, 2×] → pressure building; ≤ threshold → near the backstop.
+ *  A large context (> SOFT_NUDGE_TOKENS used) with otherwise-OK headroom gets
+ *  a suggestion-only compact hint instead of "headroom OK". */
+export function contextStatusAdvice(remaining: number, tokens: number, settings: PiCompactionSettings): string {
   const threshold = nudgeThreshold(settings);
   if (remaining <= threshold) {
     return settings.enabled
@@ -601,6 +607,9 @@ export function contextStatusAdvice(remaining: number, settings: PiCompactionSet
   }
   if (remaining <= 2 * threshold) {
     return "Advice: pressure building — if a large batch of reads or images is ahead, call request_compact at this boundary first.";
+  }
+  if (tokens > SOFT_NUDGE_TOKENS) {
+    return `Advice: large context (~${formatTokenCount(tokens)} used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call request_compact at this boundary.`;
   }
   return "Advice: headroom OK.";
 }
@@ -635,7 +644,7 @@ export function buildContextStatusText(
       `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings))} remaining · pi auto-compact OFF (no backstop)`,
     );
   }
-  lines.push(contextStatusAdvice(remaining, settings));
+  lines.push(contextStatusAdvice(remaining, usage.tokens, settings));
   return lines.join("\n");
 }
 
