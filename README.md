@@ -204,3 +204,22 @@ agent.
 
 Compaction resets all escalation state (blocks, nudges, stall count).
 
+### Context status (active usage query)
+
+The model has no passive view of context usage — the nudge above only fires
+near the limit. `context_status` is a parameterless tool that reports, on
+demand: current usage vs the model window (percent), remaining tokens, the
+two backstop thresholds (gallop nudge, pi auto-compact — or the missing
+backstop when auto-compact is off), and one deterministic advice line
+(headroom OK / pressure building / near the backstop). It reads pi's own
+`getContextUsage()` — the same last-usage-anchored estimate pi's automatic
+threshold check uses — so the numbers match the backstop. In the window right
+after a compaction (before the next assistant response carries usage) pi
+reports `null`; the tool then says the context is fresh and safe to proceed.
+
+The tool description scopes the call frequency — task boundaries and large
+batches of reads or images (~1.6k tokens each), not after every tool call — so
+the on-demand query stays on-demand (each result stays in the kept context).
+Per-category visualization for humans remains the separate `/context`
+extension.
+

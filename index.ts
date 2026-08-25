@@ -12,7 +12,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, InputEvent, SessionBeforeCompactEvent, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Persisted settings ──
@@ -80,6 +80,19 @@ let selfSummary: string | null = null;
  *  started. Cleared by session_compact (a compaction already did the work) and by
  *  session reset. */
 let pendingCompact: { continue: boolean } | null = null;
+/** Interactive messages received while a compact was pending. pi would queue
+ *  them and its post-run loop would process them on the stale, un-compacted
+ *  context BEFORE the deferred compact fires (agent_settled waits for queued
+ *  continuations). The input handler stashes them; session_compact re-delivers
+ *  them after the compaction. A new session discards them — they belong to the
+ *  compacted context. */
+type StashedInput = Pick<InputEvent, "text" | "images">;
+let stashedInputs: StashedInput[] = [];
+/** True between redelivery scheduling (session_compact) and delivery — the
+ *  user's own messages are the continuation, so the manual path's continue
+ *  steer must be suppressed. */
+let stashedRedeliveryPending = false;
+let stashedRedeliveryTimer: ReturnType<typeof setTimeout> | undefined;
 /** Re-entrancy guard for ctx.compact(). Set when a compact actually starts;
  *  cleared only at a true new-turn boundary (a new user message or a new
  *  session) — NOT on session_compact or compact complete/error.
@@ -353,6 +366,30 @@ function scheduleContinueSteer(pi: ExtensionAPI): void {
   }, 200);
 }
 
+function sendStashed(stashed: StashedInput[], pi: ExtensionAPI): void {
+  for (const m of stashed) {
+    const content = m.images && m.images.length > 0
+      ? [{ type: "text" as const, text: m.text }, ...m.images]
+      : m.text;
+    // followUp: direct prompt when idle, queued when a run is already active.
+    // expandPromptTemplates: interactive prompts expand by default — keep it.
+    void pi.sendUserMessage(content, { deliverAs: "followUp", expandPromptTemplates: true });
+  }
+}
+
+/** Re-deliver messages stashed while a compact was pending (input handler).
+ *  Delayed: session_compact fires while pi's compaction-in-progress flag is
+ *  still set, and prompt() refuses to submit during compaction — by the time
+ *  the timer fires, compact() has finished and cleared the flag. */
+function scheduleStashedRedelivery(stashed: StashedInput[], pi: ExtensionAPI): void {
+  stashedRedeliveryPending = true;
+  stashedRedeliveryTimer = setTimeout(() => {
+    stashedRedeliveryTimer = undefined;
+    stashedRedeliveryPending = false;
+    sendStashed(stashed, pi);
+  }, 200);
+}
+
 function triggerCompaction(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
@@ -371,7 +408,9 @@ function triggerCompaction(
   ctx.compact({
     customInstructions: instructions,
     onComplete: () => {
-      if (continueAfter) {
+      // A stashed-redelivery is in flight (session_compact) — the user's own
+      // messages are the continuation, so no generic proceed steer.
+      if (continueAfter && !stashedRedeliveryPending) {
         scheduleContinueSteer(pi);
       }
     },
@@ -402,6 +441,14 @@ function triggerCompaction(
 // compaction already ran → session_compact cleared the pending state → no
 // trigger; nothing ran → the deferred trigger compacts now, with the stashed
 // summary if the model called the tool, pi's native one-shot otherwise.
+//
+// A user message typed while the compact is pending would otherwise be queued
+// by pi and its post-run loop would process it BEFORE the deferred compact
+// (agent_settled waits for queued continuations) — running it on the stale,
+// un-compacted context and delaying the compact until that run ends. The input
+// handler (extension factory) swallows interactive messages while pendingCompact
+// is set; session_compact re-delivers them after the compaction (and
+// session_compact_failed delivers them immediately when the compact fails).
 //
 // The summary text would stay in the kept tail as the tool call's arguments —
 // duplicated on every request — and the exchange (call + "Compacting (…)" result)
@@ -536,6 +583,65 @@ export function readPiCompactionSettings(
  *  fire). */
 export function nudgeThreshold(settings: PiCompactionSettings = PI_COMPACTION_DEFAULTS): number {
   return settings.enabled ? settings.reserveTokens + NUDGE_BUFFER : NUDGE_DISABLED_AT;
+}
+
+/** Format a token count for the LLM: 950 → "950", 1200 → "1.2k", 200000 → "200k". */
+export function formatTokenCount(n: number): string {
+  const trim = (v: number) => v.toFixed(1).replace(/\.0$/, "");
+  if (n >= 1_000_000) return `${trim(n / 1_000_000)}M`;
+  if (n >= 1_000) return `${trim(n / 1_000)}k`;
+  return `${Math.round(n)}`;
+}
+
+/** The context_status advice line: one deterministic tier from the remaining
+ *  distance to the nudge threshold — the model gets a recommendation, not raw
+ *  math to interpret. Tiers: > 2× threshold → headroom OK; (threshold, 2×] →
+ *  pressure building; ≤ threshold → near the backstop. */
+export function contextStatusAdvice(remaining: number, settings: PiCompactionSettings): string {
+  const threshold = nudgeThreshold(settings);
+  if (remaining <= threshold) {
+    return settings.enabled
+      ? "Advice: near the backstop — call request_compact now if at a pause point."
+      : "Advice: near the limit and auto-compact is off — call request_compact now if at a pause point.";
+  }
+  if (remaining <= 2 * threshold) {
+    return "Advice: pressure building — if a large batch of reads or images is ahead, call request_compact at this boundary first.";
+  }
+  return "Advice: headroom OK.";
+}
+
+/** Build the context_status tool result. Pure function of (usage, settings)
+ *  so the tiers and formatting are unit-testable. usage is pi's own
+ *  getContextUsage() — the same last-usage-anchored estimate pi's automatic
+ *  threshold check uses, so the numbers match the backstop. tokens === null
+ *  only in the window right after a compaction, before the next assistant
+ *  response carries usage. */
+export function buildContextStatusText(
+  usage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined,
+  settings: PiCompactionSettings,
+): string {
+  if (!usage || usage.contextWindow <= 0) {
+    return "No context usage data available (no model or context window).";
+  }
+  if (usage.tokens === null) {
+    return "Context was just compacted — exact usage is unknown until the next response. Context is fresh; safe to proceed.";
+  }
+  const remaining = Math.max(0, usage.contextWindow - usage.tokens);
+  const pct = usage.percent !== null ? usage.percent.toFixed(1) : "?";
+  const lines = [
+    `${formatTokenCount(usage.tokens)} / ${formatTokenCount(usage.contextWindow)} tokens (${pct}%) — ${formatTokenCount(remaining)} remaining`,
+  ];
+  if (settings.enabled) {
+    lines.push(
+      `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings))} remaining · pi auto-compact ~${formatTokenCount(settings.reserveTokens)} remaining`,
+    );
+  } else {
+    lines.push(
+      `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings))} remaining · pi auto-compact OFF (no backstop)`,
+    );
+  }
+  lines.push(contextStatusAdvice(remaining, settings));
+  return lines.join("\n");
 }
 
 /**
@@ -729,6 +835,12 @@ function resetAllState(): void {
   sawAssistantMessage = false;
   selfSummary = null;
   pendingCompact = null;
+  stashedInputs = [];
+  stashedRedeliveryPending = false;
+  if (stashedRedeliveryTimer) {
+    clearTimeout(stashedRedeliveryTimer);
+    stashedRedeliveryTimer = undefined;
+  }
   contextNudgeState = "idle";
 
   pendingToolCalls.clear();
@@ -1000,21 +1112,16 @@ function checkFailureLoop(
 // [compaction] entry right below the call already carries it (Ctrl+O in the
 // TUI, click in the export), and showing it in the tool view would print the
 // same text twice under the same expand toggle.
-// Structural theme type: pi's Theme satisfies it; keeps the helpers free of
-// a pi-internal Theme import.
+// Theme is the public pi-coding-agent export (pi-tui does not export it);
+// renderer parameters are contextually typed by registerTool, so they track
+// pi's ToolDefinition signature instead of a hand-kept structural copy.
 
-interface CompactRenderTheme {
-  fg: (name: string, text: string) => string;
-  bold?: (text: string) => string;
-}
-
-function formatCompactCallLine(theme: CompactRenderTheme): string {
-  const bold = theme.bold ?? ((s: string) => s);
-  return theme.fg("toolTitle", bold("request_compact"));
+function formatToolCallLine(theme: Theme, name: string): string {
+  return theme.fg("toolTitle", theme.bold(name));
 }
 
 function formatCompactResultText(
-  theme: CompactRenderTheme,
+  theme: Theme,
   result: { content?: Array<{ type: string; text?: string }> } | undefined,
   options: { isPartial?: boolean },
 ): string {
@@ -1025,6 +1132,24 @@ function formatCompactResultText(
     .join("\n")
     .trim();
   return text ? theme.fg("toolOutput", text) : "";
+}
+
+/** context_status: the result IS the payload — collapsed shows the usage line
+ *  only, expanded the full text (usage / thresholds / advice). No args are
+ *  ever shown (the tool has none). */
+function formatStatusResultText(
+  theme: Theme,
+  result: { content?: Array<{ type: string; text?: string }> } | undefined,
+  options: { isPartial?: boolean; expanded?: boolean },
+): string {
+  if (options.isPartial) return theme.fg("warning", "Measuring…");
+  const text = (result?.content ?? [])
+    .filter((block) => block?.type === "text")
+    .map((block) => String(block.text ?? ""))
+    .join("\n")
+    .trim();
+  if (!text) return "";
+  return theme.fg("toolOutput", options.expanded ? text : text.split("\n")[0]!);
 }
 
 // ── Main extension ──
@@ -1044,7 +1169,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     name: "request_compact",
     label: "Request Compact",
     description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
-- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, a planned task finished and another is queued (compact at the boundary — the next task starts on a fresh context), the session is long, or a [Gallop] context-pressure notice asks you to.
+- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, a planned task finished and another is queued (compact at the boundary — the next task starts on a fresh context), the session is long, context_status reports pressure before a large batch of reads or images, or a [Gallop] context-pressure notice asks you to.
 - Write the checkpoint summary yourself in the 'summary' argument, in this exact format:
 
 ${checkpointFormat(keepRecentTokens)}
@@ -1100,18 +1225,52 @@ ${checkpointFormat(keepRecentTokens)}
         terminate: true,
       };
     },
-    renderCall(
-      _args: { message?: string; summary?: string },
-      theme: CompactRenderTheme,
-    ) {
-      return new Text(formatCompactCallLine(theme), 0, 0);
+    renderCall(_args, theme) {
+      return new Text(formatToolCallLine(theme, "request_compact"), 0, 0);
     },
-    renderResult(
-      result: { content?: Array<{ type: string; text?: string }> },
-      options: { isPartial?: boolean },
-      theme: CompactRenderTheme,
-    ) {
+    renderResult(result, options, theme) {
       return new Text(formatCompactResultText(theme, result, options), 0, 0);
+    },
+  });
+
+  // ── Tool: LLM queries its own context usage ──
+  // The model has no passive view of context usage — the pressure nudge above
+  // only fires near the limit, one steer per cycle. This makes the view
+  // on-demand, so the model can decide PROACTIVELY: compact at a task
+  // boundary before the next task inherits the bloat, or before an image
+  // batch that would overflow a small window. It reports pi's own
+  // getContextUsage() (the last-usage-anchored estimate pi's automatic
+  // threshold check uses) plus the two backstop thresholds it already reads,
+  // and one advice line — a recommendation, not raw math. No parameters
+  // (nothing to tune in v1); the description scopes the call frequency so the
+  // on-demand query stays on-demand (per-call results stay in context — an
+  // after-every-tool-call habit would re-create the v1.3 ambient noise).
+  pi.registerTool({
+    name: "context_status",
+    label: "Context Status",
+    description: `Report current context usage vs the model window, remaining tokens, and compaction thresholds.
+- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each), to decide whether to call request_compact first. Not after every tool call.
+- If the advice is not "headroom OK", call request_compact at this boundary with a checkpoint summary.`,
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+    async execute(_id: string, _params: {}, _signal, _onUpdate, ctx: ExtensionContext) {
+      const usage = ctx.getContextUsage();
+      const settings = readPiCompactionSettings(ctx.cwd);
+      return {
+        details: {},
+        content: [{
+          type: "text",
+          text: buildContextStatusText(usage, settings),
+        }],
+      };
+    },
+    renderCall(_args, theme) {
+      return new Text(formatToolCallLine(theme, "context_status"), 0, 0);
+    },
+    renderResult(result, options, theme) {
+      return new Text(formatStatusResultText(theme, result, options), 0, 0);
     },
   });
 
@@ -1328,6 +1487,23 @@ ${checkpointFormat(keepRecentTokens)}
     const branch = ctx.sessionManager?.getBranch?.() ?? [];
     if (branch[branch.length - 1]?.type === "compaction") return;
     triggerCompaction(ctx, pi, undefined, continueAfter);
+  });
+
+  // ── Pending-compact input gate ──
+  // While a model-requested compact is pending (request_compact executed, the
+  // deferred compact not yet fired), a typed message would be queued and pi's
+  // post-run loop would process it on the stale context before the compact —
+  // delaying the compact until that run ends. Swallow interactive messages
+  // instead; session_compact (or session_compact_failed) re-delivers them on
+  // the fresh context. Once a compact is actually running, the TUI routes
+  // typed messages through its own compaction queue and they never reach here.
+  pi.on("input", (event, ctx) => {
+    if (!pendingCompact || event.source !== "interactive") return;
+    stashedInputs.push({ text: event.text, images: event.images });
+    if (ctx.hasUI) {
+      ctx.ui.notify("Gallop: message saved — it will run after the pending compaction", "info");
+    }
+    return { action: "handled" };
   });
 
   // ── Turn tracking ──
@@ -1812,10 +1988,27 @@ ${checkpointFormat(keepRecentTokens)}
     // trigger will be a no-op. (The manual path delivers its own via
     // onComplete; its pending state is already cleared by then.)
     const continueAfter = pendingCompact?.continue ?? false;
+    // Messages swallowed while this compact was pending (input gate): the
+    // compact just ran, so re-deliver them on the fresh context. They are the
+    // continuation — the generic proceed steer is skipped (the manual path's
+    // onComplete is suppressed via stashedRedeliveryPending).
+    const stashed = stashedInputs;
     // Reset all Gallop state after compaction to avoid stale state
     resetAllState();
-    if (continueAfter) {
+    if (stashed.length > 0) {
+      scheduleStashedRedelivery(stashed, pi);
+    } else if (continueAfter) {
       scheduleContinueSteer(pi);
     }
+  });
+
+  pi.on("session_compact_failed", async (_event: unknown, _ctx: ExtensionContext) => {
+    // The compact did not run — deliver the swallowed messages anyway (they
+    // would have run on the un-compacted context, so dropping them would lose
+    // user input). Safe to submit now: pi clears its compaction-in-progress
+    // flag before emitting this event.
+    const stashed = stashedInputs;
+    stashedInputs = [];
+    if (stashed.length > 0) sendStashed(stashed, pi);
   });
 }
