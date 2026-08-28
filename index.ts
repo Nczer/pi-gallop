@@ -1172,7 +1172,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
 - Write the checkpoint summary yourself in the 'summary' argument, in this exact format:
 
 ${checkpointFormat(keepRecentTokens)}
-- 'message': brief user-visible message shown while compacting.
 - 'continue': defaults to true — work resumes right after compaction (a generic proceed message is injected; the checkpoint's Next Steps say what to do). Pass false only when the task is done or the user takes the next step.`,
     parameters: {
       type: "object",
