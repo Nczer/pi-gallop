@@ -481,7 +481,7 @@ export function checkpointFormat(keepRecentTokens: number = PI_COMPACTION_DEFAUL
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
 ## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
+- [Any constraints, preferences, or requirements mentioned by user or found]
 - [Or "(none)" if none were mentioned]
 
 ## Progress
@@ -1167,12 +1167,12 @@ export default function gallopExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "request_compact",
     label: "Request Compact",
-    description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
-- Call when: edit keeps failing (bloat broke text matching), a task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure before a big read/image batch.
-- Write the checkpoint summary yourself in 'summary', in this exact format:
+    description: `Compact context to remove unrelated old context and increase performance while preserving active tasks.
+- Call when: edit keeps failing (broken text matching), a major task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure.
+- Write the checkpoint summary in 'summary', in this exact format:
 
 ${checkpointFormat(keepRecentTokens)}
-- 'continue' defaults to true; pass false only when the task is done or the user takes the next step.`,
+- 'continue' defaults to true; pass false if there is nothing to follow up`,
     parameters: {
       type: "object",
       properties: {
@@ -1186,7 +1186,7 @@ ${checkpointFormat(keepRecentTokens)}
         },
         continue: {
           type: "boolean",
-          description: "Whether the agent should continue working right after compaction (default: true — pass false to stop)",
+          description: "Continue working right after compaction or not (default: true — pass false to stop)",
         },
       },
       required: ["summary"],
@@ -1246,8 +1246,8 @@ ${checkpointFormat(keepRecentTokens)}
   pi.registerTool({
     name: "context_status",
     label: "Context Status",
-    description: `Report current context usage vs the model window, remaining tokens, and compaction thresholds.
-- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each) — not after every tool call. If the advice is not "headroom OK", call request_compact first.`,
+    description: `Report current context usage, remaining tokens, and compaction thresholds.
+- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each). If the advice is not "headroom OK", call request_compact first.`,
     parameters: {
       type: "object",
       properties: {},
