@@ -648,6 +648,21 @@ export function buildContextStatusText(
   return lines.join("\n");
 }
 
+/** Minimum-context guard for request_compact. pi's compact keeps the most recent
+ *  keepRecentTokens (compaction.keepRecentTokens, default 20k) verbatim and summarizes
+ *  everything older; when the whole context fits in that window the cut point reaches the
+ *  session start — nothing to summarize, and pi fails the compact. Returns the error
+ *  message to fail the tool call with, or null when the call may proceed. tokens === null
+ *  (the window right after a compaction, before the next assistant response carries usage)
+ *  is unmeasurable → proceed and let pi decide. */
+export function tooSmallCompactError(
+  tokens: number | null | undefined,
+  keepRecentTokens: number,
+): string | null {
+  if (tokens === null || tokens === undefined || tokens > keepRecentTokens) return null;
+  return `Context is below the compaction minimum (${formatTokenCount(tokens)} tokens ≤ ${formatTokenCount(keepRecentTokens)} keep window). Pi keeps the most recent ${formatTokenCount(keepRecentTokens)} tokens verbatim, so there is no older context to summarize — the compact would fail. Continue working; call request_compact again once context exceeds ${formatTokenCount(keepRecentTokens)} tokens.`;
+}
+
 /**
  * Nudge the LLM to self-compact as the context nears its limit: one advisory
  * steer per compaction cycle, just above pi's automatic threshold (or at a
@@ -1172,7 +1187,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
 - Write the checkpoint summary in 'summary', in this exact format:
 
 ${checkpointFormat(keepRecentTokens)}
-- 'continue' defaults to true; pass false if there is nothing to follow up`,
+- 'continue' defaults to true; pass false if there is nothing to follow up
+- Fails when the context fits in the kept tail (~${Math.round(keepRecentTokens / 1000)}k tokens) — nothing older to summarize yet`,
     parameters: {
       type: "object",
       properties: {
@@ -1191,7 +1207,17 @@ ${checkpointFormat(keepRecentTokens)}
       },
       required: ["summary"],
     },
-    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean }, _signal, _onUpdate, _ctx) {
+    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean }, _signal, _onUpdate, ctx: ExtensionContext) {
+      // Minimum-context guard: when the whole context fits in pi's keep window there is no
+      // older message to summarize — pi would fail the compact. Fail the tool call instead:
+      // the thrown error becomes the tool result the model sees, and because the guard runs
+      // before anything is stashed, no pending state exists and the deferred compact never
+      // fires. Usage is pi's own last-usage-anchored estimate (same as the automatic
+      // threshold check); the keep window is read live, like context_status.
+      const usage = ctx.getContextUsage();
+      const tooSmall = tooSmallCompactError(usage?.tokens, readPiCompactionSettings(ctx.cwd).keepRecentTokens);
+      if (tooSmall) throw new Error(tooSmall);
+
       const message = params?.message || "model-initiated";
 
       // Stash the model's checkpoint for session_before_compact. A too-short summary

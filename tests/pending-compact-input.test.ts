@@ -56,6 +56,8 @@ describe("pending-compact input gate", () => {
       compact: vi.fn(),
       hasUI: false,
       cwd: "/tmp/gallop-test",
+      // Above the default 20k keep window — the minimum-context guard stays out of the way.
+      getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: 200_000, percent: 25 })),
       sessionManager: { getBranch: vi.fn(() => []) },
     };
     // Reset shared module state (mirrors the self-compact suite): clear any

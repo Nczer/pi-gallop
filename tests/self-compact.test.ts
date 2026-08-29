@@ -9,6 +9,7 @@ import gallopExtension, {
   readPiCompactionSettings,
   nudgeThreshold,
   checkpointFormat,
+  tooSmallCompactError,
   COMPACT_DONE_MARKER,
 } from "../index";
 
@@ -59,6 +60,30 @@ describe("appendSelfCompactFileOps", () => {
     expect(appendSelfCompactFileOps("SUMMARY", fileOps)).toBe(
       "SUMMARY\n\n<modified-files>\na.ts\n</modified-files>",
     );
+  });
+});
+
+// ── tooSmallCompactError (minimum-context guard) ──
+
+describe("tooSmallCompactError", () => {
+  it("fails at or below the keep window", () => {
+    expect(tooSmallCompactError(10_000, 20_000)).toMatch(/below the compaction minimum/);
+    expect(tooSmallCompactError(20_000, 20_000)).toMatch(/below the compaction minimum/);
+  });
+
+  it("proceeds above the keep window", () => {
+    expect(tooSmallCompactError(20_001, 20_000)).toBeNull();
+    expect(tooSmallCompactError(150_000, 20_000)).toBeNull();
+  });
+
+  it("proceeds when usage is unmeasurable (post-compaction null)", () => {
+    expect(tooSmallCompactError(null, 20_000)).toBeNull();
+    expect(tooSmallCompactError(undefined, 20_000)).toBeNull();
+  });
+
+  it("tracks a custom keep window", () => {
+    expect(tooSmallCompactError(30_000, 40_000)).toMatch(/40k/);
+    expect(tooSmallCompactError(50_000, 40_000)).toBeNull();
   });
 });
 
@@ -118,6 +143,9 @@ describe("self-compact wiring (in-session summary)", () => {
       compact: vi.fn(),
       hasUI: false,
       cwd: "/tmp/gallop-test",
+      // Comfortably above the default 20k keep window so the minimum-context
+      // guard stays out of the way (tests that exercise it override this).
+      getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: 200_000, percent: 25 })),
       sessionManager: {
         getSessionFile: () => "/tmp/gallop-test/session.jsonl",
         // Branch does not end in a compaction entry (nothing compacted yet).
@@ -216,6 +244,23 @@ describe("self-compact wiring (in-session summary)", () => {
     opts.onComplete();
     await flushTimers();
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("fails the call when the context is at or below the keep window — nothing stashed, no deferred compact", async () => {
+    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
+    await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
+
+    // The guard threw before stashing — the settle point must not fire a compact.
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("proceeds when usage is unmeasurable (tokens: null right after a compact)", async () => {
+    ctx.getContextUsage.mockReturnValue({ tokens: null, contextWindow: 200_000, percent: null });
+    const result = await callTool({ summary: LONG_SUMMARY });
+    expect(result.terminate).toBe(true);
+    await settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
   it("declares summary as a required parameter and exposes message/continue", () => {
@@ -446,6 +491,9 @@ describe("context-pressure nudge", () => {
       hasUI: false,
       cwd: tmpCwd,
       model: { contextWindow: WINDOW },
+      // Comfortably above the default 20k keep window — the minimum-context
+      // guard stays out of the way.
+      getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: WINDOW, percent: 25 })),
       sessionManager: { getSessionFile: () => "/tmp/gallop-test/session.jsonl", getBranch: vi.fn(() => []) },
     };
     void handlers.get("session_compact")(null, { hasUI: false });

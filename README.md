@@ -138,6 +138,16 @@ Tool arguments:
   = the agent stops and you take the next step. No custom resume text is ever written
   or re-sent.
 
+Minimum context: the call **fails when the whole context fits in pi's keep
+window** (`compaction.keepRecentTokens`, default 20k) — there is nothing older
+than the verbatim tail to summarize, and pi would fail the compact. The guard
+checks pi's own `getContextUsage()` (the same last-usage-anchored estimate the
+automatic threshold check uses) against the live settings before stashing
+anything: a below-minimum call fails as the tool call itself (the thrown error
+becomes the tool result the model sees, with the reason and a retry-once-larger
+hint), and no deferred compact is armed. Unmeasurable usage (`tokens: null` in
+the window right after a compaction) proceeds and lets pi decide.
+
 The tool description also suggests compacting at task boundaries: when a planned
 task finished and another is queued, the checkpoint becomes the handoff for the
 next task (which starts on a fresh context) instead of the next task inheriting
