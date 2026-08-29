@@ -1219,7 +1219,6 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
 ${checkpointFormat(keepRecentTokens)}
 - 'continue' defaults to true; pass false if there is nothing to follow up
-- Fails when the context fits in the kept tail (~${Math.round(keepRecentTokens / 1000)}k tokens) — nothing older to summarize yet
 - Context broken beyond repair (tool calls failing repeatedly): pass nuke: true — the checkpoint must then carry full state, not just older work`,
     parameters: {
       type: "object",
@@ -1238,7 +1237,7 @@ ${checkpointFormat(keepRecentTokens)}
         },
         nuke: {
           type: "boolean",
-          description: `Summarize everything instead of the default ~${Math.round(keepRecentTokens / 1000)}k keep window — only the last turn's tail survives`,
+          description: `True = only compaction summary survives after compact, summarize everything you need (default: false)`,
         },
       },
       required: ["summary"],
