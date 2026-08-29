@@ -1168,11 +1168,11 @@ export default function gallopExtension(pi: ExtensionAPI) {
     name: "request_compact",
     label: "Request Compact",
     description: `Compact context to reduce token usage. Discards bloat while preserving active tasks.
-- Call when: edit tool fails 2+ times (context bloat broke text matching), large diffs accumulated, a planned task finished and another is queued (compact at the boundary — the next task starts on a fresh context), the session is long, context_status reports pressure before a large batch of reads or images, or a [Gallop] context-pressure notice asks you to.
-- Write the checkpoint summary yourself in the 'summary' argument, in this exact format:
+- Call when: edit keeps failing (bloat broke text matching), a task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure before a big read/image batch.
+- Write the checkpoint summary yourself in 'summary', in this exact format:
 
 ${checkpointFormat(keepRecentTokens)}
-- 'continue': defaults to true — work resumes right after compaction (a generic proceed message is injected; the checkpoint's Next Steps say what to do). Pass false only when the task is done or the user takes the next step.`,
+- 'continue' defaults to true; pass false only when the task is done or the user takes the next step.`,
     parameters: {
       type: "object",
       properties: {
@@ -1247,8 +1247,7 @@ ${checkpointFormat(keepRecentTokens)}
     name: "context_status",
     label: "Context Status",
     description: `Report current context usage vs the model window, remaining tokens, and compaction thresholds.
-- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each), to decide whether to call request_compact first. Not after every tool call.
-- If the advice is not "headroom OK", call request_compact at this boundary with a checkpoint summary.`,
+- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each) — not after every tool call. If the advice is not "headroom OK", call request_compact first.`,
     parameters: {
       type: "object",
       properties: {},
