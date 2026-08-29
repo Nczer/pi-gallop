@@ -12,7 +12,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import type { ExtensionAPI, ExtensionContext, InputEvent, SessionBeforeCompactEvent, Theme } from "@earendil-works/pi-coding-agent";
+import type { CompactionEntry, ExtensionAPI, ExtensionContext, InputEvent, SessionBeforeCompactEvent, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
+import { findCutPoint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Persisted settings ──
@@ -71,7 +72,7 @@ let sawAssistantMessage = false;
  *  flattened conversation). Null → pi's native one-shot. */
 let selfSummary: string | null = null;
 /** A compact was requested during the last run but has not run yet. Set when
- *  request_compact executes ({ continue } from the tool arg). Consumed by the
+ *  request_compact executes ({ continue, nuke } from the tool args). Consumed by the
  *  agent_settled handler, which triggers the compact. Deferring to agent_settled is what makes
  *  the trigger race-free: pi's automatic threshold compaction runs in the post-run
  *  loop, BEFORE the settled event. If it fired, it consumed the stashed summary
@@ -79,7 +80,7 @@ let selfSummary: string | null = null;
  *  compact that would otherwise hit pi's "Already compacted" error is never
  *  started. Cleared by session_compact (a compaction already did the work) and by
  *  session reset. */
-let pendingCompact: { continue: boolean } | null = null;
+let pendingCompact: { continue: boolean; nuke: boolean } | null = null;
 /** Interactive messages received while a compact was pending. pi would queue
  *  them and its post-run loop would process them on the stale, un-compacted
  *  context BEFORE the deferred compact fires (agent_settled waits for queued
@@ -649,18 +650,48 @@ export function buildContextStatusText(
 }
 
 /** Minimum-context guard for request_compact. pi's compact keeps the most recent
- *  keepRecentTokens (compaction.keepRecentTokens, default 20k) verbatim and summarizes
- *  everything older; when the whole context fits in that window the cut point reaches the
- *  session start — nothing to summarize, and pi fails the compact. Returns the error
- *  message to fail the tool call with, or null when the call may proceed. tokens === null
- *  (the window right after a compaction, before the next assistant response carries usage)
- *  is unmeasurable → proceed and let pi decide. */
+ *  configuredKeep (compaction.keepRecentTokens, default 20k) verbatim and summarizes
+ *  everything older; when the whole context fits in that window pi's prepareCompaction
+ *  bails out (returns undefined) and the compact fails — including a nuke, which pi
+ *  evaluates with the CONFIGURED window, before any extension hook runs. Returns the
+ *  error message to fail the tool call with, or null when the call may proceed.
+ *  tokens === null (the window right after a compaction, before the next assistant
+ *  response carries usage) is unmeasurable → proceed and let pi decide. */
 export function tooSmallCompactError(
   tokens: number | null | undefined,
-  keepRecentTokens: number,
+  configuredKeep: number,
+  nuke: boolean,
 ): string | null {
-  if (tokens === null || tokens === undefined || tokens > keepRecentTokens) return null;
-  return `Context is below the compaction minimum (${formatTokenCount(tokens)} tokens ≤ ${formatTokenCount(keepRecentTokens)} keep window). Pi keeps the most recent ${formatTokenCount(keepRecentTokens)} tokens verbatim, so there is no older context to summarize — the compact would fail. Continue working; call request_compact again once context exceeds ${formatTokenCount(keepRecentTokens)} tokens.`;
+  if (tokens === null || tokens === undefined || tokens > configuredKeep) return null;
+  if (nuke) {
+    return `Context (~${formatTokenCount(tokens)} tokens) is at or below pi's configured keep window (${formatTokenCount(configuredKeep)}), so pi refuses to compact this session at all — even nuke: true is rejected before compaction ("session too small"). If the context is broken: persist the state to memory (or a handoff file) and tell the user to start a new session.`;
+  }
+  return `Context is below the compaction minimum (${formatTokenCount(tokens)} tokens ≤ ${formatTokenCount(configuredKeep)} keep window). Pi keeps the most recent ${formatTokenCount(configuredKeep)} tokens verbatim, so there is no older context to summarize — the compact would fail. Continue working; call request_compact again once context exceeds ${formatTokenCount(configuredKeep)} tokens.`;
+}
+
+/** Recompute pi's cut point with a custom keep budget (the nuke path uses 0).
+ *  prepareCompaction itself is not exported, only its pieces — so mirror its boundary
+ *  logic (start after the previous compaction's kept boundary) and run the same
+ *  findCutPoint walker pi uses. session_before_compact returns the id; pi uses a
+ *  custom firstKeptEntryId verbatim. Null when the entries yield no cut (the caller
+ *  keeps pi's own cut). */
+export function computeCustomFirstKeptEntryId(entries: SessionEntry[], keepTokens: number): string | null {
+  if (entries.length === 0) return null;
+  let prev: CompactionEntry | undefined;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.type === "compaction") {
+      prev = e;
+      break;
+    }
+  }
+  let boundaryStart = 0;
+  if (prev) {
+    const firstKeptEntryIndex = entries.findIndex((e) => e.id === prev.firstKeptEntryId);
+    boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : entries.indexOf(prev) + 1;
+  }
+  const cut = findCutPoint(entries, boundaryStart, entries.length, keepTokens);
+  return entries[cut.firstKeptEntryIndex]?.id ?? null;
 }
 
 /**
@@ -1188,7 +1219,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
 ${checkpointFormat(keepRecentTokens)}
 - 'continue' defaults to true; pass false if there is nothing to follow up
-- Fails when the context fits in the kept tail (~${Math.round(keepRecentTokens / 1000)}k tokens) — nothing older to summarize yet`,
+- Fails when the context fits in the kept tail (~${Math.round(keepRecentTokens / 1000)}k tokens) — nothing older to summarize yet
+- Context broken beyond repair (tool calls failing repeatedly): pass nuke: true — the checkpoint must then carry full state, not just older work`,
     parameters: {
       type: "object",
       properties: {
@@ -1204,18 +1236,25 @@ ${checkpointFormat(keepRecentTokens)}
           type: "boolean",
           description: "Continue working right after compaction or not (default: true — pass false to stop)",
         },
+        nuke: {
+          type: "boolean",
+          description: `Summarize everything instead of the default ~${Math.round(keepRecentTokens / 1000)}k keep window — only the last turn's tail survives`,
+        },
       },
       required: ["summary"],
     },
-    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean }, _signal, _onUpdate, ctx: ExtensionContext) {
-      // Minimum-context guard: when the whole context fits in pi's keep window there is no
-      // older message to summarize — pi would fail the compact. Fail the tool call instead:
-      // the thrown error becomes the tool result the model sees, and because the guard runs
-      // before anything is stashed, no pending state exists and the deferred compact never
-      // fires. Usage is pi's own last-usage-anchored estimate (same as the automatic
-      // threshold check); the keep window is read live, like context_status.
+    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean; nuke?: boolean }, _signal, _onUpdate, ctx: ExtensionContext) {
+      // Minimum-context guard: when the whole context fits in pi's configured keep
+      // window, pi's prepareCompaction bails before any hook runs — no compact can
+      // happen at all (not even a nuke; pi evaluates the cut with the configured
+      // window, never 0). Fail the tool call instead: the thrown error becomes the
+      // tool result the model sees, and because the guard runs before anything is
+      // stashed, no pending state exists and the deferred compact never fires. Usage
+      // is pi's own last-usage-anchored estimate (same as the automatic threshold
+      // check); the keep window is read live, like context_status.
+      const settings = readPiCompactionSettings(ctx.cwd);
       const usage = ctx.getContextUsage();
-      const tooSmall = tooSmallCompactError(usage?.tokens, readPiCompactionSettings(ctx.cwd).keepRecentTokens);
+      const tooSmall = tooSmallCompactError(usage?.tokens, settings.keepRecentTokens, params?.nuke === true);
       if (tooSmall) throw new Error(tooSmall);
 
       const message = params?.message || "model-initiated";
@@ -1234,7 +1273,7 @@ ${checkpointFormat(keepRecentTokens)}
       // Default continue: an omitted argument keeps working. The failure costs
       // are asymmetric — a mistaken continue costs one idle "nothing to do"
       // turn; a mistaken stop strands the in-flight task at the boundary.
-      pendingCompact = { continue: params?.continue !== false };
+      pendingCompact = { continue: params?.continue !== false, nuke: params?.nuke === true };
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the
@@ -1851,10 +1890,22 @@ ${checkpointFormat(keepRecentTokens)}
       const summary = selfSummary;
       selfSummary = null;
       if (!summary || summary.length < MIN_SUMMARY_LENGTH) return;
+      // Nuke (request_compact's `nuke`): pi computed preparation with its configured
+      // keep window — recompute the cut point with budget 0 (the same findCutPoint
+      // walker pi's prepareCompaction uses), keeping only the last turn's tail, and
+      // return the custom firstKeptEntryId; pi uses it verbatim. Applies to any
+      // trigger that consumes the stashed summary (the deferred manual path, or the
+      // automatic threshold compact that won the race). Falls back to pi's cut when
+      // no usable custom cut exists.
+      let firstKeptEntryId = event.preparation.firstKeptEntryId;
+      if (pendingCompact?.nuke === true) {
+        const custom = computeCustomFirstKeptEntryId(event.branchEntries, 0);
+        if (custom) firstKeptEntryId = custom;
+      }
       return {
         compaction: {
           summary: appendSelfCompactFileOps(summary, event.preparation.fileOps),
-          firstKeptEntryId: event.preparation.firstKeptEntryId,
+          firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           details: computeSelfCompactFileLists(event.preparation.fileOps),
         },

@@ -10,6 +10,7 @@ import gallopExtension, {
   nudgeThreshold,
   checkpointFormat,
   tooSmallCompactError,
+  computeCustomFirstKeptEntryId,
   COMPACT_DONE_MARKER,
 } from "../index";
 
@@ -67,23 +68,77 @@ describe("appendSelfCompactFileOps", () => {
 
 describe("tooSmallCompactError", () => {
   it("fails at or below the keep window", () => {
-    expect(tooSmallCompactError(10_000, 20_000)).toMatch(/below the compaction minimum/);
-    expect(tooSmallCompactError(20_000, 20_000)).toMatch(/below the compaction minimum/);
+    expect(tooSmallCompactError(10_000, 20_000, false)).toMatch(/below the compaction minimum/);
+    expect(tooSmallCompactError(20_000, 20_000, false)).toMatch(/below the compaction minimum/);
+  });
+
+  it("tells a nuke that pi refuses to compact a too-small session at all", () => {
+    const err = tooSmallCompactError(10_000, 20_000, true);
+    expect(err).toMatch(/refuses to compact this session at all/);
+    expect(err).toMatch(/start a new session/);
   });
 
   it("proceeds above the keep window", () => {
-    expect(tooSmallCompactError(20_001, 20_000)).toBeNull();
-    expect(tooSmallCompactError(150_000, 20_000)).toBeNull();
+    expect(tooSmallCompactError(20_001, 20_000, false)).toBeNull();
+    expect(tooSmallCompactError(50_000, 20_000, true)).toBeNull(); // nuke on a large session
+    expect(tooSmallCompactError(150_000, 20_000, false)).toBeNull();
   });
 
   it("proceeds when usage is unmeasurable (post-compaction null)", () => {
-    expect(tooSmallCompactError(null, 20_000)).toBeNull();
-    expect(tooSmallCompactError(undefined, 20_000)).toBeNull();
+    expect(tooSmallCompactError(null, 20_000, false)).toBeNull();
+    expect(tooSmallCompactError(undefined, 20_000, true)).toBeNull();
   });
 
   it("tracks a custom keep window", () => {
-    expect(tooSmallCompactError(30_000, 40_000)).toMatch(/40k/);
-    expect(tooSmallCompactError(50_000, 40_000)).toBeNull();
+    expect(tooSmallCompactError(30_000, 40_000, false)).toMatch(/40k/);
+    expect(tooSmallCompactError(50_000, 40_000, false)).toBeNull();
+  });
+});
+
+// Session-shaped fixtures for computeCustomFirstKeptEntryId — pi's findCutPoint
+// runs on the same entry shape (verified against pi's real walker).
+const fixtureUser = (id: string, text: string) => ({ type: "message", id, message: { role: "user", content: text, timestamp: 0 } });
+const fixtureAssistant = (id: string, text: string) => ({
+  type: "message",
+  id,
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    stopReason: "stop",
+    timestamp: 0,
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  },
+});
+const BIG_TEXT = "x".repeat(20_000); // ~5k tokens by pi's chars/4 heuristic
+
+// ── computeCustomFirstKeptEntryId (nuke cut) ──
+
+describe("computeCustomFirstKeptEntryId", () => {
+  const entries = [fixtureUser("u1", "hello there"), fixtureAssistant("a1", BIG_TEXT), fixtureUser("u2", "second " + BIG_TEXT), fixtureAssistant("a2", "final")];
+
+  it("keeps only the last turn's tail for a nuke (keep 0)", () => {
+    expect(computeCustomFirstKeptEntryId(entries, 0)).toBe("a2");
+  });
+
+  it("cuts at a valid point for an intermediate keep", () => {
+    expect(computeCustomFirstKeptEntryId(entries, 5_000)).toBe("u2");
+  });
+
+  it("keeps everything (first entry) when the budget exceeds the context", () => {
+    expect(computeCustomFirstKeptEntryId(entries, 50_000)).toBe("u1");
+  });
+
+  it("returns null for empty entries", () => {
+    expect(computeCustomFirstKeptEntryId([], 0)).toBeNull();
+  });
+
+  it("starts after the previous compaction's kept boundary", () => {
+    // A compaction whose kept boundary is u2 — the already-summarized older
+    // entries must never be re-kept, even with a huge budget.
+    const withPrev = [...entries, { type: "compaction", id: "cmp", parentId: "a2", timestamp: 0, summary: "old state", firstKeptEntryId: "u2", tokensBefore: 10_000 }, fixtureUser("u3", "new work " + BIG_TEXT), fixtureAssistant("a3", "end")];
+    expect(computeCustomFirstKeptEntryId(withPrev, 0)).toBe("a3");
+    expect(computeCustomFirstKeptEntryId(withPrev, 5_000)).toBe("u3");
+    expect(computeCustomFirstKeptEntryId(withPrev, 50_000)).toBe("u2");
   });
 });
 
@@ -263,12 +318,15 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
-  it("declares summary as a required parameter and exposes message/continue", () => {
+  it("declares summary as a required parameter and exposes message/continue/nuke", () => {
     const tool = tools.get("request_compact");
     expect(tool.parameters.required).toEqual(["summary"]);
-    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "message", "summary"]);
+    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "message", "nuke", "summary"]);
     expect(tool.parameters.properties.continue.type).toBe("boolean");
-    // The tool description carries the checkpoint format the model must follow.
+    expect(tool.parameters.properties.nuke.type).toBe("boolean");
+    // The tool description carries the checkpoint format the model must follow
+    // and the nuke bullet (trigger + full-state obligation).
+    expect(tool.description).toContain("nuke: true");
     for (const section of ["## Goal", "## Progress", "## Next Steps", "## Critical Context"]) {
       expect(tool.description).toContain(section);
     }
@@ -296,6 +354,49 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(result.compaction.summary).toContain("<modified-files>\na.ts\nc.ts\n</modified-files>");
     expect(result.compaction.details).toEqual({ readFiles: ["b.ts"], modifiedFiles: ["a.ts", "c.ts"] });
     compactDone();
+  });
+
+  it("nuke: true replaces pi's cut with the budget-0 cut (last turn's tail)", async () => {
+    await callTool({ message: "broken context", summary: LONG_SUMMARY, nuke: true });
+
+    const result = await handlers.get("session_before_compact")(
+      {
+        preparation: prep(emptyOps()),
+        branchEntries: [fixtureUser("u1", "hello there"), fixtureAssistant("a1", BIG_TEXT), fixtureUser("u2", "second " + BIG_TEXT), fixtureAssistant("a2", "final")],
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+
+    // pi's own cut (entry-123, the configured ~20k window) is replaced by the
+    // budget-0 cut point.
+    expect(result?.compaction?.firstKeptEntryId).toBe("a2");
+    compactDone();
+  });
+
+  it("keeps pi's own cut when nuke is not set", async () => {
+    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+
+    const result = await handlers.get("session_before_compact")(
+      {
+        preparation: prep(emptyOps()),
+        branchEntries: [fixtureUser("u1", "hello there"), fixtureAssistant("a1", BIG_TEXT)],
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+
+    expect(result?.compaction?.firstKeptEntryId).toBe("entry-123");
+    compactDone();
+  });
+
+  it("nuke on a too-small session fails with the escape-hatch message — nothing stashed", async () => {
+    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
+    await expect(callTool({ summary: LONG_SUMMARY, nuke: true })).rejects.toThrow(/refuses to compact this session at all/);
+
+    // The guard threw before stashing — the settle point must not fire a compact.
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
   });
 
   it("returns undefined (pi's native one-shot) when no summary is stashed — native /compact path", async () => {

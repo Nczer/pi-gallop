@@ -132,6 +132,14 @@ Tool arguments:
   (default ~20k, user-configurable) are kept verbatim — the tool description names
   the configured value. Stays in the kept tail as the tool call's arguments — one
   copy, the price of in-session summarization.
+- `nuke` (boolean, optional) — summarize the *entire* context instead of keeping
+  the most recent `compaction.keepRecentTokens` (default ~20k) verbatim; only the
+  last turn's tail survives. For contexts broken beyond repair (repeated failing
+  tool calls), where the default tail is exactly the broken part. The cut point is
+  recomputed with budget 0 by the same `findCutPoint` walker pi's `prepareCompaction`
+  uses (mirroring its previous-compaction boundary logic) and returned as a custom
+  `firstKeptEntryId` — pi uses it verbatim. The checkpoint must then carry full
+  state, since the verbatim tail no longer covers recent work.
 - `continue` (boolean) — if `true`, a fixed generic steer
   (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
   the checkpoint's Next Steps section tells the agent what to do next. Omitted/`false`
@@ -145,8 +153,12 @@ checks pi's own `getContextUsage()` (the same last-usage-anchored estimate the
 automatic threshold check uses) against the live settings before stashing
 anything: a below-minimum call fails as the tool call itself (the thrown error
 becomes the tool result the model sees, with the reason and a retry-once-larger
-hint), and no deferred compact is armed. Unmeasurable usage (`tokens: null` in
-the window right after a compaction) proceeds and lets pi decide.
+hint), and no deferred compact is armed. A `nuke` on such a session fails with an
+explicit escape hatch instead: pi evaluates the cut with the *configured* keep
+window — never 0 — and refuses to compact a small session at all, so the model is
+told to persist the state to memory (or a handoff file) and have the user start a
+new session. Unmeasurable usage (`tokens: null` in the window right after a
+compaction) proceeds and lets pi decide.
 
 The tool description also suggests compacting at task boundaries: when a planned
 task finished and another is queued, the checkpoint becomes the handoff for the
