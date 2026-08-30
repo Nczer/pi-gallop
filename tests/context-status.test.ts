@@ -48,7 +48,7 @@ describe("contextStatusAdvice", () => {
 
   it("near the backstop at or below the threshold (auto-compact on)", () => {
     expect(contextStatusAdvice(18_432, 180_000, DEFAULTS)).toBe(
-      "Advice: near the backstop — call request_compact now if at a pause point.",
+      "Advice: near the backstop — call compact_request now if at a pause point.",
     );
     expect(contextStatusAdvice(0, 200_000, DEFAULTS)).toContain("near the backstop");
   });
@@ -56,7 +56,7 @@ describe("contextStatusAdvice", () => {
   it("names the missing backstop when auto-compact is off", () => {
     // disabled → fixed 16k threshold
     expect(contextStatusAdvice(15_000, 180_000, { ...DEFAULTS, enabled: false })).toBe(
-      "Advice: near the limit and auto-compact is off — call request_compact now if at a pause point.",
+      "Advice: near the limit and auto-compact is off — call compact_request now if at a pause point.",
     );
     // disabled → 2× fixed 16k = 32k still counts as pressure building
     expect(contextStatusAdvice(17_000, 180_000, { ...DEFAULTS, enabled: false })).toContain("pressure building");
@@ -92,7 +92,7 @@ describe("buildContextStatusText", () => {
     expect(lines[0]).toBe("142.3k / 200k tokens (71.2%) — 57.7k remaining");
     expect(lines[1]).toBe("Thresholds: gallop nudge ~18.4k remaining · pi auto-compact ~16.4k remaining");
     expect(lines[2]).toBe(
-      "Advice: large context (~142.3k used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call request_compact at this boundary.",
+      "Advice: large context (~142.3k used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call compact_request at this boundary.",
     );
   });
 

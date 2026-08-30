@@ -17,23 +17,23 @@ function captureTools() {
   return tools;
 }
 
-describe("request_compact renderers", () => {
+describe("compact_request renderers", () => {
   const SUMMARY = "## Goal\nFix the thing.\n\n## Next Steps\n1. Done";
   const args = { message: "context bloat", summary: SUMMARY };
 
   it("call is a single title line — no args, no expand hint", () => {
-    const tool = captureTools().get("request_compact");
+    const tool = captureTools().get("compact_request");
     const comp: any = tool.renderCall(args, fakeTheme, {});
     const lines = comp.render(100);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("request_compact");
+    expect(lines[0]).toContain("compact_request");
     expect(lines[0]).not.toContain("context bloat");
     expect(lines[0]).not.toContain("Ctrl+O");
     expect(lines[0]).not.toContain("## Goal");
   });
 
   it("collapsed result is the short line only", () => {
-    const tool = captureTools().get("request_compact");
+    const tool = captureTools().get("compact_request");
     const comp: any = tool.renderResult(
       { content: [{ type: "text", text: "Compacting (context bloat)." }] },
       { expanded: false, isPartial: false },
@@ -47,7 +47,7 @@ describe("request_compact renderers", () => {
   });
 
   it("expanded result does NOT re-render the checkpoint (it lives in the [compaction] entry)", () => {
-    const tool = captureTools().get("request_compact");
+    const tool = captureTools().get("compact_request");
     const comp: any = tool.renderResult(
       { content: [{ type: "text", text: "Compacting (context bloat)." }] },
       { expanded: true, isPartial: false },
@@ -61,7 +61,7 @@ describe("request_compact renderers", () => {
   });
 
   it("partial result shows the warning line", () => {
-    const tool = captureTools().get("request_compact");
+    const tool = captureTools().get("compact_request");
     const comp: any = tool.renderResult(
       { content: [] },
       { expanded: false, isPartial: true },

@@ -4,7 +4,7 @@
  * Keeps the agent moving:
  * - Detects stalled generation (stopped mid-thinking or mid-tool-call) and sends resume
  * - Detects repetitive command failure loops and nudges the agent to change strategy
- * - LLM can trigger compaction via `request_compact` with an in-session checkpoint summary
+ * - LLM can trigger compaction via `compact_request` with an in-session checkpoint summary
  * - Nudges the LLM to self-compact as the context nears its limit — pi's automatic
  *   compaction stays enabled as the backstop for non-compliant or overflowing runs
  */
@@ -66,13 +66,13 @@ function saveToggleSetting(key: string, enabled: boolean): void {
 let cooldownUntil = 0;
 let sawAssistantMessage = false;
 
-/** Checkpoint summary written by the live model (request_compact's `summary` arg,
+/** Checkpoint summary written by the live model (compact_request's `summary` arg,
  *  stashed in the tool's execute). session_before_compact returns it as a custom
  *  CompactionResult so pi skips its one-shot summarizer (a cold prefill of the
  *  flattened conversation). Null → pi's native one-shot. */
 let selfSummary: string | null = null;
 /** A compact was requested during the last run but has not run yet. Set when
- *  request_compact executes ({ continue, nuke } from the tool args). Consumed by the
+ *  compact_request executes ({ continue, nuke } from the tool args). Consumed by the
  *  agent_settled handler, which triggers the compact. Deferring to agent_settled is what makes
  *  the trigger race-free: pi's automatic threshold compaction runs in the post-run
  *  loop, BEFORE the settled event. If it fired, it consumed the stashed summary
@@ -343,7 +343,7 @@ export function lastItemIsToolUse(message: { content?: unknown[] }): boolean {
   return typeof last === "object" && last !== null && (last as any).type === "toolCall";
 }
 
-/** True when the message contains a request_compact tool call. pi emits
+/** True when the message contains a compact_request tool call. pi emits
  *  message_end BEFORE the message's tool calls execute, so this is how the
  *  nudge path sees an en-route compact — pendingCompact is only set later,
  *  in the tool's execute. */
@@ -352,7 +352,7 @@ export function messageContainsRequestCompact(message: { content?: unknown[] }):
   return message.content.some(
     (item) =>
       typeof item === "object" && item !== null &&
-      (item as any).type === "toolCall" && (item as any).name === "request_compact",
+      (item as any).type === "toolCall" && (item as any).name === "compact_request",
   );
 }
 
@@ -425,7 +425,7 @@ function triggerCompaction(
 
 // ── Self-compact (in-session checkpoint summary) ──
 //
-// The live model writes the checkpoint summary itself as request_compact's
+// The live model writes the checkpoint summary itself as compact_request's
 // `summary` argument — a normal session turn, so that LLM call rides the
 // session's cached prompt prefix (no cold prefill). The summary is stashed and
 // returned by session_before_compact as a custom CompactionResult, so pi skips
@@ -463,17 +463,17 @@ function triggerCompaction(
 /** Below this length a stashed summary is rejected (pi's one-shot runs instead). */
 const MIN_SUMMARY_LENGTH = 200;
 
-/** The in-context completion marker that replaces a request_compact exchange
+/** The in-context completion marker that replaces a compact_request exchange
  *  once the compaction has run (see the `context` handler). A fixed string —
  *  the rewrite must be deterministic or the request prefix loses cache
  *  stability. "summary" (not "checkpoint"): on the native-fallback path the
  *  top summary is pi's one-shot, not the model's checkpoint. Revocable by
  *  design — a later task that fills the context again may compact again. */
 export const COMPACT_DONE_MARKER =
-  "[Gallop] Compaction complete — the summary at the top of context is your current state. Do not call request_compact again unless context pressure returns.";
+  "[Gallop] Compaction complete — the summary at the top of context is your current state. Do not call compact_request again unless context pressure returns.";
 
 /** Checkpoint summary format — the exact format the model must use, carried
- *  by the request_compact tool description (system prompt). The kept-tail
+ *  by the compact_request tool description (system prompt). The kept-tail
  *  line is parameterized: pi's compaction.keepRecentTokens (default 20k) is
  *  user-configurable, and the guidance must match what pi will actually keep
  *  verbatim. */
@@ -603,14 +603,14 @@ export function contextStatusAdvice(remaining: number, tokens: number, settings:
   const threshold = nudgeThreshold(settings);
   if (remaining <= threshold) {
     return settings.enabled
-      ? "Advice: near the backstop — call request_compact now if at a pause point."
-      : "Advice: near the limit and auto-compact is off — call request_compact now if at a pause point.";
+      ? "Advice: near the backstop — call compact_request now if at a pause point."
+      : "Advice: near the limit and auto-compact is off — call compact_request now if at a pause point.";
   }
   if (remaining <= 2 * threshold) {
-    return "Advice: pressure building — if a large batch of reads or images is ahead, call request_compact at this boundary first.";
+    return "Advice: pressure building — if a large batch of reads or images is ahead, call compact_request at this boundary first.";
   }
   if (tokens > SOFT_NUDGE_TOKENS) {
-    return `Advice: large context (~${formatTokenCount(tokens)} used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call request_compact at this boundary.`;
+    return `Advice: large context (~${formatTokenCount(tokens)} used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call compact_request at this boundary.`;
   }
   return "Advice: headroom OK.";
 }
@@ -649,7 +649,7 @@ export function buildContextStatusText(
   return lines.join("\n");
 }
 
-/** Minimum-context guard for request_compact. pi's compact keeps the most recent
+/** Minimum-context guard for compact_request. pi's compact keeps the most recent
  *  configuredKeep (compaction.keepRecentTokens, default 20k) verbatim and summarizes
  *  everything older; when the whole context fits in that window pi's prepareCompaction
  *  bails out (returns undefined) and the compact fails — including a nuke, which pi
@@ -666,7 +666,7 @@ export function tooSmallCompactError(
   if (nuke) {
     return `Context (~${formatTokenCount(tokens)} tokens) is at or below pi's configured keep window (${formatTokenCount(configuredKeep)}), so pi refuses to compact this session at all — even nuke: true is rejected before compaction ("session too small"). If the context is broken: persist the state to memory (or a handoff file) and tell the user to start a new session.`;
   }
-  return `Context is below the compaction minimum (${formatTokenCount(tokens)} tokens ≤ ${formatTokenCount(configuredKeep)} keep window). Pi keeps the most recent ${formatTokenCount(configuredKeep)} tokens verbatim, so there is no older context to summarize — the compact would fail. Continue working; call request_compact again once context exceeds ${formatTokenCount(configuredKeep)} tokens.`;
+  return `Context is below the compaction minimum (${formatTokenCount(tokens)} tokens ≤ ${formatTokenCount(configuredKeep)} keep window). Pi keeps the most recent ${formatTokenCount(configuredKeep)} tokens verbatim, so there is no older context to summarize — the compact would fail. Continue working; call compact_request again once context exceeds ${formatTokenCount(configuredKeep)} tokens.`;
 }
 
 /** Recompute pi's cut point with a custom keep budget (the nuke path uses 0).
@@ -717,9 +717,9 @@ function checkContextNudge(
   if (pendingCompact) return;                     // a compact request is already pending
   if (compactionRunning) return;                 // compact in flight — usage about to drop
   // pi emits message_end BEFORE this message's tool calls execute — a message
-  // containing request_compact has a compact en route the two state guards
+  // containing compact_request has a compact en route the two state guards
   // above cannot see yet (execute runs after this event). Skip, or the nudge
-  // steer lands around the compaction boundary: "call request_compact now"
+  // steer lands around the compaction boundary: "call compact_request now"
   // right after the model just called it.
   if (messageContainsRequestCompact(message)) return;
   if (message.stopReason === "aborted" || message.stopReason === "error") return;
@@ -737,12 +737,12 @@ function checkContextNudge(
   if (settings.enabled) {
     const m = Math.max(1, Math.round(settings.reserveTokens / 1000));
     pi.sendUserMessage(
-      `[Gallop] Context is nearly full (~${k}k tokens remaining; pi's automatic compaction triggers at ~${m}k). If the current work is at a sensible pause point, write a checkpoint summary and call request_compact now so the summary stays cache-warm.`,
+      `[Gallop] Context is nearly full (~${k}k tokens remaining; pi's automatic compaction triggers at ~${m}k). If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now so the summary stays cache-warm.`,
       { deliverAs: "steer" },
     );
   } else {
     pi.sendUserMessage(
-      `[Gallop] Context is nearly full (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call request_compact now — a context overflow would otherwise abort the run.`,
+      `[Gallop] Context is nearly full (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now — a context overflow would otherwise abort the run.`,
       { deliverAs: "steer" },
     );
   }
@@ -1148,7 +1148,7 @@ function checkFailureLoop(
   );
 }
 
-// ── request_compact rendering (TUI + /export HTML) ──
+// ── compact_request rendering (TUI + /export HTML) ──
 // Without renderCall/renderResult, pi's /export HTML falls into its default
 // case — JSON.stringify(args), i.e. the full checkpoint summary dumped in
 // every export (native tools like read/bash ship one-line renderers instead).
@@ -1211,7 +1211,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // ── Tool: LLM can request compaction ──
 
   pi.registerTool({
-    name: "request_compact",
+    name: "compact_request",
     label: "Request Compact",
     description: `Compact context to remove unrelated old context and increase performance while preserving active tasks.
 - Call when: edit keeps failing (broken text matching), a major task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure.
@@ -1276,7 +1276,7 @@ ${checkpointFormat(keepRecentTokens)}
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the
-      // context handler below replaces the request_compact exchange with the
+      // context handler below replaces the compact_request exchange with the
       // completion marker anyway. The user-visible message is the short 'message' arg.
       return {
         details: {},
@@ -1288,7 +1288,7 @@ ${checkpointFormat(keepRecentTokens)}
       };
     },
     renderCall(_args, theme) {
-      return new Text(formatToolCallLine(theme, "request_compact"), 0, 0);
+      return new Text(formatToolCallLine(theme, "compact_request"), 0, 0);
     },
     renderResult(result, options, theme) {
       return new Text(formatCompactResultText(theme, result, options), 0, 0);
@@ -1311,7 +1311,7 @@ ${checkpointFormat(keepRecentTokens)}
     name: "context_status",
     label: "Context Status",
     description: `Report current context usage, remaining tokens, and compaction thresholds.
-- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each). If the advice is not "headroom OK", call request_compact first.`,
+- Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each). If the advice is not "headroom OK", call compact_request first.`,
     parameters: {
       type: "object",
       properties: {},
@@ -1409,7 +1409,7 @@ ${checkpointFormat(keepRecentTokens)}
     // ── Context-pressure nudge ──
     checkContextNudge(event.message, ctx, pi);
 
-    // request_compact: message_end triggers nothing. pi emits message_end
+    // compact_request: message_end triggers nothing. pi emits message_end
     // BEFORE pending tool calls execute, and pi's automatic threshold
     // compaction (when the run crossed it) runs in the post-run loop — both are
     // resolved deterministically at agent_settled, where the deferred trigger
@@ -1548,7 +1548,7 @@ ${checkpointFormat(keepRecentTokens)}
   });
 
   // ── Pending-compact input gate ──
-  // While a model-requested compact is pending (request_compact executed, the
+  // While a model-requested compact is pending (compact_request executed, the
   // deferred compact not yet fired), a typed message would be queued and pi's
   // post-run loop would process it on the stale context before the compact —
   // delaying the compact until that run ends. Swallow interactive messages
@@ -1865,7 +1865,7 @@ ${checkpointFormat(keepRecentTokens)}
   });
 
   // ── Compaction: in-session checkpoint (cache-friendly) ──
-  // When the live model called request_compact, its checkpoint summary is stashed
+  // When the live model called compact_request, its checkpoint summary is stashed
   // in selfSummary — return it (with the file-ops sections appended) as a custom
   // CompactionResult so pi skips its one-shot summarizer (a cold prefill of the
   // flattened conversation). Otherwise (native /compact, auto threshold, overflow
@@ -1889,7 +1889,7 @@ ${checkpointFormat(keepRecentTokens)}
       const summary = selfSummary;
       selfSummary = null;
       if (!summary || summary.length < MIN_SUMMARY_LENGTH) return;
-      // Nuke (request_compact's `nuke`): pi computed preparation with its configured
+      // Nuke (compact_request's `nuke`): pi computed preparation with its configured
       // keep window — recompute the cut point with budget 0 (the same findCutPoint
       // walker pi's prepareCompaction uses), keeping only the last turn's tail, and
       // return the custom firstKeptEntryId; pi uses it verbatim. Applies to any
@@ -1914,14 +1914,14 @@ ${checkpointFormat(keepRecentTokens)}
     }
   });
 
-  // ── context: replace the request_compact exchange with a completion marker ──
+  // ── context: replace the compact_request exchange with a completion marker ──
   // After a self-compact, the checkpoint text appears twice in every request:
   // as the compaction summary (pi renders compaction entries as messages with
   // role "compactionSummary") and as the `summary` argument of the
-  // request_compact tool call in the kept tail (~1k duplicated tokens per
+  // compact_request tool call in the kept tail (~1k duplicated tokens per
   // request). The exchange is also a liability — dropping it outright (the
   // previous behavior) left the nudge that triggered the compact ("…call
-  // request_compact now") standing in the tail as an unfulfilled instruction
+  // compact_request now") standing in the tail as an unfulfilled instruction
   // while its fulfillment was gone, and a `continue: false` compact delivers
   // no other completion signal. The resumed model then rationally re-requested
   // (field: two back-to-back double-compacts, the second preempting the user's
@@ -1969,19 +1969,19 @@ ${checkpointFormat(keepRecentTokens)}
     }
     if (compactionSummaries.length === 0) return;
 
-    // Classify every request_compact call in context (also feeds orphan
+    // Classify every compact_request call in context (also feeds orphan
     // detection):
     //  - carried: its summary text is verifiably in a compaction summary →
     //    replace the exchange with the marker (dedupe + completion closure)
     //  - fallback: not carried → keep the call, mark its result done
     const callIdsInContext = new Set<string>();
-    // Carried calls get the exchange replaced; every OTHER request_compact call
+    // Carried calls get the exchange replaced; every OTHER compact_request call
     // in context is a native-fallback call (result gets marked done).
     const carriedCallIds = new Set<string>();
     for (const msg of messagesIn) {
       if (!Array.isArray(msg?.content)) continue;
       for (const block of msg.content) {
-        if (block?.type !== "toolCall" || block.name !== "request_compact") continue;
+        if (block?.type !== "toolCall" || block.name !== "compact_request") continue;
         if (typeof block.id !== "string") continue;
         callIdsInContext.add(block.id);
         const summary = block.arguments?.summary;
@@ -1998,11 +1998,11 @@ ${checkpointFormat(keepRecentTokens)}
     let changed = false;
     const messages: any[] = [];
     for (const msg of messagesIn) {
-      // request_compact toolResult: orphan (call summarized out of the window)
+      // compact_request toolResult: orphan (call summarized out of the window)
       // → drop (an unpaired toolResult is an API error); paired with a carried
       // call → drop (the marker message carries the closure); paired with a
       // fallback call → rewrite the in-progress text to the marker.
-      if (msg?.role === "toolResult" && msg?.toolName === "request_compact") {
+      if (msg?.role === "toolResult" && msg?.toolName === "compact_request") {
         const id = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
         if (!id || !callIdsInContext.has(id) || carriedCallIds.has(id)) {
           changed = true;

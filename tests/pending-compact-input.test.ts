@@ -24,7 +24,7 @@ the stale, un-compacted context before the deferred compact fires.
 
 ## Progress
 ### Done
-- [x] request_compact defers to agent_settled
+- [x] compact_request defers to agent_settled
 
 ### In Progress
 - [ ] Input gate around the pending window
@@ -73,7 +73,7 @@ describe("pending-compact input gate", () => {
 
   const settle = () => handlers.get("agent_settled")(null, ctx);
   const callTool = (params: any) =>
-    tools.get("request_compact").execute("id1", params, new AbortController().signal, undefined, ctx);
+    tools.get("compact_request").execute("id1", params, new AbortController().signal, undefined, ctx);
   const input = (text: string, source = "interactive") =>
     handlers.get("input")({ type: "input", text, images: undefined, source, streamingBehavior: "steer" }, ctx);
   const flushTimers = (ms = 250) => new Promise<void>((r) => setTimeout(r, ms));

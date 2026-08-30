@@ -112,7 +112,7 @@ Detects when the LLM acknowledges an error in its thinking but then calls the sa
 
 ### Self-Compaction (cache-friendly)
 
-The LLM can request compaction via the `request_compact` tool and write the
+The LLM can request compaction via the `compact_request` tool and write the
 checkpoint summary itself — the summarization happens inside the live session
 (a normal turn), so that LLM call rides the session's cached prompt prefix with
 no cold prefill. Gallop stashes the summary and returns it as a custom
@@ -178,14 +178,14 @@ already end in a compaction entry); in that race case the `continue` steer is
 sent from `session_compact` instead of the manual `onComplete`.
 
 Once the checkpoint has become the compaction summary, a `context` handler
-replaces the `request_compact` exchange in every LLM request — the exchange
+replaces the `compact_request` exchange in every LLM request — the exchange
 would otherwise duplicate the ~1k-token summary in the kept tail *and* read
 as an unfulfilled request (the resumed model re-requested compaction, with
 the triggering pressure nudge still standing in the tail). When the summary
 text is verifiably carried by a `compactionSummary` message in context, the
 assistant message carrying the call is rewritten to a fixed completion marker
 (“Compaction complete — the summary at the top of context is your current
-state. Do not call request_compact again unless context pressure returns.”)
+state. Do not call compact_request again unless context pressure returns.”)
 and the paired toolResult is dropped. A call whose text is NOT carried
 (native-fallback compact) keeps its call as a true record and only gets its
 in-progress “Compacting (…)” result text marked done. Pre-compact tree views
@@ -218,7 +218,7 @@ back to pi's defaults), so it tracks a custom `reserveTokens` and stays
 proportionate on small context windows (e.g. 64k). After the nudge, silence —
 pi's automatic compaction (which also drives overflow recovery, so it stays
 enabled as the backstop) decides. No nudge while a compact is pending or in
-flight — including an en-route one whose `request_compact` call sits in the
+flight — including an en-route one whose `compact_request` call sits in the
 very message being judged (pi emits `message_end` before that call executes, so
 the state flags are not set yet — the message content is the signal) — when a
 message ends in aborted/error, or when the circuit breaker has halted the

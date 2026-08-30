@@ -142,7 +142,7 @@ describe("computeCustomFirstKeptEntryId", () => {
   });
 });
 
-// ── Integration: request_compact tool + session_before_compact wiring ──
+// ── Integration: compact_request tool + session_before_compact wiring ──
 
 function makeMockPi() {
   const handlers = new Map<string, any>();
@@ -167,7 +167,7 @@ Test goal: refactor the compaction machinery of the gallop extension.
 ## Progress
 ### Done
 - [x] Removed the old fork summarizer
-- [x] Rewrote the request_compact tool
+- [x] Rewrote the compact_request tool
 
 ### In Progress
 - [ ] Rewriting the test suite
@@ -226,9 +226,9 @@ describe("self-compact wiring (in-session summary)", () => {
 
   const emptyOps = () => ({ read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() });
 
-  /** Call the request_compact tool and return its result. */
+  /** Call the compact_request tool and return its result. */
   const callTool = (params: any) =>
-    tools.get("request_compact").execute("id1", params, new AbortController().signal, undefined, ctx);
+    tools.get("compact_request").execute("id1", params, new AbortController().signal, undefined, ctx);
 
   const flushTimers = (ms = 250) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -239,7 +239,7 @@ describe("self-compact wiring (in-session summary)", () => {
    */
   const compactDone = () => handlers.get("session_compact")(null, { hasUI: false });
 
-  // ── request_compact tool ──
+  // ── compact_request tool ──
 
   it("stashes the summary, defers the compact to agent_settled, and returns the short message with terminate", async () => {
     const result = await callTool({ message: "context bloat", summary: LONG_SUMMARY });
@@ -319,7 +319,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("declares summary as a required parameter and exposes message/continue/nuke", () => {
-    const tool = tools.get("request_compact");
+    const tool = tools.get("compact_request");
     expect(tool.parameters.required).toEqual(["summary"]);
     expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "message", "nuke", "summary"]);
     expect(tool.parameters.properties.continue.type).toBe("boolean");
@@ -473,7 +473,7 @@ describe("self-compact wiring (in-session summary)", () => {
 
   // ── message_end behavior ──
 
-  it("message_end with a pending request_compact triggers nothing; the tool stashes and settle compacts", async () => {
+  it("message_end with a pending compact_request triggers nothing; the tool stashes and settle compacts", async () => {
     // pi emits message_end BEFORE the pending tool call executes: nothing may
     // trigger here (an un-stashed compact would race the tool's stashed one).
     await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
@@ -482,7 +482,7 @@ describe("self-compact wiring (in-session summary)", () => {
         role: "assistant",
         content: [
           { type: "text", text: "I'll write the checkpoint now." },
-          { type: "toolCall", id: "c1", name: "request_compact", arguments: { message: "context bloat", summary: LONG_SUMMARY, continue: true } },
+          { type: "toolCall", id: "c1", name: "compact_request", arguments: { message: "context bloat", summary: LONG_SUMMARY, continue: true } },
         ],
       },
     }, ctx);
@@ -517,10 +517,10 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(2);
   });
 
-  // ── the threshold race (request_compact vs pi's automatic compaction) ──
+  // ── the threshold race (compact_request vs pi's automatic compaction) ──
 
   it("does not double-compact when pi's automatic compaction ran first (the 16k race)", async () => {
-    // LLM calls request_compact right as the run's final usage crosses pi's
+    // LLM calls compact_request right as the run's final usage crosses pi's
     // automatic threshold. The automatic compact runs in pi's post-run loop,
     // BEFORE agent_settled — it consumes the stashed summary (cache-warm, no
     // cold prefill) and session_compact clears the pending state.
@@ -727,7 +727,7 @@ describe("context-pressure nudge", () => {
     // 15k is below every threshold — only the skip conditions are under test.
     // pending compact
     await resetState();
-    await tools.get("request_compact").execute("id1", { summary: LONG_SUMMARY }, new AbortController().signal, undefined, ctx);
+    await tools.get("compact_request").execute("id1", { summary: LONG_SUMMARY }, new AbortController().signal, undefined, ctx);
     await endTurn(15_000);
     expect(nudgeSteers()).toHaveLength(0);
 
@@ -746,7 +746,7 @@ describe("context-pressure nudge", () => {
     expect(nudgeSteers()).toHaveLength(0);
   });
 
-  it("does not nudge when the ending message itself calls request_compact (message_end precedes tool execution)", async () => {
+  it("does not nudge when the ending message itself calls compact_request (message_end precedes tool execution)", async () => {
     // Real pi order: message_end fires BEFORE the message's tool calls execute,
     // so pendingCompact is still null — only the message's content reveals the
     // en-route compact. Regression: the nudge steer landed around the
@@ -757,7 +757,7 @@ describe("context-pressure nudge", () => {
         ...usageMsg(8_000).message,
         content: [
           { type: "text", text: "context is hot — checkpointing" },
-          { type: "toolCall", id: "c1", name: "request_compact", arguments: { summary: LONG_SUMMARY } },
+          { type: "toolCall", id: "c1", name: "compact_request", arguments: { summary: LONG_SUMMARY } },
         ],
         stopReason: "toolUse",
       },
@@ -765,17 +765,17 @@ describe("context-pressure nudge", () => {
     expect(nudgeSteers()).toHaveLength(0);
 
     // The tool then executes; a same-cycle endTurn is held by the pending guard.
-    await tools.get("request_compact").execute("id1", { summary: LONG_SUMMARY }, new AbortController().signal, undefined, ctx);
+    await tools.get("compact_request").execute("id1", { summary: LONG_SUMMARY }, new AbortController().signal, undefined, ctx);
     await endTurn(7_000);
     expect(nudgeSteers()).toHaveLength(0);
   });
 
-  it("the request_compact skip is message-scoped: a fresh cycle still nudges", async () => {
+  it("the compact_request skip is message-scoped: a fresh cycle still nudges", async () => {
     await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
     await handlers.get("message_end")({
       message: {
         ...usageMsg(8_000).message,
-        content: [{ type: "toolCall", id: "c1", name: "request_compact", arguments: { summary: LONG_SUMMARY } }],
+        content: [{ type: "toolCall", id: "c1", name: "compact_request", arguments: { summary: LONG_SUMMARY } }],
         stopReason: "toolUse",
       },
     }, ctx);
@@ -788,9 +788,9 @@ describe("context-pressure nudge", () => {
 });
 
 
-// ── context handler: dropping the request_compact exchange from LLM context ──
+// ── context handler: dropping the compact_request exchange from LLM context ──
 
-describe("context handler (request_compact exchange → completion marker)", () => {
+describe("context handler (compact_request exchange → completion marker)", () => {
   let pi: any;
   let handlers: Map<string, any>;
   let ctx: any;
@@ -814,14 +814,14 @@ describe("context handler (request_compact exchange → completion marker)", () 
     role: "assistant",
     content: [
       { type: "text", text: "compacting" },
-      { type: "toolCall", id, name: "request_compact", arguments: { message: "bloat", summary } },
+      { type: "toolCall", id, name: "compact_request", arguments: { message: "bloat", summary } },
     ],
   });
 
   const compactToolResult = (toolCallId = "tc1") => ({
     role: "toolResult",
     toolCallId,
-    toolName: "request_compact",
+    toolName: "compact_request",
     content: [{ type: "text", text: "Compacting (bloat)." }],
   });
 
@@ -856,7 +856,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
     expect(result.messages[0].role).toBe("compactionSummary");
     expect(result.messages[1]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
     expect(result.messages[2]).toEqual(otherToolCall());
-    expect(result.messages.some((m: any) => m?.toolName === "request_compact")).toBe(false);
+    expect(result.messages.some((m: any) => m?.toolName === "compact_request")).toBe(false);
   });
 
   it("keeps the triggering nudge in the tail while the exchange becomes the marker (field repro)", async () => {
@@ -868,7 +868,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
       role: "user",
       content: [{
         type: "text",
-        text: "[Gallop] Context is nearly full (~11k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call request_compact now.",
+        text: "[Gallop] Context is nearly full (~11k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now.",
       }],
     };
     const result = await handlers.get("context")({
@@ -886,7 +886,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
     expect(result.messages[1]).toEqual(nudge); // the instruction stays — visibly fulfilled below
     expect(result.messages[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
     expect(result.messages[3].content).toEqual([{ type: "text", text: "reloaded" }]);
-    expect(result.messages.some((m: any) => m?.toolName === "request_compact")).toBe(false);
+    expect(result.messages.some((m: any) => m?.toolName === "compact_request")).toBe(false);
   });
 
   it("keeps a call the compaction summary does not carry, marking its result done", async () => {
@@ -906,7 +906,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
     expect(result.messages[2]).toEqual({
       role: "toolResult",
       toolCallId: "tc1",
-      toolName: "request_compact",
+      toolName: "compact_request",
       content: [{ type: "text", text: COMPACT_DONE_MARKER }],
     });
   });
@@ -925,7 +925,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
     expect(result.messages[2].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]);
   });
 
-  it("handles multiple request_compact calls: carried → marker, uncarried → marked result", async () => {
+  it("handles multiple compact_request calls: carried → marker, uncarried → marked result", async () => {
     const otherCheckpoint = "Another checkpoint summary, long enough to matter. ".repeat(5); // >200 chars
     const result = await handlers.get("context")({
       messages: [
@@ -942,7 +942,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
     expect(result.messages[1].content[1].arguments.summary).toBe(otherCheckpoint);
     expect(result.messages[2].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]); // tc2 result marked
     expect(result.messages[3]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] }); // tc1 → marker
-    expect(result.messages.some((m: any) => m?.toolName === "request_compact" && m?.toolCallId === "tc1")).toBe(false); // tc1 result dropped
+    expect(result.messages.some((m: any) => m?.toolName === "compact_request" && m?.toolCallId === "tc1")).toBe(false); // tc1 result dropped
   });
 
   it("markers the newest compacted exchange when an older compaction entry sits in the kept tail", async () => {
@@ -983,7 +983,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
     expect(result.messages[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
   });
 
-  it("drops an orphaned request_compact toolResult whose call was summarized out of the window", async () => {
+  it("drops an orphaned compact_request toolResult whose call was summarized out of the window", async () => {
     // The cut point split the compact turn: the call landed in the summarized
     // prefix, only its result survives in the kept tail. Without its toolCall
     // the result would be an API error — drop it.
@@ -1004,7 +1004,7 @@ describe("context handler (request_compact exchange → completion marker)", () 
           role: "assistant",
           content: [
             { type: "toolCall", id: "tc2", name: "bash", arguments: { command: "ls" } },
-            { type: "toolCall", id: "tc1", name: "request_compact", arguments: { message: "bloat", summary: LONG_SUMMARY } },
+            { type: "toolCall", id: "tc1", name: "compact_request", arguments: { message: "bloat", summary: LONG_SUMMARY } },
           ],
         },
         { role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] },
