@@ -9,57 +9,19 @@
  *   compaction stays enabled as the backstop for non-compliant or overflowing runs
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { loadExtSettings, patchExtSettings } from "./ext-settings";
 import type { CompactionEntry, ExtensionAPI, ExtensionContext, InputEvent, SessionBeforeCompactEvent, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
 import { findCutPoint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Persisted settings ──
 
-const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "gallop.json");
-const LEGACY_SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
-const BINARY_SUPPRESSION_KEY = "gallopBinarySuppressionEnabled";
-const READ_GUARD_KEY = "gallopReadGuardEnabled";
-
-/** Gallop's own settings file (~/.pi/agent/gallop.json). pi owns settings.json
- *  and writes it under a proper-lockfile lock; writing to it from an extension
- *  races pi's saves and can clobber keys or corrupt the file. */
-function readJsonFile(filePath: string): Record<string, any> | null {
-  if (existsSync(filePath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(filePath, "utf-8"));
-      if (parsed && typeof parsed === "object") return parsed;
-    } catch {}
-  }
-  return null;
-}
-
-function loadSettings(): Record<string, any> {
-  return readJsonFile(SETTINGS_PATH) ?? {};
-}
-
-function saveSettings(settings: Record<string, any>): void {
-  mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
-  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
-}
-
-/** Load a toggle: gallop.json first, then migrate from legacy settings.json keys. */
-function loadToggleSetting(key: string, defaultValue: boolean): boolean {
-  const own = loadSettings();
-  if (own[key] !== undefined) return own[key] !== false;
-  // Legacy: toggles used to live in pi's settings.json — migrate if present.
-  const legacy = readJsonFile(LEGACY_SETTINGS_PATH);
-  if (legacy && legacy[key] !== undefined) return legacy[key] !== false;
-  return defaultValue;
-}
-
-function saveToggleSetting(key: string, enabled: boolean): void {
-  const settings = loadSettings();
-  settings[key] = enabled;
-  saveSettings(settings);
-}
+/** Gallop's toggles live in the shared settings-ext.json ("gallop"
+ *  namespace, defaults materialized on first load). */
+const GALLOP_DEFAULTS = { binarySuppression: true, readGuard: true };
 
 // ── State ──
 
@@ -1348,7 +1310,7 @@ ${checkpointFormat(keepRecentTokens)}
       } else {
         binarySuppressionEnabled = !binarySuppressionEnabled;
       }
-      saveToggleSetting(BINARY_SUPPRESSION_KEY, binarySuppressionEnabled);
+      patchExtSettings("gallop", { binarySuppression: binarySuppressionEnabled });
       const status = binarySuppressionEnabled ? "enabled" : "disabled";
 
       if (ctx.hasUI) {
@@ -1370,7 +1332,7 @@ ${checkpointFormat(keepRecentTokens)}
       } else {
         readGuardEnabled = !readGuardEnabled;
       }
-      saveToggleSetting(READ_GUARD_KEY, readGuardEnabled);
+      patchExtSettings("gallop", { readGuard: readGuardEnabled });
       const status = readGuardEnabled ? "enabled" : "disabled";
 
       if (ctx.hasUI) {
@@ -1383,8 +1345,9 @@ ${checkpointFormat(keepRecentTokens)}
 
   pi.on("session_start", async (_event, _ctx) => {
     resetAllState();
-    binarySuppressionEnabled = loadToggleSetting(BINARY_SUPPRESSION_KEY, true);
-    readGuardEnabled = loadToggleSetting(READ_GUARD_KEY, true);
+    const gallopSettings = loadExtSettings("gallop", GALLOP_DEFAULTS);
+    binarySuppressionEnabled = gallopSettings.binarySuppression !== false;
+    readGuardEnabled = gallopSettings.readGuard !== false;
   });
 
   // ── Stall detection ──
