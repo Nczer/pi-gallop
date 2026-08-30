@@ -2,7 +2,126 @@
 
 Keeps the agent moving. Prevents stalls and manages context lifecycle.
 
+The headline feature is model-driven self-compaction: the model writes its
+own checkpoint and compacts in-session, so the summarization rides the
+session's cached prompt prefix instead of a cold prefill. It runs as a loop —
+every fresh context starts the cycle again.
+
+```mermaid
+flowchart TB
+    A["1 · Context nears full — gallop nudges the model.<br/>Or a large task finished and the next one is queued"]
+    A --> B["2 · Model calls compact_request with its own checkpoint summary<br/>(optionally after checking usage with context_status)"]
+    B --> C["3 · Summary stashed, run ends —<br/>the compact fires when the agent goes idle"]
+    C --> D["4 · pi compacts with the stashed summary (no cold LLM call).<br/>The tool call is stripped, replaced by a short 'compaction complete' note"]
+    D --> E["5 · Fresh context: summary + recent tail kept verbatim"]
+    E -. loop .-> A
+    B -. context rotten: nuke .-> N["The checkpoint summarizes the ENTIRE context —<br/>a handoff, but automatic"]
+    N -.-> C
+```
+
+Everything else keeps the run alive and the context clean:
+
+- **Stall detection** — resumes a model that halts mid-thought or mid-tool-call, escalating to a strategy nudge instead of resuming forever
+- **Failure-loop, repetitive-call & mismatch detection** — spots stuck command patterns, then a circuit breaker halts the agent
+- **Read guard** — blocks binary files (PDFs, archives, binaries, ...) before they garble the context, with a result-sniffing safety net
+- **Binary output filter** — replaces binary bash output with a readable summary
+
 ## Features
+
+### Self-Compaction (cache-friendly)
+
+The LLM can request compaction via the `compact_request` tool and write the
+checkpoint summary itself — the summarization happens inside the live session
+(a normal turn), so that LLM call rides the session's cached prompt prefix with
+no cold prefill. Gallop stashes the summary and returns it as a custom
+`CompactionResult` in `session_before_compact` (with pi's file-list sections
+appended), so pi skips its one-shot summarizer (which cold-prefills the
+flattened conversation). If no usable summary is stashed (native `/compact`,
+auto threshold, overflow recovery, or a summary under 200 chars) or the user
+aborts, gallop returns `undefined` and pi's native one-shot runs — compaction
+always works.
+
+Tool arguments:
+
+- `message` — brief user-visible message shown in the tool result (`Compacting (<message>).`)
+- `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
+  Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
+  older work, since the recent tokens up to pi's `compaction.keepRecentTokens`
+  (default ~20k, user-configurable) are kept verbatim — the tool description names
+  the configured value. Stays in the kept tail as the tool call's arguments — one
+  copy, the price of in-session summarization.
+- `nuke` (boolean, optional) — summarize the *entire* context instead of keeping
+  the most recent `compaction.keepRecentTokens` (default ~20k) verbatim; only the
+  last turn's tail survives. For contexts broken beyond repair (repeated failing
+  tool calls), where the default tail is exactly the broken part. The cut point is
+  recomputed with budget 0 by the same `findCutPoint` walker pi's `prepareCompaction`
+  uses (mirroring its previous-compaction boundary logic) and returned as a custom
+  `firstKeptEntryId` — pi uses it verbatim. The checkpoint must then carry full
+  state, since the verbatim tail no longer covers recent work.
+- `continue` (boolean) — if `true`, a fixed generic steer
+  (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
+  the checkpoint's Next Steps section tells the agent what to do next. Omitted/`false`
+  = the agent stops and you take the next step. No custom resume text is ever written
+  or re-sent.
+
+Minimum context: the call **fails when the whole context fits in pi's keep
+window** (`compaction.keepRecentTokens`, default 20k) — there is nothing older
+than the verbatim tail to summarize, and pi would fail the compact. The guard
+checks pi's own `getContextUsage()` (the same last-usage-anchored estimate the
+automatic threshold check uses) against the live settings before stashing
+anything: a below-minimum call fails as the tool call itself (the thrown error
+becomes the tool result the model sees, with the reason and a retry-once-larger
+hint), and no deferred compact is armed. A `nuke` on such a session fails with an
+explicit escape hatch instead: pi evaluates the cut with the *configured* keep
+window — never 0 — and refuses to compact a small session at all, so the model is
+told to persist the state to memory (or a handoff file) and have the user start a
+new session. Unmeasurable usage (`tokens: null` in the window right after a
+compaction) proceeds and lets pi decide.
+
+The tool description also suggests compacting at task boundaries: when a planned
+task finished and another is queued, the checkpoint becomes the handoff for the
+next task (which starts on a fresh context) instead of the next task inheriting
+the previous one's tool-call history.
+
+The compact itself is **deferred to pi's `agent_settled` event** (emitted after
+the post-run loop). `ctx.compact()` first awaits the agent to go idle, which
+only happens *after* pi's automatic threshold compaction ran — so firing it
+inside the tool's `execute` at the moment a run's final usage crossed that
+threshold would always double-compact: the automatic compact consumes the
+stashed checkpoint first, then the manual one throws "Already compacted" and
+the TUI shows an error. Deferring makes the race a no-op — if the automatic
+compact (or a user `/compact`) ran first, `session_compact` clears the pending
+state and the deferred trigger skips (a second check that the branch does not
+already end in a compaction entry); in that race case the `continue` steer is
+sent from `session_compact` instead of the manual `onComplete`.
+
+Once the checkpoint has become the compaction summary, a `context` handler
+replaces the `compact_request` exchange in every LLM request — the exchange
+would otherwise duplicate the ~1k-token summary in the kept tail *and* read
+as an unfulfilled request (the resumed model re-requested compaction, with
+the triggering pressure nudge still standing in the tail). When the summary
+text is verifiably carried by a `compactionSummary` message in context, the
+assistant message carrying the call is rewritten to a fixed completion marker
+(“Compaction complete — the summary at the top of context is your current
+state. Do not call compact_request again unless context pressure returns.”)
+and the paired toolResult is dropped. A call whose text is NOT carried
+(native-fallback compact) keeps its call as a true record and only gets its
+in-progress “Compacting (…)” result text marked done. Pre-compact tree views
+and aborted compacts (no `compactionSummary` in context) are left intact, so
+a re-request after an aborted compact is still the correct recovery. The
+session file and TUI transcript always retain the full summary; the rewrite
+is deterministic, so the prefix stays cache-stable.
+
+`message_end` triggers nothing (pi emits it *before* pending tools execute) —
+every compact request resolves deterministically at `agent_settled`. A
+re-entrancy guard skips re-triggered `ctx.compact()` calls while a compact is
+in flight (pi would throw "Already compacted"), re-armed at each new user
+turn.
+
+`/qcompact` (v2.0.0–v2.0.2) is gone: the context-pressure nudge below asks the
+model to compact itself as the context fills, and pi's native `/compact`
+remains for an immediate user-initiated compact (cold one-shot — the trade for
+not needing a live-model checkpoint turn).
 
 ### Read Guard (binary file blocking)
 
@@ -109,101 +228,6 @@ Detects when the LLM acknowledges an error in its thinking but then calls the sa
 - If thinking acknowledges an error AND the tool call matches the last failed fingerprint → injects `[Gallop] Mismatch: ...` steer message
 - One-shot: clears after firing or on any successful tool call
 - Operates independently of failure-loop and repetitive-call escalation
-
-### Self-Compaction (cache-friendly)
-
-The LLM can request compaction via the `compact_request` tool and write the
-checkpoint summary itself — the summarization happens inside the live session
-(a normal turn), so that LLM call rides the session's cached prompt prefix with
-no cold prefill. Gallop stashes the summary and returns it as a custom
-`CompactionResult` in `session_before_compact` (with pi's file-list sections
-appended), so pi skips its one-shot summarizer (which cold-prefills the
-flattened conversation). If no usable summary is stashed (native `/compact`,
-auto threshold, overflow recovery, or a summary under 200 chars) or the user
-aborts, gallop returns `undefined` and pi's native one-shot runs — compaction
-always works.
-
-Tool arguments:
-
-- `message` — brief user-visible message shown in the tool result (`Compacting (<message>).`)
-- `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
-  Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
-  older work, since the recent tokens up to pi's `compaction.keepRecentTokens`
-  (default ~20k, user-configurable) are kept verbatim — the tool description names
-  the configured value. Stays in the kept tail as the tool call's arguments — one
-  copy, the price of in-session summarization.
-- `nuke` (boolean, optional) — summarize the *entire* context instead of keeping
-  the most recent `compaction.keepRecentTokens` (default ~20k) verbatim; only the
-  last turn's tail survives. For contexts broken beyond repair (repeated failing
-  tool calls), where the default tail is exactly the broken part. The cut point is
-  recomputed with budget 0 by the same `findCutPoint` walker pi's `prepareCompaction`
-  uses (mirroring its previous-compaction boundary logic) and returned as a custom
-  `firstKeptEntryId` — pi uses it verbatim. The checkpoint must then carry full
-  state, since the verbatim tail no longer covers recent work.
-- `continue` (boolean) — if `true`, a fixed generic steer
-  (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
-  the checkpoint's Next Steps section tells the agent what to do next. Omitted/`false`
-  = the agent stops and you take the next step. No custom resume text is ever written
-  or re-sent.
-
-Minimum context: the call **fails when the whole context fits in pi's keep
-window** (`compaction.keepRecentTokens`, default 20k) — there is nothing older
-than the verbatim tail to summarize, and pi would fail the compact. The guard
-checks pi's own `getContextUsage()` (the same last-usage-anchored estimate the
-automatic threshold check uses) against the live settings before stashing
-anything: a below-minimum call fails as the tool call itself (the thrown error
-becomes the tool result the model sees, with the reason and a retry-once-larger
-hint), and no deferred compact is armed. A `nuke` on such a session fails with an
-explicit escape hatch instead: pi evaluates the cut with the *configured* keep
-window — never 0 — and refuses to compact a small session at all, so the model is
-told to persist the state to memory (or a handoff file) and have the user start a
-new session. Unmeasurable usage (`tokens: null` in the window right after a
-compaction) proceeds and lets pi decide.
-
-The tool description also suggests compacting at task boundaries: when a planned
-task finished and another is queued, the checkpoint becomes the handoff for the
-next task (which starts on a fresh context) instead of the next task inheriting
-the previous one's tool-call history.
-
-The compact itself is **deferred to pi's `agent_settled` event** (emitted after
-the post-run loop). `ctx.compact()` first awaits the agent to go idle, which
-only happens *after* pi's automatic threshold compaction ran — so firing it
-inside the tool's `execute` at the moment a run's final usage crossed that
-threshold would always double-compact: the automatic compact consumes the
-stashed checkpoint first, then the manual one throws "Already compacted" and
-the TUI shows an error. Deferring makes the race a no-op — if the automatic
-compact (or a user `/compact`) ran first, `session_compact` clears the pending
-state and the deferred trigger skips (a second check that the branch does not
-already end in a compaction entry); in that race case the `continue` steer is
-sent from `session_compact` instead of the manual `onComplete`.
-
-Once the checkpoint has become the compaction summary, a `context` handler
-replaces the `compact_request` exchange in every LLM request — the exchange
-would otherwise duplicate the ~1k-token summary in the kept tail *and* read
-as an unfulfilled request (the resumed model re-requested compaction, with
-the triggering pressure nudge still standing in the tail). When the summary
-text is verifiably carried by a `compactionSummary` message in context, the
-assistant message carrying the call is rewritten to a fixed completion marker
-(“Compaction complete — the summary at the top of context is your current
-state. Do not call compact_request again unless context pressure returns.”)
-and the paired toolResult is dropped. A call whose text is NOT carried
-(native-fallback compact) keeps its call as a true record and only gets its
-in-progress “Compacting (…)” result text marked done. Pre-compact tree views
-and aborted compacts (no `compactionSummary` in context) are left intact, so
-a re-request after an aborted compact is still the correct recovery. The
-session file and TUI transcript always retain the full summary; the rewrite
-is deterministic, so the prefix stays cache-stable.
-
-`message_end` triggers nothing (pi emits it *before* pending tools execute) —
-every compact request resolves deterministically at `agent_settled`. A
-re-entrancy guard skips re-triggered `ctx.compact()` calls while a compact is
-in flight (pi would throw "Already compacted"), re-armed at each new user
-turn.
-
-`/qcompact` (v2.0.0–v2.0.2) is gone: the context-pressure nudge below asks the
-model to compact itself as the context fills, and pi's native `/compact`
-remains for an immediate user-initiated compact (cold one-shot — the trade for
-not needing a live-model checkpoint turn).
 
 ### Context-pressure nudge
 
