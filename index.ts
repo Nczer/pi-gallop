@@ -30,6 +30,17 @@ import * as stall from "./stall";
  *  message_end); message_end processing is gated on it. */
 let sawAssistantMessage = false;
 
+/** Defaults for gallop's namespace in the shared settings-ext.json — the
+ *  single owner of the materialized defaults (ext-settings writes back any
+ *  keys missing from the file, so every option is visible and editable
+ *  there). */
+const GALLOP_DEFAULTS = {
+  binarySuppression: true,
+  readGuard: true,
+  compactNudgeBuffer: selfCompact.NUDGE_BUFFER_DEFAULT,
+  compactNudgeDisabledAt: selfCompact.NUDGE_DISABLED_AT_DEFAULT,
+};
+
 /** Reset all gallop state. Called on session start and compaction (and via
  *  the breaker's "Continue", which the composition root injects into
  *  intervention as setFullReset). */
@@ -48,8 +59,9 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // ── Session lifecycle ──
   pi.on("session_start", () => {
     resetAllState();
-    const gallopSettings = loadExtSettings("gallop", binary.GALLOP_DEFAULTS);
+    const gallopSettings = loadExtSettings("gallop", GALLOP_DEFAULTS);
     binary.setToggles(gallopSettings);
+    selfCompact.setNudgeSettings(gallopSettings);
   });
 
   // ── Message liveness + the new-user-turn compact re-arm ──

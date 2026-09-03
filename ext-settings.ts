@@ -21,7 +21,11 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-export const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings-ext.json");
+/** Production settings-ext.json path — computed per call (not at import
+ *  time) so a changed $HOME (tests stub it) is respected. */
+export function settingsExtPath(): string {
+  return path.join(os.homedir(), ".pi", "agent", "settings-ext.json");
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -83,7 +87,7 @@ function writeWhole(filePath: string, file: Record<string, unknown>): void {
 export function loadExtSettings<T extends object>(
   namespace: string,
   defaults: T,
-  filePath: string = SETTINGS_PATH,
+  filePath: string = settingsExtPath(),
 ): T {
   const file = readWhole(filePath);
   const raw = file[namespace];
@@ -98,7 +102,7 @@ export function loadExtSettings<T extends object>(
 export function patchExtSettings(
   namespace: string,
   patch: Record<string, unknown>,
-  filePath: string = SETTINGS_PATH,
+  filePath: string = settingsExtPath(),
 ): void {
   const file = readWhole(filePath);
   const raw = file[namespace];

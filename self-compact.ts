@@ -96,12 +96,37 @@ export function readPiCompactionSettings(
 
 // ── Thresholds and formats ──
 
-/** Buffer above pi's automatic threshold for the self-compact nudge — the
- *  model gets one more message of warning before the native backstop fires. */
-const NUDGE_BUFFER = 2_048;
-/** Nudge threshold when pi's automatic compaction is disabled — no backstop
- *  exists, so a fixed 16k (pi's default reserve). */
-const NUDGE_DISABLED_AT = 16_000;
+/** Buffer (tokens) above pi's automatic threshold for the self-compact nudge —
+ *  the warning margin before the native backstop fires. Exposed setting:
+ *  `compactNudgeBuffer` in the "gallop" namespace of settings-ext.json, loaded
+ *  by the session_start handler (setNudgeSettings) — a changed value takes
+ *  effect on the next /reload or new session, like the rest of the
+ *  extension's load-time state. */
+export const NUDGE_BUFFER_DEFAULT = 2_048;
+let nudgeBuffer = NUDGE_BUFFER_DEFAULT;
+
+/** Nudge threshold (remaining tokens) when pi's automatic compaction is
+ *  disabled — no backstop exists to anchor the buffer to, so a fixed
+ *  threshold is used. Exposed setting: `compactNudgeDisabledAt` in the same
+ *  namespace (default 16k = pi's default reserve). */
+export const NUDGE_DISABLED_AT_DEFAULT = 16_000;
+let nudgeDisabledAt = NUDGE_DISABLED_AT_DEFAULT;
+
+/** session_start: load the nudge thresholds from settings-ext.json. Invalid
+ *  values (missing / non-number / non-finite) keep the previous value;
+ *  negatives clamp to 0 (a negative buffer would put the nudge at or behind
+ *  the backstop). */
+export function setNudgeSettings(
+  settings: { compactNudgeBuffer?: unknown; compactNudgeDisabledAt?: unknown } = {},
+): void {
+  nudgeBuffer = clampTokenSetting(settings.compactNudgeBuffer, nudgeBuffer);
+  nudgeDisabledAt = clampTokenSetting(settings.compactNudgeDisabledAt, nudgeDisabledAt);
+}
+
+function clampTokenSetting(value: unknown, current: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.round(value)) : current;
+}
+
 /** Context size (tokens used) beyond which context_status suggests a
  *  compaction even with ample headroom — models (especially local ones)
  *  perform best under ~100k. Suggestion only: the model decides whether the
@@ -192,11 +217,11 @@ export function contextTokensFromUsage(usage: {
 }
 
 /** Remaining-token threshold at which gallop nudges the model to self-compact:
- *  just above pi's automatic threshold (reserveTokens + NUDGE_BUFFER) when
- *  auto-compact is on, or a fixed 16k when it is off (nothing else would
- *  fire). */
+ *  just above pi's automatic threshold (reserveTokens + the configured nudge
+ *  buffer) when auto-compact is on, or the configured no-backstop threshold
+ *  (default 16k) when it is off (nothing else would fire). */
 export function nudgeThreshold(settings: PiCompactionSettings = PI_COMPACTION_DEFAULTS): number {
-  return settings.enabled ? settings.reserveTokens + NUDGE_BUFFER : NUDGE_DISABLED_AT;
+  return settings.enabled ? settings.reserveTokens + nudgeBuffer : nudgeDisabledAt;
 }
 
 /** Format a token count for the LLM: 950 → "950", 1200 → "1.2k", 200000 → "200k". */
@@ -360,8 +385,9 @@ let compactionInFlight = false;
  *  post-compaction re-trigger window. */
 let compactionRunning = false;
 /** Context-pressure nudge state, one nudge per compaction cycle. "idle" →
- *  advisory nudge just above pi's automatic threshold (reserveTokens +
- *  NUDGE_BUFFER, or a fixed 16k when auto-compact is disabled); "nudged" →
+ *  advisory nudge just above pi's automatic threshold (reserveTokens + the
+ *  configured nudge buffer, or the configured no-backstop threshold when
+ *  auto-compact is disabled); "nudged" →
  *  silence — pi's automatic compaction is the backstop (or nothing, if it is
  *  disabled). Reset on every compaction and session reset. */
 let contextNudgeState: "idle" | "nudged" = "idle";
@@ -461,7 +487,8 @@ export function noteUserTurn(): void {
 
 /** message_end (assistant): the context-pressure nudge — one advisory steer
  *  per compaction cycle, just above pi's automatic threshold (or at a fixed
- *  16k when auto-compact is disabled — then no backstop exists). A compliant
+ *  configured no-backstop threshold when auto-compact is disabled — then no
+ *  backstop exists). A compliant
  *  model compacts cache-warm before the native backstop takes over; after the
  *  nudge, silence — the backstop (or overflow) decides. Like the old per-turn
  *  context-usage injection (removed in v1.3 as ambient noise), this rides the

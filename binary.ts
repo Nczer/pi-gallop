@@ -17,11 +17,7 @@
  * (jpg/png/gif/webp/bmp) are never blocked — those attach correctly.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadExtSettings, patchExtSettings } from "./ext-settings";
-
-/** Gallop's toggles live in the shared settings-ext.json ("gallop"
- *  namespace, defaults materialized on first load). */
-export const GALLOP_DEFAULTS = { binarySuppression: true, readGuard: true };
+import { patchExtSettings } from "./ext-settings";
 
 let binarySuppressionEnabled = true;
 let readGuardEnabled = true;

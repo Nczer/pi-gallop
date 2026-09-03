@@ -9,6 +9,9 @@ import {
   contextTokensFromUsage,
   readPiCompactionSettings,
   nudgeThreshold,
+  setNudgeSettings,
+  NUDGE_BUFFER_DEFAULT,
+  NUDGE_DISABLED_AT_DEFAULT,
   checkpointFormat,
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
@@ -599,6 +602,7 @@ describe("context-pressure nudge", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT });
     fs.rmSync(tmpHome, { recursive: true, force: true });
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
@@ -684,6 +688,29 @@ describe("context-pressure nudge", () => {
     expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(18_432);
   });
 
+  it("exposes both nudge thresholds as settings (compactNudgeBuffer / compactNudgeDisabledAt)", () => {
+    const s = readPiCompactionSettings(tmpCwd, missingGlobal());
+    expect(nudgeThreshold(s)).toBe(18_432);              // 16_384 + 2_048
+    expect(nudgeThreshold({ ...s, enabled: false })).toBe(16_000);
+
+    // Both configurable — valid values take effect
+    setNudgeSettings({ compactNudgeBuffer: 8_192, compactNudgeDisabledAt: 20_000 });
+    expect(nudgeThreshold(s)).toBe(24_576);
+    expect(nudgeThreshold({ ...s, enabled: false })).toBe(20_000);
+
+    // Partial update: missing keys keep their values
+    setNudgeSettings({ compactNudgeBuffer: 0 });
+    expect(nudgeThreshold(s)).toBe(16_384);              // 0 margin → nudge at the backstop
+    expect(nudgeThreshold({ ...s, enabled: false })).toBe(20_000);
+
+    // Invalid values keep the previous value; negatives clamp to 0
+    setNudgeSettings({ compactNudgeBuffer: "8k", compactNudgeDisabledAt: Number.NaN });
+    expect(nudgeThreshold(s)).toBe(16_384);
+    expect(nudgeThreshold({ ...s, enabled: false })).toBe(20_000);
+    setNudgeSettings({ compactNudgeDisabledAt: -5 });
+    expect(nudgeThreshold({ ...s, enabled: false })).toBe(0);
+  });
+
   // ── nudge message path ──
 
   it("nudges once just above the automatic threshold and does not repeat", async () => {
@@ -717,6 +744,31 @@ describe("context-pressure nudge", () => {
     await resetState();
     await endTurn(15_000);
     expect(nudgeSteers()).toHaveLength(2);
+  });
+
+  it("session_start loads the nudge settings from settings-ext.json (real load path)", async () => {
+    const extPath = path.join(tmpHome, ".pi", "agent", "settings-ext.json");
+    fs.mkdirSync(path.dirname(extPath), { recursive: true });
+    fs.writeFileSync(extPath, JSON.stringify({ gallop: { compactNudgeBuffer: 40_960, compactNudgeDisabledAt: 6_000 } }));
+    await handlers.get("session_start")(null, ctx);
+
+    // Enabled branch: 16_384 + 40_960 = 57_344 — the default buffer (18_432) would not have nudged at 55k
+    await endTurn(60_000);
+    expect(nudgeSteers()).toHaveLength(0);
+    await endTurn(55_000);
+    expect(nudgeSteers()).toHaveLength(1);
+    expect(nudgeSteers()[0]).toContain("~55k tokens remaining");
+
+    // Disabled branch: custom no-backstop threshold 6k (fresh cycle; settings
+    // survive the session_compact reset — they only reload at session_start)
+    await resetState();
+    writeSettings({ compaction: { enabled: false } });
+    await endTurn(7_000);
+    expect(nudgeSteers()).toHaveLength(1);
+    await endTurn(5_000);
+    expect(nudgeSteers()).toHaveLength(2);
+    expect(nudgeSteers()[1]).toContain("~5k tokens remaining");
+    expect(nudgeSteers()[1]).toContain("automatic compaction is disabled");
   });
 
   it("does not nudge while a compact is pending or on aborted/error messages", async () => {

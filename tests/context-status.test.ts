@@ -7,6 +7,9 @@ import {
   formatTokenCount,
   contextStatusAdvice,
   buildContextStatusText,
+  setNudgeSettings,
+  NUDGE_BUFFER_DEFAULT,
+  NUDGE_DISABLED_AT_DEFAULT,
 } from "../self-compact";
 
 const DEFAULTS = { reserveTokens: 16_384, enabled: true, keepRecentTokens: 20_000 };
@@ -140,6 +143,26 @@ describe("buildContextStatusText", () => {
     );
     expect(text.split("\n")[0]).toContain("0 remaining");
     expect(text.split("\n")[2]).toContain("near the backstop");
+  });
+
+  it("tracks the configured nudge thresholds (compactNudgeBuffer / compactNudgeDisabledAt)", () => {
+    setNudgeSettings({ compactNudgeBuffer: 8_192, compactNudgeDisabledAt: 20_000 });
+    try {
+      // enabled: threshold 16_384 + 8_192 = 24_576; 2× = 49_152
+      expect(contextStatusAdvice(24_576, 180_000, DEFAULTS)).toContain("near the backstop");
+      expect(contextStatusAdvice(30_000, 90_000, DEFAULTS)).toContain("pressure building");
+      expect(contextStatusAdvice(50_000, 40_000, DEFAULTS)).toBe("Advice: headroom OK.");
+      const on = buildContextStatusText({ tokens: 142_300, contextWindow: WINDOW, percent: 71.2 }, DEFAULTS);
+      expect(on.split("\n")[1]).toBe("Thresholds: gallop nudge ~24.6k remaining · pi auto-compact ~16.4k remaining");
+      // disabled: no-backstop threshold 20k
+      const off = buildContextStatusText(
+        { tokens: 185_000, contextWindow: WINDOW, percent: 92.5 },
+        { ...DEFAULTS, enabled: false },
+      );
+      expect(off.split("\n")[1]).toBe("Thresholds: gallop nudge ~20k remaining · pi auto-compact OFF (no backstop)");
+    } finally {
+      setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT });
+    }
   });
 });
 

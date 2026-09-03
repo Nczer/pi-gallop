@@ -130,7 +130,7 @@ Intercepts `read` tool calls targeting known binary file types (`.pdf`, `.docx`,
 - Unsupported image formats (tiff, heic, ...) are deliberately **not** blocked either — pi may add native support without notice, and the safety net below catches them until then
 - ASCII-capable CAD formats (`.stl`, `.obj`, `.step`, `.iges`, `.dxf`) are **not** blocked — they are often plain text the read tool handles fine; binary variants (e.g. binary STL) are caught by the safety net. Always-binary `.dwg` and `.3mf` remain blocked
 - Safety net: `read` tool **results** are also sniffed for binary content (null bytes, >5% non-printable, >5% U+FFFD replacement characters) and replaced with a suppression summary — catches misnamed or extension-less binaries and unsupported image formats
-- Toggle with `/gallop-read-guard [on|off]` (persisted, default on; stored in `~/.pi/agent/gallop.json` — pi's own `settings.json` is left untouched)
+- Toggle with `/gallop-read-guard [on|off]` (persisted, default on; stored in the `gallop` namespace of `~/.pi/agent/settings-ext.json` — pi's own `settings.json` is left untouched)
 
 ### Binary Output Filter
 
@@ -141,7 +141,7 @@ The summary includes:
 - Hex head preview (first 64 bytes)
 - **First 3 and last 5 readable lines** (control chars stripped) so you can verify the command ran correctly
 - Total line count when output exceeds 8 readable lines
-- Toggle with `/gallop-binary [on|off]` (persisted, default on, in the same `~/.pi/agent/gallop.json`)
+- Toggle with `/gallop-binary [on|off]` (persisted, default on, in the same `~/.pi/agent/settings-ext.json` namespace)
 
 ### Stall Detection
 
@@ -232,13 +232,23 @@ Detects when the LLM acknowledges an error in its thinking but then calls the sa
 
 As the context nears its limit, gallop steers the live model to self-compact:
 one advisory steer per compaction cycle (state resets on `session_compact`),
-placed just above pi's automatic threshold — `reserveTokens + 2k` (default ~18k
-remaining) when auto-compact is on, or a fixed 16k when it is off (then no
-backstop exists, and an overflow would abort the run). The threshold reads pi's
-compaction settings from the global + project `settings.json` (merged per key,
-project wins — same read-only reader shape as the context extension, falling
-back to pi's defaults), so it tracks a custom `reserveTokens` and stays
-proportionate on small context windows (e.g. 64k). After the nudge, silence —
+placed just above pi's automatic threshold — `reserveTokens + the nudge
+buffer` (default 2k → ~18k remaining) when auto-compact is on, or the
+no-backstop threshold (default 16k) when it is off (then no backstop exists,
+and an overflow would abort the run). The threshold reads pi's compaction
+settings from the global + project `settings.json` (merged per key, project
+wins — same read-only reader shape as the context extension, falling back to
+pi's defaults), so it tracks a custom `reserveTokens` and stays proportionate
+on small context windows (e.g. 64k).
+
+Both thresholds are exposed settings in the `gallop` namespace of
+`~/.pi/agent/settings-ext.json` (loaded on `session_start`; a changed value
+takes effect on the next /reload or new session): `compactNudgeBuffer`
+(tokens, default 2048) — the warning margin above the backstop; widen it to
+compact earlier with more headroom, set it to 0 to let the backstop decide —
+and `compactNudgeDisabledAt` (tokens, default 16000) — the nudge threshold
+when auto-compact is off (no backstop to anchor a buffer to).
+`context_status`'s threshold line and advice tiers track both automatically. After the nudge, silence —
 pi's automatic compaction (which also drives overflow recovery, so it stays
 enabled as the backstop) decides. No nudge while a compact is pending or in
 flight — including an en-route one whose `compact_request` call sits in the
