@@ -242,14 +242,14 @@ describe("self-compact wiring (in-session summary)", () => {
   // ── compact_request tool ──
 
   it("stashes the summary, defers the compact to agent_settled, and returns the short message with terminate", async () => {
-    const result = await callTool({ message: "context bloat", summary: LONG_SUMMARY });
+    const result = await callTool({ summary: LONG_SUMMARY });
 
     // No compact during execute — the run ends (terminate) and pi's post-run
     // loop (automatic threshold compaction) gets its chance first.
     expect(ctx.compact).not.toHaveBeenCalled();
     expect(result.terminate).toBe(true);
     const text = result.content[0].text;
-    expect(text).toBe("Compacting (context bloat).");
+    expect(text).toBe("Compacting.");
     // The summary must NOT be echoed in the tool result — the tool call's own
     // arguments (kept in the tail) already carry it.
     expect(text).not.toContain("## Goal");
@@ -259,14 +259,8 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
-  it("defaults the message to 'model-initiated' when omitted", async () => {
-    const result = await callTool({ summary: LONG_SUMMARY });
-    expect(result.content[0].text).toBe("Compacting (model-initiated).");
-    await settle(); // consume the pending request — a real run always settles
-  });
-
   it("injects the generic proceed message after compaction when continue is true", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY, continue: true });
+    await callTool({ summary: LONG_SUMMARY, continue: true });
     await settle();
     const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
@@ -278,7 +272,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("injects the proceed message when continue is omitted (default true)", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     await settle();
     const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
@@ -292,7 +286,7 @@ describe("self-compact wiring (in-session summary)", () => {
     // Re-arm the guard (a user turn ends the previous cycle).
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
     ctx.compact.mockClear();
-    await callTool({ message: "bloat", summary: LONG_SUMMARY, continue: false });
+    await callTool({ summary: LONG_SUMMARY, continue: false });
     await settle();
     const opts = ctx.compact.mock.calls[0][0];
     pi.sendUserMessage.mockClear();
@@ -318,10 +312,10 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
 
-  it("declares summary as a required parameter and exposes message/continue/nuke", () => {
+  it("declares summary as the only required parameter and exposes summary/continue/nuke", () => {
     const tool = tools.get("compact_request");
     expect(tool.parameters.required).toEqual(["summary"]);
-    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "message", "nuke", "summary"]);
+    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "nuke", "summary"]);
     expect(tool.parameters.properties.continue.type).toBe("boolean");
     expect(tool.parameters.properties.nuke.type).toBe("boolean");
     // The tool description carries the checkpoint format the model must follow
@@ -335,7 +329,7 @@ describe("self-compact wiring (in-session summary)", () => {
   // ── session_before_compact ──
 
   it("returns a custom compaction built from the stashed summary, with file ops appended", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
 
     const result = await handlers.get("session_before_compact")(
       {
@@ -357,7 +351,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("nuke: true replaces pi's cut with the budget-0 cut (last turn's tail)", async () => {
-    await callTool({ message: "broken context", summary: LONG_SUMMARY, nuke: true });
+    await callTool({ summary: LONG_SUMMARY, nuke: true });
 
     const result = await handlers.get("session_before_compact")(
       {
@@ -375,7 +369,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("keeps pi's own cut when nuke is not set", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
 
     const result = await handlers.get("session_before_compact")(
       {
@@ -408,7 +402,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("returns undefined (native one-shot fallback) for a too-short stashed summary", async () => {
-    await callTool({ message: "bloat", summary: "too short" });
+    await callTool({ summary: "too short" });
     const result = await handlers.get("session_before_compact")(
       { preparation: prep(emptyOps()), signal: new AbortController().signal },
       ctx,
@@ -418,7 +412,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("discards the stashed summary on abort so a later compact doesn't reuse it", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
 
     // Simulate pi aborting the compact after the hook has run (Esc during compaction):
     // the hook consumed the stash; a second compact must fall back to the one-shot.
@@ -437,7 +431,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("registers its abort handler on the signal and removes it again on the way out", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
 
     const added: string[] = [];
     const removed: string[] = [];
@@ -454,19 +448,19 @@ describe("self-compact wiring (in-session summary)", () => {
   // ── re-entrancy ──
 
   it("blocks a redundant trigger while a compact is in flight; a new user turn re-arms", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
     // Another request before any user turn: the guard blocks the redundant
     // trigger (and its continue message).
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
     // A new user turn re-arms the guard — the next request is honored.
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(2);
   });
@@ -482,14 +476,14 @@ describe("self-compact wiring (in-session summary)", () => {
         role: "assistant",
         content: [
           { type: "text", text: "I'll write the checkpoint now." },
-          { type: "toolCall", id: "c1", name: "compact_request", arguments: { message: "context bloat", summary: LONG_SUMMARY, continue: true } },
+          { type: "toolCall", id: "c1", name: "compact_request", arguments: { summary: LONG_SUMMARY, continue: true } },
         ],
       },
     }, ctx);
     expect(ctx.compact).not.toHaveBeenCalled();
 
     // The pending tool call executes right after and stashes the summary.
-    await callTool({ message: "context bloat", summary: LONG_SUMMARY, continue: true });
+    await callTool({ summary: LONG_SUMMARY, continue: true });
     expect(ctx.compact).not.toHaveBeenCalled();
 
     // Settle → deferred trigger compacts with the stashed summary.
@@ -505,14 +499,14 @@ describe("self-compact wiring (in-session summary)", () => {
   // ── session_compact ──
 
   it("clears compaction state on session_compact so a new request works again", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
     await handlers.get("session_compact")(null, { hasUI: false });
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
 
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(2);
   });
@@ -524,7 +518,7 @@ describe("self-compact wiring (in-session summary)", () => {
     // automatic threshold. The automatic compact runs in pi's post-run loop,
     // BEFORE agent_settled — it consumes the stashed summary (cache-warm, no
     // cold prefill) and session_compact clears the pending state.
-    await callTool({ message: "model-initiated", summary: LONG_SUMMARY, continue: true });
+    await callTool({ summary: LONG_SUMMARY, continue: true });
     expect(ctx.compact).not.toHaveBeenCalled();
 
     const auto = await handlers.get("session_before_compact")(
@@ -547,7 +541,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("skips the deferred trigger when the branch already ends in a compaction entry", async () => {
-    await callTool({ message: "bloat", summary: LONG_SUMMARY });
+    await callTool({ summary: LONG_SUMMARY });
     // A compaction completed in the same window but its session_compact event
     // did not reach our state (defensive path): the branch check catches it.
     ctx.sessionManager.getBranch.mockReturnValue([{ type: "compaction", summary: "x" }]);
@@ -814,7 +808,7 @@ describe("context handler (compact_request exchange → completion marker)", () 
     role: "assistant",
     content: [
       { type: "text", text: "compacting" },
-      { type: "toolCall", id, name: "compact_request", arguments: { message: "bloat", summary } },
+      { type: "toolCall", id, name: "compact_request", arguments: { summary } },
     ],
   });
 
@@ -822,7 +816,7 @@ describe("context handler (compact_request exchange → completion marker)", () 
     role: "toolResult",
     toolCallId,
     toolName: "compact_request",
-    content: [{ type: "text", text: "Compacting (bloat)." }],
+    content: [{ type: "text", text: "Compacting." }],
   });
 
   const otherToolCall = () => ({
@@ -892,7 +886,7 @@ describe("context handler (compact_request exchange → completion marker)", () 
   it("keeps a call the compaction summary does not carry, marking its result done", async () => {
     // The call's text is not in any compaction summary (native-fallback
     // compact): the call stays as a true record, but the in-progress
-    // "Compacting (…)" result is rewritten to the marker.
+    // "Compacting." result is rewritten to the marker.
     const result = await handlers.get("context")({
       messages: [
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
@@ -1004,7 +998,7 @@ describe("context handler (compact_request exchange → completion marker)", () 
           role: "assistant",
           content: [
             { type: "toolCall", id: "tc2", name: "bash", arguments: { command: "ls" } },
-            { type: "toolCall", id: "tc1", name: "compact_request", arguments: { message: "bloat", summary: LONG_SUMMARY } },
+            { type: "toolCall", id: "tc1", name: "compact_request", arguments: { summary: LONG_SUMMARY } },
           ],
         },
         { role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] },
@@ -1039,7 +1033,7 @@ describe("context handler (compact_request exchange → completion marker)", () 
 
   it("never emits the marker without a compaction summary in context", async () => {
     // Aborted compact / pre-compact tree view: the exchange is the only
-    // record, "Compacting (…)" is still true, and a re-request is the correct
+    // record, "Compacting." is still true, and a re-request is the correct
     // recovery — so the handler must not rewrite anything.
     const result = await handlers.get("context")({
       messages: [requestCompactCall("too short"), compactToolResult()],

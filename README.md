@@ -43,7 +43,6 @@ always works.
 
 Tool arguments:
 
-- `message` — brief user-visible message shown in the tool result (`Compacting (<message>).`)
 - `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
   Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
   older work, since the recent tokens up to pi's `compaction.keepRecentTokens`
@@ -106,7 +105,7 @@ assistant message carrying the call is rewritten to a fixed completion marker
 state. Do not call compact_request again unless context pressure returns.”)
 and the paired toolResult is dropped. A call whose text is NOT carried
 (native-fallback compact) keeps its call as a true record and only gets its
-in-progress “Compacting (…)” result text marked done. Pre-compact tree views
+in-progress “Compacting.” result text marked done. Pre-compact tree views
 and aborted compacts (no `compactionSummary` in context) are left intact, so
 a re-request after an aborted compact is still the correct recovery. The
 session file and TUI transcript always retain the full summary; the rewrite

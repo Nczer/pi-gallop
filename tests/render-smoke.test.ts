@@ -35,27 +35,27 @@ describe("compact_request renderers", () => {
   it("collapsed result is the short line only", () => {
     const tool = captureTools().get("compact_request");
     const comp: any = tool.renderResult(
-      { content: [{ type: "text", text: "Compacting (context bloat)." }] },
+      { content: [{ type: "text", text: "Compacting." }] },
       { expanded: false, isPartial: false },
       fakeTheme,
       {},
     );
     const lines = comp.render(100);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("Compacting (context bloat).");
+    expect(lines[0]).toContain("Compacting.");
     expect(lines[0]).not.toContain("## Goal");
   });
 
   it("expanded result does NOT re-render the checkpoint (it lives in the [compaction] entry)", () => {
     const tool = captureTools().get("compact_request");
     const comp: any = tool.renderResult(
-      { content: [{ type: "text", text: "Compacting (context bloat)." }] },
+      { content: [{ type: "text", text: "Compacting." }] },
       { expanded: true, isPartial: false },
       fakeTheme,
       { expanded: true, args },
     );
     const out = comp.render(100).join("\n");
-    expect(out).toContain("Compacting (context bloat).");
+    expect(out).toContain("Compacting.");
     expect(out).not.toContain("## Goal");
     expect(out).not.toContain("Fix the thing.");
   });

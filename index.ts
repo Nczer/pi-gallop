@@ -414,7 +414,7 @@ function triggerCompaction(
 // session_compact_failed delivers them immediately when the compact fails).
 //
 // The summary text would stay in the kept tail as the tool call's arguments —
-// duplicated on every request — and the exchange (call + "Compacting (…)" result)
+// duplicated on every request — and the exchange (call + in-progress "Compacting." result)
 // would read as an unfulfilled compact request. The `context` handler below
 // replaces it with a short completion marker once a compaction summary is in
 // context (session file untouched; per-path rules there). When no usable summary
@@ -1185,10 +1185,6 @@ ${checkpointFormat(keepRecentTokens)}
     parameters: {
       type: "object",
       properties: {
-        message: {
-          type: "string",
-          description: "Brief user-visible message about this compaction (e.g., 'context bloat', 'large task finished')",
-        },
         summary: {
           type: "string",
           description: "Checkpoint summary of the conversation so far, in the exact format given in the tool description",
@@ -1204,7 +1200,7 @@ ${checkpointFormat(keepRecentTokens)}
       },
       required: ["summary"],
     },
-    async execute(_id: string, params: { message?: string; summary?: string; continue?: boolean; nuke?: boolean }, _signal, _onUpdate, ctx: ExtensionContext) {
+    async execute(_id: string, params: { summary?: string; continue?: boolean; nuke?: boolean }, _signal, _onUpdate, ctx: ExtensionContext) {
       // Minimum-context guard: when the whole context fits in pi's configured keep
       // window, pi's prepareCompaction bails before any hook runs — no compact can
       // happen at all (not even a nuke; pi evaluates the cut with the configured
@@ -1217,8 +1213,6 @@ ${checkpointFormat(keepRecentTokens)}
       const usage = ctx.getContextUsage();
       const tooSmall = tooSmallCompactError(usage?.tokens, settings.keepRecentTokens, params?.nuke === true);
       if (tooSmall) throw new Error(tooSmall);
-
-      const message = params?.message || "model-initiated";
 
       // Stash the model's checkpoint for session_before_compact. A too-short summary
       // falls back to pi's native one-shot there, so compaction always works.
@@ -1244,7 +1238,7 @@ ${checkpointFormat(keepRecentTokens)}
         details: {},
         content: [{
           type: "text",
-          text: `Compacting (${message}).`,
+          text: "Compacting.",
         }],
         terminate: true,
       };
@@ -1898,7 +1892,7 @@ ${checkpointFormat(keepRecentTokens)}
   //    summary at the top of context.
   //  - Not carried (native-fallback: a too-short/absent summary, so pi's
   //    one-shot ran): the call stays as a true record of the model's short
-  //    text, but its "Compacting (…)" result reads as in-progress — rewrite
+  //    text, but its "Compacting." result reads as in-progress — rewrite
   //    just the result text to the marker once any compaction summary is in
   //    context. (Edge: an ABORTED botched compact with an OLDER compaction in
   //    context is marked done too; a missed re-request then waits for the next
@@ -1911,7 +1905,7 @@ ${checkpointFormat(keepRecentTokens)}
   //    top summary already says compaction happened.
   //
   // Pre-compact tree views (no compactionSummary message) and aborted compacts
-  // leave everything intact — on abort "Compacting (…)" is true, and a
+  // leave everything intact — on abort "Compacting." is true, and a
   // re-request is the correct recovery. The triggering nudge is left untouched
   // (a live post-compaction nudge is indistinguishable from a stale one in the
   // rendered context); with the marker present it reads as fulfilled. The
