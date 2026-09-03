@@ -3,11 +3,10 @@ import {
   normalizeCommand,
   extractErrorFingerprint,
   normalizeToolArgs,
-  lastItemIsThinking,
-  lastItemIsToolUse,
   pruneFailureHistory,
-  detectBinaryContent,
-} from "../index";
+} from "../intervention";
+import { lastItemIsThinking, lastItemIsToolUse } from "../stall";
+import { detectBinaryContent } from "../binary";
 
 // ── normalizeCommand ──
 

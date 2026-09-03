@@ -19,7 +19,7 @@ function captureTools() {
 
 describe("compact_request renderers", () => {
   const SUMMARY = "## Goal\nFix the thing.\n\n## Next Steps\n1. Done";
-  const args = { message: "context bloat", summary: SUMMARY };
+  const args = { summary: SUMMARY };
 
   it("call is a single title line — no args, no expand hint", () => {
     const tool = captureTools().get("compact_request");

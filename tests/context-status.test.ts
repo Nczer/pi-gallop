@@ -2,11 +2,12 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import gallopExtension, {
+import gallopExtension from "../index";
+import {
   formatTokenCount,
   contextStatusAdvice,
   buildContextStatusText,
-} from "../index";
+} from "../self-compact";
 
 const DEFAULTS = { reserveTokens: 16_384, enabled: true, keepRecentTokens: 20_000 };
 const WINDOW = 200_000;

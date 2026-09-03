@@ -2,7 +2,8 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import gallopExtension, {
+import gallopExtension from "../index";
+import {
   computeSelfCompactFileLists,
   appendSelfCompactFileOps,
   contextTokensFromUsage,
@@ -12,7 +13,7 @@ import gallopExtension, {
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
   COMPACT_DONE_MARKER,
-} from "../index";
+} from "../self-compact";
 
 // ── computeSelfCompactFileLists ──
 

@@ -3,7 +3,7 @@ import {
   escalate,
   type EscalationEntry,
   type EscalationLevel,
-} from "../index";
+} from "../intervention";
 
 // ── escalate (shared escalation engine) ──
 
