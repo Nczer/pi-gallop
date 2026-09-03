@@ -650,7 +650,14 @@ export function onBeforeCompact(
 // session file is never touched (the TUI transcript still shows the full
 // summary) and the rewrite is deterministic, so the prefix stays cache-stable.
 export function onContext(event: { messages: unknown }): { messages: any[] } | undefined {
-  const messagesIn = event.messages as any[];
+  const rewritten = rewriteCompactContext(event.messages as any[]);
+  return rewritten ? { messages: rewritten } : undefined;
+}
+
+/** The pure context rewrite. Pure function of the in-context message list —
+ *  the `context` handler is only glue around it, so every case below is
+ *  unit-testable without booting the extension. */
+export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
   // Collect ALL compaction summaries in context: an earlier compaction entry
   // can sit inside the newest compaction's kept tail, so context may carry
   // several compactionSummary messages. A carried check matches ANY of them —
@@ -731,7 +738,7 @@ export function onContext(event: { messages: unknown }): { messages: any[] } | u
     messages.push({ ...msg, content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
     changed = true;
   }
-  return changed ? { messages } : undefined;
+  return changed ? messages : undefined;
 }
 
 /** session_compact: a compaction completed. Clears the running flag and the

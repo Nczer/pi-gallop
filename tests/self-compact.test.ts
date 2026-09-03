@@ -13,6 +13,7 @@ import {
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
   COMPACT_DONE_MARKER,
+  rewriteCompactContext,
 } from "../self-compact";
 
 // ── computeSelfCompactFileLists ──
@@ -783,19 +784,9 @@ describe("context-pressure nudge", () => {
 });
 
 
-// ── context handler: dropping the compact_request exchange from LLM context ──
+// ── rewriteCompactContext: the compact_request exchange → completion marker ──
 
-describe("context handler (compact_request exchange → completion marker)", () => {
-  let pi: any;
-  let handlers: Map<string, any>;
-  let ctx: any;
-
-  beforeEach(() => {
-    ({ pi, handlers } = makeMockPi());
-    gallopExtension(pi);
-    ctx = { hasUI: false };
-  });
-
+describe("rewriteCompactContext (compact_request exchange → completion marker)", () => {
   const emptyFileOps = { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() };
 
   const compactionSummaryMsg = (summary: string) => ({
@@ -827,9 +818,7 @@ describe("context handler (compact_request exchange → completion marker)", () 
 
   it("returns undefined (no rewrite) when no compaction summary is in context", async () => {
     // Pre-compact tree view / aborted compact: the exchange is the only record.
-    const result = await handlers.get("context")({
-      messages: [requestCompactCall(LONG_SUMMARY), compactToolResult()],
-    }, ctx);
+    const result = rewriteCompactContext([requestCompactCall(LONG_SUMMARY), compactToolResult()]);
     expect(result).toBeUndefined();
   });
 
@@ -842,16 +831,14 @@ describe("context handler (compact_request exchange → completion marker)", () 
       written: new Set(["a.ts"]),
       edited: new Set<string>(),
     });
-    const result = await handlers.get("context")({
-      messages: [compactionSummaryMsg(compactionSummary), requestCompactCall(LONG_SUMMARY), compactToolResult(), otherToolCall()],
-    }, ctx);
+    const result = rewriteCompactContext([compactionSummaryMsg(compactionSummary), requestCompactCall(LONG_SUMMARY), compactToolResult(), otherToolCall()]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[0].role).toBe("compactionSummary");
-    expect(result.messages[1]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
-    expect(result.messages[2]).toEqual(otherToolCall());
-    expect(result.messages.some((m: any) => m?.toolName === "compact_request")).toBe(false);
+    expect(result).toHaveLength(3);
+    expect(result[0].role).toBe("compactionSummary");
+    expect(result[1]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+    expect(result[2]).toEqual(otherToolCall());
+    expect(result.some((m: any) => m?.toolName === "compact_request")).toBe(false);
   });
 
   it("keeps the triggering nudge in the tail while the exchange becomes the marker (field repro)", async () => {
@@ -866,39 +853,35 @@ describe("context handler (compact_request exchange → completion marker)", () 
         text: "[Gallop] Context is nearly full (~11k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now.",
       }],
     };
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         nudge,
         requestCompactCall(LONG_SUMMARY),
         compactToolResult(),
         { role: "user", content: [{ type: "text", text: "reloaded" }] },
-      ],
-    }, ctx);
+      ]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(4);
-    expect(result.messages[1]).toEqual(nudge); // the instruction stays — visibly fulfilled below
-    expect(result.messages[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
-    expect(result.messages[3].content).toEqual([{ type: "text", text: "reloaded" }]);
-    expect(result.messages.some((m: any) => m?.toolName === "compact_request")).toBe(false);
+    expect(result).toHaveLength(4);
+    expect(result[1]).toEqual(nudge); // the instruction stays — visibly fulfilled below
+    expect(result[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+    expect(result[3].content).toEqual([{ type: "text", text: "reloaded" }]);
+    expect(result.some((m: any) => m?.toolName === "compact_request")).toBe(false);
   });
 
   it("keeps a call the compaction summary does not carry, marking its result done", async () => {
     // The call's text is not in any compaction summary (native-fallback
     // compact): the call stays as a true record, but the in-progress
     // "Compacting." result is rewritten to the marker.
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         requestCompactCall("A completely different checkpoint that was never compacted.".padEnd(250, "x")),
         compactToolResult(),
-      ],
-    }, ctx);
+      ]);
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[1].content[1].arguments.summary).toMatch("completely different checkpoint");
-    expect(result.messages[2]).toEqual({
+    expect(result).toHaveLength(3);
+    expect(result[1].content[1].arguments.summary).toMatch("completely different checkpoint");
+    expect(result[2]).toEqual({
       role: "toolResult",
       toolCallId: "tc1",
       toolName: "compact_request",
@@ -911,33 +894,29 @@ describe("context handler (compact_request exchange → completion marker)", () 
     // one-shot ran. The arg is the model's real short text (a record), but the
     // result must stop reading as in-progress.
     const short = "too short";
-    const result = await handlers.get("context")({
-      messages: [compactionSummaryMsg("A native one-shot summary that does not carry the short arg at all."), requestCompactCall(short), compactToolResult()],
-    }, ctx);
+    const result = rewriteCompactContext([compactionSummaryMsg("A native one-shot summary that does not carry the short arg at all."), requestCompactCall(short), compactToolResult()]);
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[1]).toEqual(requestCompactCall(short));
-    expect(result.messages[2].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]);
+    expect(result).toHaveLength(3);
+    expect(result[1]).toEqual(requestCompactCall(short));
+    expect(result[2].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]);
   });
 
   it("handles multiple compact_request calls: carried → marker, uncarried → marked result", async () => {
     const otherCheckpoint = "Another checkpoint summary, long enough to matter. ".repeat(5); // >200 chars
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         requestCompactCall(otherCheckpoint, "tc2"), // not carried → call kept, result marked
         compactToolResult("tc2"),
         requestCompactCall(LONG_SUMMARY, "tc1"), // carried → replaced by the marker
         compactToolResult("tc1"),
-      ],
-    }, ctx);
+      ]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(4);
-    expect(result.messages[1].content[1].arguments.summary).toBe(otherCheckpoint);
-    expect(result.messages[2].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]); // tc2 result marked
-    expect(result.messages[3]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] }); // tc1 → marker
-    expect(result.messages.some((m: any) => m?.toolName === "compact_request" && m?.toolCallId === "tc1")).toBe(false); // tc1 result dropped
+    expect(result).toHaveLength(4);
+    expect(result[1].content[1].arguments.summary).toBe(otherCheckpoint);
+    expect(result[2].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]); // tc2 result marked
+    expect(result[3]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] }); // tc1 → marker
+    expect(result.some((m: any) => m?.toolName === "compact_request" && m?.toolCallId === "tc1")).toBe(false); // tc1 result dropped
   });
 
   it("markers the newest compacted exchange when an older compaction entry sits in the kept tail", async () => {
@@ -946,54 +925,47 @@ describe("context handler (compact_request exchange → completion marker)", () 
     // summary messages. The just-compacted exchange must still be replaced —
     // the older summary does not carry its text (the .find()-first bug).
     const oldCheckpoint = "Old checkpoint from a previous task, long enough to matter. ".repeat(4);
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(oldCheckpoint),
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         requestCompactCall(LONG_SUMMARY),
         compactToolResult(),
-      ],
-    }, ctx);
+      ]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+    expect(result).toHaveLength(3);
+    expect(result[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
   });
 
   it("markers a call from an earlier compaction when its entry is still in the kept tail", async () => {
     // The older compaction entry's summary is still carried by context, so
     // the earlier call's text is verifiably present — replace it too.
     const oldCheckpoint = "Old checkpoint from a previous task, long enough to matter. ".repeat(4);
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(oldCheckpoint),
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         requestCompactCall(oldCheckpoint),
         compactToolResult(),
-      ],
-    }, ctx);
+      ]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+    expect(result).toHaveLength(3);
+    expect(result[2]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
   });
 
   it("drops an orphaned compact_request toolResult whose call was summarized out of the window", async () => {
     // The cut point split the compact turn: the call landed in the summarized
     // prefix, only its result survives in the kept tail. Without its toolCall
     // the result would be an API error — drop it.
-    const result = await handlers.get("context")({
-      messages: [compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)), compactToolResult("tc1")],
-    }, ctx);
+    const result = rewriteCompactContext([compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)), compactToolResult("tc1")]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(1);
-    expect(result.messages[0].role).toBe("compactionSummary");
+    expect(result).toHaveLength(1);
+    expect(result[0].role).toBe("compactionSummary");
   });
 
   it("keeps sibling tool calls in a batched message, dropping the compact block and appending the marker", async () => {
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
         {
           role: "assistant",
@@ -1004,41 +976,36 @@ describe("context handler (compact_request exchange → completion marker)", () 
         },
         { role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] },
         compactToolResult("tc1"),
-      ],
-    }, ctx);
+      ]);
 
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[1].content).toEqual([
+    expect(result).toHaveLength(3);
+    expect(result[1].content).toEqual([
       { type: "toolCall", id: "tc2", name: "bash", arguments: { command: "ls" } },
       { type: "text", text: COMPACT_DONE_MARKER },
     ]);
-    expect(result.messages[2]).toEqual({ role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] });
+    expect(result[2]).toEqual({ role: "toolResult", toolCallId: "tc2", toolName: "bash", content: [{ type: "text", text: "ok" }] });
   });
 
   it("handles messages without array content and non-matching roles", async () => {
-    const result = await handlers.get("context")({
-      messages: [
+    const result = rewriteCompactContext([
         compactionSummaryMsg(LONG_SUMMARY),
         { role: "user", content: "plain string content, not an array" },
         { role: "toolResult", toolCallId: "tc9", toolName: "bash", content: [{ type: "text", text: "ok" }] },
         requestCompactCall(LONG_SUMMARY),
         compactToolResult(),
-      ],
-    }, ctx);
+      ]);
     expect(result).toBeDefined();
-    expect(result.messages).toHaveLength(4); // compactionSummary, user, bash result, marker
-    expect(result.messages[2]).toEqual({ role: "toolResult", toolCallId: "tc9", toolName: "bash", content: [{ type: "text", text: "ok" }] });
-    expect(result.messages[3]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+    expect(result).toHaveLength(4); // compactionSummary, user, bash result, marker
+    expect(result[2]).toEqual({ role: "toolResult", toolCallId: "tc9", toolName: "bash", content: [{ type: "text", text: "ok" }] });
+    expect(result[3]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
   });
 
   it("never emits the marker without a compaction summary in context", async () => {
     // Aborted compact / pre-compact tree view: the exchange is the only
     // record, "Compacting." is still true, and a re-request is the correct
     // recovery — so the handler must not rewrite anything.
-    const result = await handlers.get("context")({
-      messages: [requestCompactCall("too short"), compactToolResult()],
-    }, ctx);
+    const result = rewriteCompactContext([requestCompactCall("too short"), compactToolResult()]);
     expect(result).toBeUndefined();
   });
 });
