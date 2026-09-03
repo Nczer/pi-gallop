@@ -6,7 +6,7 @@ import {
   pruneFailureHistory,
 } from "../intervention";
 import { lastItemIsThinking, lastItemIsToolUse } from "../stall";
-import { detectBinaryContent } from "../binary";
+import { detectBinaryContent, buildBinarySuppressionSummary } from "../binary";
 
 // ── normalizeCommand ──
 
@@ -367,5 +367,44 @@ describe("pruneFailureHistory", () => {
     pruneFailureHistory(history, 10, 5);
     // cutoff = 10 - 5 = 5, and 5 < 5 is false, so it stays
     expect(history).toHaveLength(1);
+  });
+});
+
+// ── buildBinarySuppressionSummary ──
+
+describe("buildBinarySuppressionSummary", () => {
+  it("produces the full summary format verbatim (null bytes, read source)", () => {
+    const text = "hello world\0binary";
+    const summary = buildBinarySuppressionSummary(text, detectBinaryContent(text), { kind: "read", path: "a.pdf" });
+    expect(summary).toBe(
+      `[Gallop] Binary output suppressed — 18 bytes (contains null bytes)\n` +
+      `Path: \`a.pdf\`\n` +
+      `Head (hex): 68 65 6c 6c 6f 20 77 6f 72 6c 64 00 62 69 6e 61 72 79\n` +
+      `> hello worldbinary\n` +
+      `Binary content is hidden to protect context. The output was not sent to the model.`,
+    );
+  });
+
+  it("summarizes U+FFFD walls with a bash source, shortening long commands", () => {
+    const text = "\uFFFD".repeat(100) + "some readable tail";
+    const detection = detectBinaryContent(text);
+    expect(detection.binary).toBe(true);
+    expect(detection.reason).toContain("replacement characters");
+
+    const summary = buildBinarySuppressionSummary(text, detection, {
+      kind: "bash",
+      command: "cat " + "x".repeat(100),
+    });
+    expect(summary).toContain(`Command: \`cat ${"x".repeat(73)}...\``);
+    expect(summary).toContain("> some readable tail");
+    expect(summary).not.toContain("\uFFFD");
+  });
+
+  it("keeps head and tail lines and reports the total for long output", () => {
+    const text = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n") + "\n\0\n";
+    const summary = buildBinarySuppressionSummary(text, detectBinaryContent(text), { kind: "bash", command: "cat long.bin" });
+    expect(summary).toContain("(12 lines total)");
+    expect(summary).toContain("> line 0");
+    expect(summary).toContain("> line 11");
   });
 });

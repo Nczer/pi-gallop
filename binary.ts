@@ -199,15 +199,38 @@ export function filterToolResult(
   const detection = detectBinaryContent(fullText);
   if (!detection.binary) return undefined;
 
+  const summary = buildBinarySuppressionSummary(
+    fullText,
+    detection,
+    isRead
+      ? { kind: "read", path: readPathFromInput(event.input) ?? "<unknown>" }
+      : { kind: "bash", command: (event.input as any)?.command },
+  );
+
+  return {
+    content: [{
+      type: "text",
+      text: summary,
+    }],
+  };
+}
+
+/** The suppression summary the model sees instead of the raw bytes — a pure
+ *  function of (fullText, detection, source): byte count + detection reason,
+ *  the source line, a hex dump of the first 64 bytes, and the readable lines
+ *  extracted from the mangled text (head + tail). */
+export function buildBinarySuppressionSummary(
+  fullText: string,
+  detection: BinaryDetectionResult,
+  source: { kind: "read"; path: string } | { kind: "bash"; command: string | undefined },
+): string {
   const rawBytes = new TextEncoder().encode(fullText);
   const bytes = rawBytes.length;
   let sourceLine: string;
-  if (isRead) {
-    const readPath = readPathFromInput(event.input) ?? "<unknown>";
-    sourceLine = `Path: \`${readPath}\``;
+  if (source.kind === "read") {
+    sourceLine = `Path: \`${source.path}\``;
   } else {
-    const command = (event.input as any)?.command;
-    const firstLine = typeof command === "string" ? command.split("\n")[0].trim() : "";
+    const firstLine = typeof source.command === "string" ? source.command.split("\n")[0].trim() : "";
     const shortCommand = firstLine.length > 80 ? firstLine.slice(0, 77) + "..." : (firstLine || "<unknown>");
     sourceLine = `Command: \`${shortCommand}\``;
   }
@@ -236,13 +259,7 @@ export function filterToolResult(
   }
   if (lines.length > 8) summary += `\n... (${lines.length} lines total)`;
   summary += "\nBinary content is hidden to protect context. The output was not sent to the model.";
-
-  return {
-    content: [{
-      type: "text",
-      text: summary,
-    }],
-  };
+  return summary;
 }
 
 // ── Toggles ──
