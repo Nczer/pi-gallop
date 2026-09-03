@@ -150,71 +150,100 @@ export interface EscalationEntry {
 const ESCALATION_LEVELS: EscalationLevel[] = ["nudge", "nudge_plus", "block"];
 
 /**
- * Shared escalation engine.
- * Manages level transitions (nudge → nudge_plus → block) and message delivery.
- * Repeated failures at the same level escalate immediately (previous warning ignored).
- * Callers provide a message builder for their context.
+ * Escalation ladder — one per detector. Owns the per-fingerprint level
+ * state (nudge → nudge_plus → block) and the delivery policy, so a
+ * detector only reports what happened (`bump`) and never touches the
+ * state map. Repeated occurrences at the same level escalate immediately
+ * (the previous warning was ignored); a below-threshold count deletes
+ * the entry (streak over). While quiesced (circuit breaker tripped) the
+ * ladder is silent — the breaker has taken over.
  */
-export function escalate(
-  fingerprint: string,
-  count: number,
-  threshold: number,
-  nudgePlusThreshold: number,
-  blockThreshold: number,
-  escalationMap: Map<string, EscalationEntry>,
-  ctx: ExtensionContext,
-  pi: ExtensionAPI,
-  buildMessage: (level: EscalationLevel) => string,
-  uiLabel: string,
-): void {
-  if (circuitBreakerTripped) return;
-  if (count < threshold) {
-    escalationMap.delete(fingerprint);
-    return;
-  }
+export interface EscalationLadder {
+  /** Record one more occurrence and deliver the right escalation.
+   *  Returns the delivered level, or null when nothing happened (below
+   *  threshold, quiesced, or already at the max level). */
+  bump(
+    fingerprint: string,
+    count: number,
+    buildMessage: (level: EscalationLevel) => string,
+    ctx: ExtensionContext,
+    pi: ExtensionAPI,
+    uiLabel: string,
+  ): EscalationLevel | null;
+  get(fingerprint: string): EscalationEntry | undefined;
+  clear(): void;
+  /** Clear every streak except the given one (no argument: clear all). */
+  clearExcept(fingerprint?: string): void;
+  readonly size: number;
+}
 
-  let entry = escalationMap.get(fingerprint);
-  if (!entry) {
-    entry = { level: "nudge", nudgeCount: 0 };
-    escalationMap.set(fingerprint, entry);
-  }
+export function createEscalationLadder(
+  thresholds: { nudge: number; nudgePlus: number; block: number },
+  isQuiesced: () => boolean,
+): EscalationLadder {
+  const map = new Map<string, EscalationEntry>();
 
-  let targetLevel: EscalationLevel;
-  if (count >= blockThreshold) {
-    targetLevel = "block";
-  } else if (count >= nudgePlusThreshold) {
-    targetLevel = "nudge_plus";
-  } else {
-    targetLevel = "nudge";
-  }
+  return {
+    get size() {
+      return map.size;
+    },
 
-  const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
-  let targetIndex = ESCALATION_LEVELS.indexOf(targetLevel);
+    get: (fingerprint) => map.get(fingerprint),
 
-  // Already at target level and nudged before → escalate immediately (previous warning ignored)
-  if (targetIndex <= currentIndex && entry.nudgeCount > 0) {
-    const nextIndex = Math.min(currentIndex + 1, ESCALATION_LEVELS.length - 1);
-    if (nextIndex > currentIndex) {
-      targetLevel = ESCALATION_LEVELS[nextIndex];
-      targetIndex = nextIndex;
-    } else {
-      return; // Already at max level, nothing left to do
-    }
-  } else if (targetIndex <= currentIndex) {
-    // New entry, hasn't nudged yet — fall through to send initial nudge
-  }
+    clear: () => map.clear(),
 
-  entry.level = targetLevel;
-  entry.nudgeCount++;
+    clearExcept: (fingerprint) => {
+      for (const key of [...map.keys()]) {
+        if (key !== fingerprint) map.delete(key);
+      }
+    },
 
-  const msg = buildMessage(targetLevel);
-  if (msg) {
-    pi.sendUserMessage(msg, { deliverAs: "steer" });
-  }
+    bump(fingerprint, count, buildMessage, ctx, pi, uiLabel): EscalationLevel | null {
+      if (isQuiesced()) return null;
+      if (count < thresholds.nudge) {
+        map.delete(fingerprint);
+        return null;
+      }
 
-  if (ctx.hasUI) {
-    ctx.ui.notify(`Gallop: ${targetLevel} — ${uiLabel}`, targetLevel === "block" ? "error" : "warning");
-  }
+      let entry = map.get(fingerprint);
+      if (!entry) {
+        entry = { level: "nudge", nudgeCount: 0 };
+        map.set(fingerprint, entry);
+      }
+
+      let targetLevel: EscalationLevel =
+        count >= thresholds.block ? "block" :
+        count >= thresholds.nudgePlus ? "nudge_plus" :
+        "nudge";
+
+      // Already at the target level and warned before → the previous
+      // warning was ignored — escalate one step immediately.
+      const currentIndex = ESCALATION_LEVELS.indexOf(entry.level);
+      const targetIndex = ESCALATION_LEVELS.indexOf(targetLevel);
+      if (targetIndex <= currentIndex && entry.nudgeCount > 0) {
+        const nextIndex = Math.min(currentIndex + 1, ESCALATION_LEVELS.length - 1);
+        if (nextIndex > currentIndex) {
+          targetLevel = ESCALATION_LEVELS[nextIndex];
+        } else {
+          return null; // Already at max level, nothing left to do
+        }
+      }
+
+      entry.level = targetLevel;
+      entry.nudgeCount++;
+
+      const msg = buildMessage(targetLevel);
+      if (msg) {
+        pi.sendUserMessage(msg, { deliverAs: "steer" });
+      }
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Gallop: ${targetLevel} — ${uiLabel}`, targetLevel === "block" ? "error" : "warning");
+      }
+
+      return targetLevel;
+    },
+  };
 }
 
 // ── Thresholds ──
@@ -249,12 +278,6 @@ let repetitiveCallState: {
 
 let currentTurnIndex = 0;
 
-/** Failure-loop escalation: key -> { level, nudgeCount } */
-const failureEscalation = new Map<string, EscalationEntry>();
-
-/** Repetitive-call escalation: fingerprint -> { level, nudgeCount } */
-const repetitiveEscalation = new Map<string, EscalationEntry>();
-
 /** Patterns currently blocked (key -> reason snippet for error messages) */
 const blockedPatterns = new Map<string, string>();
 
@@ -266,6 +289,19 @@ let circuitBreakerTripped = false;
 
 /** User chose "Stop" on circuit breaker — block all tool calls */
 let circuitBreakerHalted = false;
+
+/** Failure-loop ladder: per-command level state (see createEscalationLadder).
+ *  Quiesces with the circuit breaker — once it trips, no new escalations. */
+const failureLadder = createEscalationLadder(
+  { nudge: FAILURE_LOOP_THRESHOLD, nudgePlus: FAILURE_LOOP_NUDGE_PLUS, block: FAILURE_LOOP_BLOCK },
+  () => circuitBreakerTripped,
+);
+
+/** Repetitive-call ladder: per-fingerprint level state. */
+const repetitiveLadder = createEscalationLadder(
+  { nudge: REPETITIVE_CALL_THRESHOLD, nudgePlus: REPETITIVE_CALL_NUDGE_PLUS, block: REPETITIVE_CALL_BLOCK },
+  () => circuitBreakerTripped,
+);
 
 /** Last failed tool call for mismatch detection */
 let lastFailedToolCall: {
@@ -327,8 +363,8 @@ export function halted(): boolean {
 function stepBackAfterBlocks(pi: ExtensionAPI, note: string): void {
   const enforced = totalBlocks;
   blockedPatterns.clear();
-  failureEscalation.clear();
-  repetitiveEscalation.clear();
+  failureLadder.clear();
+  repetitiveLadder.clear();
   totalBlocks = 0;
   circuitBreakerTripped = false;
   pi.sendUserMessage(
@@ -413,11 +449,8 @@ function checkRepetitiveCall(
     hint = " Consider whether the result is already available in context.";
   }
 
-  escalate(
+  repetitiveLadder.bump(
     fingerprint, count,
-    REPETITIVE_CALL_THRESHOLD, REPETITIVE_CALL_NUDGE_PLUS, REPETITIVE_CALL_BLOCK,
-    repetitiveEscalation,
-    ctx, pi,
     (level) => {
       if (level === "block") {
         return `[Gallop] BLOCKED: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}). This pattern is now blocked. You MUST use a different tool or different arguments.${hint}`;
@@ -427,6 +460,7 @@ function checkRepetitiveCall(
       }
       return `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
     },
+    ctx, pi,
     `repetitive call (${count}x ${toolName})`,
   );
 }
@@ -463,11 +497,8 @@ function checkFailureLoop(
     hint = " Consider checking the working directory, command syntax, or prerequisites.";
   }
 
-  escalate(
+  failureLadder.bump(
     nudgeKey, matchCount,
-    FAILURE_LOOP_THRESHOLD, FAILURE_LOOP_NUDGE_PLUS, FAILURE_LOOP_BLOCK,
-    failureEscalation,
-    ctx, pi,
     (level) => {
       if (level === "block") {
         blockedPatterns.set(normalized, errorSnippet);
@@ -478,6 +509,7 @@ function checkFailureLoop(
       }
       return `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
     },
+    ctx, pi,
     `failure loop (${matchCount} failures)`,
   );
 }
@@ -550,7 +582,7 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
       if (!event.isError) {
         // Successful execution — reset failure history and escalation to avoid stale detections
         failureHistory.length = 0;
-        failureEscalation.clear();
+        failureLadder.clear();
         blockedPatterns.clear();
       } else {
         const normalized = normalizeCommand(rawCommand);
@@ -615,10 +647,7 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
       // their escalation so a later legitimate re-use isn't hard-blocked from
       // an earlier streak. Keep the current fingerprint's entry so its own
       // ladder (nudge → nudge+ → block) continues uninterrupted.
-      const current = repetitiveCallState?.fingerprint;
-      for (const key of repetitiveEscalation.keys()) {
-        if (key !== current) repetitiveEscalation.delete(key);
-      }
+      repetitiveLadder.clearExcept(repetitiveCallState?.fingerprint);
     }
     if (repetitiveCallState && repetitiveCallState.count >= REPETITIVE_CALL_THRESHOLD) {
       checkRepetitiveCall(repetitiveCallState.fingerprint, repetitiveCallState.count, pi, ctx);
@@ -659,14 +688,14 @@ export async function guardToolCall(
   }
 
   // Check repetitive-call blocks (all tools)
-  if (repetitiveEscalation.size > 0) {
+  if (repetitiveLadder.size > 0) {
     // Prefer the fingerprint captured at tool_execution_start (raw args) so the
     // lookup key matches the one used when the block was recorded. Fall back to
     // recomputing from the (possibly coerced) validated input.
     const callFingerprint = pendingToolCalls.get(event.toolCallId)?.fingerprint
       ?? `${event.toolName}:${normalizeToolArgs(event.toolName, event.input)}`;
 
-    const repEntry = repetitiveEscalation.get(callFingerprint);
+    const repEntry = repetitiveLadder.get(callFingerprint);
     if (repEntry && repEntry.level === "block") {
       totalBlocks++;
 
@@ -744,10 +773,10 @@ export function onMessageEnd(
 export function reset(): void {
   pendingToolCalls.clear();
   failureHistory.length = 0;
-  failureEscalation.clear();
+  failureLadder.clear();
   currentTurnIndex = 0;
   repetitiveCallState = null;
-  repetitiveEscalation.clear();
+  repetitiveLadder.clear();
 
   blockedPatterns.clear();
   totalBlocks = 0;
