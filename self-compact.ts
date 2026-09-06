@@ -35,10 +35,10 @@
  * result) would read as an unfulfilled compact request. The `context`
  * handler (onContext) replaces it with a short completion marker once a
  * compaction summary is in context (session file untouched; per-path rules
- * below). When no usable summary is stashed (native /compact, auto
- * threshold, overflow recovery, or a too-short summary),
- * session_before_compact returns undefined and pi uses its native one-shot
- * — compaction always works.
+ * below). When no summary is stashed (native /compact, auto threshold,
+ * overflow recovery), session_before_compact returns undefined and pi uses
+ * its native one-shot. A too-short summary never reaches that path:
+ * compact_request fails the tool call (the model rewrites and re-calls).
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -108,8 +108,8 @@ let nudgeBuffer = NUDGE_BUFFER_DEFAULT;
 /** Nudge threshold (remaining tokens) when pi's automatic compaction is
  *  disabled — no backstop exists to anchor the buffer to, so a fixed
  *  threshold is used. Exposed setting: `compactNudgeDisabledAt` in the same
- *  namespace (default 16k = pi's default reserve). */
-export const NUDGE_DISABLED_AT_DEFAULT = 16_000;
+ *  namespace (default 16384 = pi's default reserve). */
+export const NUDGE_DISABLED_AT_DEFAULT = 16_384;
 let nudgeDisabledAt = NUDGE_DISABLED_AT_DEFAULT;
 
 /** session_start: load the nudge thresholds from settings-ext.json. Invalid
@@ -133,7 +133,8 @@ function clampTokenSetting(value: unknown, current: number): number {
  *  next task still needs the current window. */
 export const SOFT_NUDGE_TOKENS = 100_000;
 
-/** Below this length a stashed summary is rejected (pi's one-shot runs instead). */
+/** Below this length compact_request fails the tool call — the model rewrites the
+ *  checkpoint and re-calls; pi's native one-shot never runs on the tool path. */
 const MIN_SUMMARY_LENGTH = 200;
 
 /** The in-context completion marker that replaces a compact_request exchange
@@ -219,7 +220,7 @@ export function contextTokensFromUsage(usage: {
 /** Remaining-token threshold at which gallop nudges the model to self-compact:
  *  just above pi's automatic threshold (reserveTokens + the configured nudge
  *  buffer) when auto-compact is on, or the configured no-backstop threshold
- *  (default 16k) when it is off (nothing else would fire). */
+ *  (default 16384 = pi's default reserve) when it is off (nothing else would fire). */
 export function nudgeThreshold(settings: PiCompactionSettings = PI_COMPACTION_DEFAULTS): number {
   return settings.enabled ? settings.reserveTokens + nudgeBuffer : nudgeDisabledAt;
 }
@@ -348,7 +349,10 @@ export function appendSelfCompactFileOps(summary: string, fileOps: SelfCompactFi
 /** Checkpoint summary written by the live model (compact_request's `summary` arg,
  *  stashed in the tool's execute). session_before_compact returns it as a custom
  *  CompactionResult so pi skips its one-shot summarizer (a cold prefill of the
- *  flattened conversation). Null → pi's native one-shot. */
+ *  flattened conversation). Null (no compact_request call preceded this
+ *  compaction — user /compact, auto-threshold backstop, overflow recovery) →
+ *  pi's native one-shot; the tool path can never leave a null here (too-short
+ *  summaries fail the tool call). */
 let selfSummary: string | null = null;
 /** A compact was requested during the last run but has not run yet. Set when
  *  compact_request executes ({ continue, nuke } from the tool args). Consumed by the
@@ -876,10 +880,21 @@ ${checkpointFormat(keepRecentTokens)}
       const tooSmall = tooSmallCompactError(usage?.tokens, settings.keepRecentTokens, params?.nuke === true);
       if (tooSmall) throw new Error(tooSmall);
 
-      // Stash the model's checkpoint for session_before_compact. A too-short summary
-      // falls back to pi's native one-shot there, so compaction always works.
+      // Stash the model's checkpoint for session_before_compact. A too-short
+      // summary is FAILED HERE, not stashed as null: the deferred path must
+      // never degrade into pi's native one-shot (a cold prefill of the
+      // flattened conversation — exactly what self-compact exists to avoid).
+      // Same pattern as the minimum-context guard above: the thrown error
+      // becomes the tool result, the run stays alive, and the model rewrites
+      // the checkpoint and calls again.
       const summary = (params?.summary || "").trim();
-      selfSummary = summary.length >= MIN_SUMMARY_LENGTH ? summary : null;
+      if (summary.length < MIN_SUMMARY_LENGTH) {
+        throw new Error(
+          `Checkpoint summary too short (${summary.length} chars; minimum ${MIN_SUMMARY_LENGTH}). ` +
+            "The summary is what survives compaction — write the full checkpoint in the compact_request format and call compact_request again.",
+        );
+      }
+      selfSummary = summary;
 
       // Defer the actual compact to agent_settled (the run ends right after this
       // terminate result). If the run's final usage crossed pi's automatic

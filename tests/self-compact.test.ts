@@ -188,7 +188,7 @@ Test goal: refactor the compaction machinery of the gallop extension.
 2. Update the README and CHANGELOG
 
 ## Critical Context
-- MIN_SUMMARY_LENGTH is 200; shorter summaries fall back to pi's native one-shot.`;
+- MIN_SUMMARY_LENGTH is 200; shorter summaries fail the tool call.`;
 
 describe("self-compact wiring (in-session summary)", () => {
   let pi: any;
@@ -406,14 +406,19 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(result).toBeUndefined();
   });
 
-  it("returns undefined (native one-shot fallback) for a too-short stashed summary", async () => {
-    await callTool({ summary: "too short" });
+  it("fails the tool call for a too-short summary — nothing stashed, no deferred compact, no native fallback", async () => {
+    await expect(callTool({ summary: "too short" })).rejects.toThrow(/Checkpoint summary too short/);
+
+    // The guard threw before stashing — the settle point must not fire a compact.
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+
+    // A compaction with no tool call involved still takes the native one-shot.
     const result = await handlers.get("session_before_compact")(
       { preparation: prep(emptyOps()), signal: new AbortController().signal },
       ctx,
     );
     expect(result).toBeUndefined();
-    compactDone();
   });
 
   it("discards the stashed summary on abort so a later compact doesn't reuse it", async () => {
@@ -650,7 +655,7 @@ describe("context-pressure nudge", () => {
 
   // ── threshold math (unit) ──
 
-  it("defaults (no settings files): enabled, 16k reserve, 20k kept tail → nudges at 18,432 remaining", () => {
+  it("defaults (no settings files): enabled, 16384 reserve, 20k kept tail → nudges at 18,432 remaining", () => {
     expect(readPiCompactionSettings(tmpCwd, missingGlobal())).toEqual({ reserveTokens: 16_384, enabled: true, keepRecentTokens: 20_000 });
     expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(18_432);
   });
@@ -674,13 +679,13 @@ describe("context-pressure nudge", () => {
     expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(32_048);
   });
 
-  it("merges per key with the project file winning; disabled → fixed 16k", () => {
+  it("merges per key with the project file winning; disabled → fixed 16384 (pi's default reserve)", () => {
     writeSettings({ compaction: { reserveTokens: 30_000 } }, "global");
     writeSettings({ compaction: { enabled: false } }, "project");
     // Default global path = the stubbed $HOME (writeSettings' global scope).
     const s = readPiCompactionSettings(tmpCwd);
     expect(s).toEqual({ reserveTokens: 30_000, enabled: false, keepRecentTokens: 20_000 });
-    expect(nudgeThreshold(s)).toBe(16_000);
+    expect(nudgeThreshold(s)).toBe(16_384);
   });
 
   it("treats missing or malformed settings files as pi's defaults", () => {
@@ -691,7 +696,7 @@ describe("context-pressure nudge", () => {
   it("exposes both nudge thresholds as settings (compactNudgeBuffer / compactNudgeDisabledAt)", () => {
     const s = readPiCompactionSettings(tmpCwd, missingGlobal());
     expect(nudgeThreshold(s)).toBe(18_432);              // 16_384 + 2_048
-    expect(nudgeThreshold({ ...s, enabled: false })).toBe(16_000);
+    expect(nudgeThreshold({ ...s, enabled: false })).toBe(16_384);
 
     // Both configurable — valid values take effect
     setNudgeSettings({ compactNudgeBuffer: 8_192, compactNudgeDisabledAt: 20_000 });
@@ -728,7 +733,7 @@ describe("context-pressure nudge", () => {
     expect(nudgeSteers()).toHaveLength(1);
   });
 
-  it("nudges at 16k when auto-compact is disabled", async () => {
+  it("nudges at 16384 (pi's default reserve) when auto-compact is disabled", async () => {
     writeSettings({ compaction: { enabled: false } });
     await endTurn(17_000);
     expect(nudgeSteers()).toHaveLength(0);
@@ -942,8 +947,9 @@ describe("rewriteCompactContext (compact_request exchange → completion marker)
   });
 
   it("rewrites the in-progress result on the native-fallback path, keeping the short-arg call", async () => {
-    // Below MIN_SUMMARY_LENGTH the stashed summary was NOT used — pi's native
-    // one-shot ran. The arg is the model's real short text (a record), but the
+    // A short-arg call followed by a compact result only appears in transcripts
+    // from before short summaries failed the tool call — pi's native one-shot
+    // ran. The arg is the model's real short text (a record), but the
     // result must stop reading as in-progress.
     const short = "too short";
     const result = rewriteCompactContext([compactionSummaryMsg("A native one-shot summary that does not carry the short arg at all."), requestCompactCall(short), compactToolResult()]);

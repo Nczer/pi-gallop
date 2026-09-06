@@ -36,10 +36,11 @@ checkpoint summary itself — the summarization happens inside the live session
 no cold prefill. Gallop stashes the summary and returns it as a custom
 `CompactionResult` in `session_before_compact` (with pi's file-list sections
 appended), so pi skips its one-shot summarizer (which cold-prefills the
-flattened conversation). If no usable summary is stashed (native `/compact`,
-auto threshold, overflow recovery, or a summary under 200 chars) or the user
-aborts, gallop returns `undefined` and pi's native one-shot runs — compaction
-always works.
+flattened conversation). A too-short summary never reaches that path —
+`compact_request` fails the tool call and the model rewrites the checkpoint
+and re-calls (same pattern as the minimum-context guard). If no summary is
+stashed at all (native `/compact`, auto threshold, overflow recovery) or the
+user aborts, gallop returns `undefined` and pi's native one-shot runs.
 
 Tool arguments:
 
@@ -234,7 +235,8 @@ As the context nears its limit, gallop steers the live model to self-compact:
 one advisory steer per compaction cycle (state resets on `session_compact`),
 placed just above pi's automatic threshold — `reserveTokens + the nudge
 buffer` (default 2k → ~18k remaining) when auto-compact is on, or the
-no-backstop threshold (default 16k) when it is off (then no backstop exists,
+no-backstop threshold (default 16384 = pi's default reserve) when it is off
+(then no backstop exists,
 and an overflow would abort the run). The threshold reads pi's compaction
 settings from the global + project `settings.json` (merged per key, project
 wins — same read-only reader shape as the context extension, falling back to

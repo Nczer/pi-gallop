@@ -58,11 +58,11 @@ describe("contextStatusAdvice", () => {
   });
 
   it("names the missing backstop when auto-compact is off", () => {
-    // disabled → fixed 16k threshold
+    // disabled → fixed 16384 threshold
     expect(contextStatusAdvice(15_000, 180_000, { ...DEFAULTS, enabled: false })).toBe(
       "Advice: near the limit and auto-compact is off — call compact_request now if at a pause point.",
     );
-    // disabled → 2× fixed 16k = 32k still counts as pressure building
+    // disabled → 2× 16384 = 32768 still counts as pressure building
     expect(contextStatusAdvice(17_000, 180_000, { ...DEFAULTS, enabled: false })).toContain("pressure building");
     expect(contextStatusAdvice(33_000, 90_000, { ...DEFAULTS, enabled: false })).toBe("Advice: headroom OK.");
   });
@@ -131,7 +131,7 @@ describe("buildContextStatusText", () => {
       { ...DEFAULTS, enabled: false },
     );
     expect(text.split("\n")[1]).toBe(
-      "Thresholds: gallop nudge ~16k remaining · pi auto-compact OFF (no backstop)",
+      "Thresholds: gallop nudge ~16.4k remaining · pi auto-compact OFF (no backstop)",
     );
     expect(text.split("\n")[2]).toContain("auto-compact is off");
   });
