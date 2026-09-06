@@ -18,6 +18,7 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { patchExtSettings } from "./ext-settings";
+import { collapseRepetitiveText } from "./collapse";
 
 let binarySuppressionEnabled = true;
 let readGuardEnabled = true;
@@ -166,19 +167,24 @@ export function guardRead(
 
 /** Output suppression: replace binary bash/read output with a short summary.
  *  Returns the replacement content, or undefined when the result passes
- *  through (not bash/read, disabled, no text, or not binary). */
+/** Output filtering: binary suppression (its own toggle) + repetitive-text
+ *  collapse (its own toggle). Returns the replacement content, or undefined
+ *  when the result passes through (not bash/read, no text, or nothing
+ *  triggered). */
 export function filterToolResult(
   event: { toolName: string; content: unknown; input: unknown },
 ): { content: { type: "text"; text: string }[] } | undefined {
-  // bash: suppress binary command output. read: safety net for binary content
-  // that slipped past the extension guard (misnamed or extension-less files,
-  // unsupported image formats like tiff/heic). Image reads are safe — they
-  // carry only a short printable text note.
+  // Two independent layers, each with its own toggle:
+  //  1. binary suppression — replaces binary command/file output with a
+  //     short summary (read: safety net for binary content that slipped past
+  //     the extension guard — misnamed or extension-less files, unsupported
+  //     image formats like tiff/heic. Image reads are safe — they carry only
+  //     a short printable text note).
+  //  2. repetitive-text collapse — huge text output dominated by repeated
+  //     line shapes (grep over a build tree, repeated log lines).
   const isBash = event.toolName === "bash";
   const isRead = event.toolName === "read";
   if (!isBash && !isRead) return undefined;
-  if (isBash && !binarySuppressionEnabled) return undefined;
-  if (isRead && !readGuardEnabled) return undefined;
 
   const content = event.content;
   if (!Array.isArray(content)) return undefined;
@@ -192,23 +198,40 @@ export function filterToolResult(
 
   if (!fullText.length) return undefined;
 
-  const detection = detectBinaryContent(fullText);
-  if (!detection.binary) return undefined;
+  // Layer 1: binary suppression (gated by its own toggle) takes precedence.
+  const binaryLayerOn = isBash ? binarySuppressionEnabled : readGuardEnabled;
+  if (binaryLayerOn) {
+    const detection = detectBinaryContent(fullText);
+    if (detection.binary) {
+      const summary = buildBinarySuppressionSummary(
+        fullText,
+        detection,
+        isRead
+          ? { kind: "read", path: readPathFromInput(event.input) ?? "<unknown>" }
+          : { kind: "bash", command: (event.input as any)?.command },
+      );
+      return {
+        content: [{
+          type: "text",
+          text: summary,
+        }],
+      };
+    }
+  }
 
-  const summary = buildBinarySuppressionSummary(
-    fullText,
-    detection,
-    isRead
-      ? { kind: "read", path: readPathFromInput(event.input) ?? "<unknown>" }
-      : { kind: "bash", command: (event.input as any)?.command },
-  );
+  // Layer 2: repetitive-text collapse (gated by collapse's own toggle;
+  // returns null when the text passes through).
+  const collapsed = collapseRepetitiveText(fullText);
+  if (collapsed) {
+    return {
+      content: [{
+        type: "text",
+        text: collapsed.text,
+      }],
+    };
+  }
 
-  return {
-    content: [{
-      type: "text",
-      text: summary,
-    }],
-  };
+  return undefined;
 }
 
 /** The suppression summary the model sees instead of the raw bytes — a pure

@@ -22,6 +22,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadExtSettings } from "./ext-settings";
 import * as binary from "./binary";
+import * as collapse from "./collapse";
 import * as intervention from "./intervention";
 import * as selfCompact from "./self-compact";
 import * as stall from "./stall";
@@ -37,6 +38,7 @@ let sawAssistantMessage = false;
 const GALLOP_DEFAULTS = {
   binarySuppression: true,
   readGuard: true,
+  repetitionCollapse: true,
   compactNudgeBuffer: selfCompact.NUDGE_BUFFER_DEFAULT,
   compactNudgeDisabledAt: selfCompact.NUDGE_DISABLED_AT_DEFAULT,
 };
@@ -55,12 +57,14 @@ export default function gallopExtension(pi: ExtensionAPI) {
   intervention.setFullReset(resetAllState);
   selfCompact.registerTools(pi, process.cwd());
   binary.registerCommands(pi);
+  collapse.registerCommand(pi);
 
   // ── Session lifecycle ──
   pi.on("session_start", () => {
     resetAllState();
     const gallopSettings = loadExtSettings("gallop", GALLOP_DEFAULTS);
     binary.setToggles(gallopSettings);
+    collapse.setToggles(gallopSettings);
     selfCompact.setNudgeSettings(gallopSettings);
   });
 

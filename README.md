@@ -25,6 +25,7 @@ Everything else keeps the run alive and the context clean:
 - **Failure-loop, repetitive-call & mismatch detection** — spots stuck command patterns, then a circuit breaker halts the agent
 - **Read guard** — blocks binary files (PDFs, archives, binaries, ...) before they garble the context, with a result-sniffing safety net
 - **Binary output filter** — replaces binary bash output with a readable summary
+- **Repetitive output collapse** — huge text output dominated by repeated line shapes (grep over a build tree, repeated error walls) is collapsed to examples + a count
 
 ## Features
 
@@ -143,6 +144,19 @@ The summary includes:
 - **First 3 and last 5 readable lines** (control chars stripped) so you can verify the command ran correctly
 - Total line count when output exceeds 8 readable lines
 - Toggle with `/gallop-binary [on|off]` (persisted, default on, in the same `~/.pi/agent/settings-ext.json` namespace)
+
+### Repetitive Output Collapse
+
+The binary filter catches garbled bytes; this catches the other context-killer — huge *text* output where a small number of line shapes repeat: grep/find over a build tree (thousands of `file:line: MATCH` lines sharing the matched string), repeated error walls. Pi's truncation still injects ~12k tokens of near-duplicates at that size, and in the field that has wrecked sessions outright (the model stops responding).
+
+Only the disaster band is touched (≥ 80 lines AND ≥ 30KB), and only two conservative shapes trigger it:
+
+- **Exact-line repetition** — the top literal lines cover ≥ 50% of all lines (identical content carries no per-line information)
+- **Long shared region** — most lines share a common region of ≥ ~32 chars (detected via frequent 16-char shingles co-occurring ≥ 16 chars apart in one line). This is what keeps output with a short shared label (timestamp prefix, `npm WARN`) and a unique payload intact — the per-line information is what you came for
+
+On a hit the result becomes head/tail examples + a count + a re-run hint; pi's truncation footer (full-output temp path) is preserved verbatim when present, so the model can still drill in via bash. A final shrink guard (collapse that saves < 50% of the bytes) passes the output through untouched. Binary suppression keeps precedence; the two layers have independent toggles.
+
+- Toggle with `/gallop-collapse [on|off]` (persisted, default on, in the same `~/.pi/agent/settings-ext.json` namespace)
 
 ### Stall Detection
 
