@@ -323,11 +323,12 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "nuke", "summary"]);
     expect(tool.parameters.properties.continue.type).toBe("boolean");
     expect(tool.parameters.properties.nuke.type).toBe("boolean");
-    // The tool description carries the checkpoint format the model must follow
-    // and the nuke bullet (trigger + full-state obligation).
+    // The tool description carries the nuke bullet (trigger + full-state
+    // obligation); the checkpoint format lives on the summary param — the model
+    // reads it while constructing the call.
     expect(tool.description).toContain("nuke: true");
     for (const section of ["## Goal", "## Progress", "## Next Steps", "## Critical Context"]) {
-      expect(tool.description).toContain(section);
+      expect(tool.parameters.properties.summary.description).toContain(section);
     }
   });
 

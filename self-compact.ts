@@ -843,17 +843,15 @@ export function registerTools(pi: ExtensionAPI, cwd: string): void {
     label: "Request Compact",
     description: `Compact context to remove unrelated old context and increase performance while preserving active tasks.
 - Call when: edit keeps failing (broken text matching), a major task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure.
-- Write the checkpoint summary in 'summary', in this exact format:
-
-${checkpointFormat(keepRecentTokens)}
-- 'continue' defaults to true; pass false if there is nothing to follow up
 - Context broken beyond repair (tool calls failing repeatedly): pass nuke: true — the checkpoint must then carry full state, not just older work`,
     parameters: {
       type: "object",
       properties: {
         summary: {
           type: "string",
-          description: "Checkpoint summary of the conversation so far, in the exact format given in the tool description",
+          description: `Checkpoint summary of the conversation so far, in this exact format:
+
+${checkpointFormat(keepRecentTokens)}`,
         },
         continue: {
           type: "boolean",
