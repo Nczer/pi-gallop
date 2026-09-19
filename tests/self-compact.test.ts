@@ -12,6 +12,7 @@ import {
   setNudgeSettings,
   NUDGE_BUFFER_DEFAULT,
   NUDGE_DISABLED_AT_DEFAULT,
+  NUDGE_PCT_DEFAULT,
   checkpointFormat,
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
@@ -608,7 +609,7 @@ describe("context-pressure nudge", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT });
+    setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT, compactNudgePct: NUDGE_PCT_DEFAULT });
     fs.rmSync(tmpHome, { recursive: true, force: true });
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
@@ -656,9 +657,18 @@ describe("context-pressure nudge", () => {
 
   // ── threshold math (unit) ──
 
-  it("defaults (no settings files): enabled, 16384 reserve, 20k kept tail → nudges at 18,432 remaining", () => {
+  it("defaults (no settings files): enabled, 16384 reserve, 20k kept tail → base 18,432 remaining", () => {
     expect(readPiCompactionSettings(tmpCwd, missingGlobal())).toEqual({ reserveTokens: 16_384, enabled: true, keepRecentTokens: 20_000 });
     expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(18_432);
+  });
+
+  it("floors the threshold by the window fraction (default 25%; small windows stay on the base)", () => {
+    const s = readPiCompactionSettings(tmpCwd, missingGlobal());
+    expect(nudgeThreshold(s, 200_000)).toBe(50_000);            // 0.25 × 200k
+    expect(nudgeThreshold(s, 114_688)).toBe(28_672);            // 0.25 × 114_688
+    expect(nudgeThreshold(s, 65_536)).toBe(18_432);             // base holds (0.25 × 65_536 = 16_384)
+    expect(nudgeThreshold(s, 0)).toBe(18_432);                  // no window → fixed base
+    expect(nudgeThreshold({ ...s, enabled: false }, 200_000)).toBe(50_000);
   });
 
   it("follows a custom keepRecentTokens (project wins over global; falls back to 20k)", () => {
@@ -675,9 +685,11 @@ describe("context-pressure nudge", () => {
     expect(checkpointFormat(8_000)).toContain("~8k tokens are kept verbatim");
   });
 
-  it("follows a custom reserveTokens (auto-compact on → reserve + 2k)", () => {
+  it("follows a custom reserveTokens (auto-compact on → reserve + 2k, window floor still applies)", () => {
     writeSettings({ compaction: { reserveTokens: 30_000 } });
     expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()))).toBe(32_048);
+    expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()), 200_000)).toBe(50_000); // window floor wins
+    expect(nudgeThreshold(readPiCompactionSettings(tmpCwd, missingGlobal()), 100_000)).toBe(32_048); // base wins
   });
 
   it("merges per key with the project file winning; disabled → fixed 16384 (pi's default reserve)", () => {
@@ -687,6 +699,8 @@ describe("context-pressure nudge", () => {
     const s = readPiCompactionSettings(tmpCwd);
     expect(s).toEqual({ reserveTokens: 30_000, enabled: false, keepRecentTokens: 20_000 });
     expect(nudgeThreshold(s)).toBe(16_384);
+    expect(nudgeThreshold(s, 65_536)).toBe(16_384);            // 0.25 × 65_536 = 16_384 — floor ties
+    expect(nudgeThreshold(s, 200_000)).toBe(50_000);
   });
 
   it("treats missing or malformed settings files as pi's defaults", () => {
@@ -715,27 +729,58 @@ describe("context-pressure nudge", () => {
     expect(nudgeThreshold({ ...s, enabled: false })).toBe(20_000);
     setNudgeSettings({ compactNudgeDisabledAt: -5 });
     expect(nudgeThreshold({ ...s, enabled: false })).toBe(0);
+
+    // pct (default 0.25) floors the threshold by the window fraction; 0 = fixed
+    // base only (at this point buffer = 0 and disabledAt = 0, from the clamp
+    // assertions above)
+    expect(nudgeThreshold(s, 200_000)).toBe(50_000);
+    expect(nudgeThreshold(s, 65_536)).toBe(16_384);
+    setNudgeSettings({ compactNudgePct: 0 });
+    expect(nudgeThreshold(s, 200_000)).toBe(16_384);
+    expect(nudgeThreshold({ ...s, enabled: false }, 200_000)).toBe(0);
+    // pct clamps to [0, 1]; invalid values keep the previous
+    setNudgeSettings({ compactNudgePct: 0.5 });
+    expect(nudgeThreshold(s, 200_000)).toBe(100_000);
+    setNudgeSettings({ compactNudgePct: "25%" });
+    expect(nudgeThreshold(s, 200_000)).toBe(100_000);
+    setNudgeSettings({ compactNudgePct: 2 });
+    expect(nudgeThreshold(s, 200_000)).toBe(200_000);          // clamped to 1
+    setNudgeSettings({ compactNudgePct: -0.5 });
+    expect(nudgeThreshold(s, 200_000)).toBe(16_384);           // clamped to 0
   });
 
   // ── nudge message path ──
 
-  it("nudges once just above the automatic threshold and does not repeat", async () => {
-    // Default settings: nudge at 18,432 remaining.
-    await endTurn(19_000);
+  it("nudges once at the threshold (scaled to the window) and does not repeat", async () => {
+    // Default settings on a 200k window: threshold max(18_432, 0.25 × 200k) = 50k.
+    await endTurn(51_000);
     expect(nudgeSteers()).toHaveLength(0);
 
-    await endTurn(18_000);
+    await endTurn(49_000);
     expect(nudgeSteers()).toHaveLength(1);
-    expect(nudgeSteers()[0]).toContain("~18k tokens remaining");
+    expect(nudgeSteers()[0]).toContain("~49k tokens remaining");
     expect(nudgeSteers()[0]).toContain("automatic compaction triggers at ~16k");
 
-    // Deeper still — silence, the backstop is just below.
-    await endTurn(15_000);
+    // Deeper still — silence, the backstop is far below.
+    await endTurn(45_000);
     expect(nudgeSteers()).toHaveLength(1);
   });
 
-  it("nudges at 16384 (pi's default reserve) when auto-compact is disabled", async () => {
+  it("nudges at the scaled no-backstop threshold when auto-compact is disabled", async () => {
     writeSettings({ compaction: { enabled: false } });
+    // 200k window: threshold max(16_384, 0.25 × 200k) = 50k
+    await endTurn(51_000);
+    expect(nudgeSteers()).toHaveLength(0);
+
+    await endTurn(49_000);
+    expect(nudgeSteers()).toHaveLength(1);
+    expect(nudgeSteers()[0]).toContain("~49k tokens remaining");
+    expect(nudgeSteers()[0]).toContain("automatic compaction is disabled");
+  });
+
+  it("pct 0 keeps the fixed no-backstop threshold (16384 = pi's default reserve)", async () => {
+    writeSettings({ compaction: { enabled: false } });
+    setNudgeSettings({ compactNudgePct: 0 });
     await endTurn(17_000);
     expect(nudgeSteers()).toHaveLength(0);
 
@@ -746,16 +791,16 @@ describe("context-pressure nudge", () => {
   });
 
   it("resets after a compaction (fresh cycle)", async () => {
-    await endTurn(18_000);
+    await endTurn(49_000);
     await resetState();
-    await endTurn(15_000);
+    await endTurn(45_000);
     expect(nudgeSteers()).toHaveLength(2);
   });
 
   it("session_start loads the nudge settings from settings-ext.json (real load path)", async () => {
     const extPath = path.join(tmpHome, ".pi", "agent", "settings-ext.json");
     fs.mkdirSync(path.dirname(extPath), { recursive: true });
-    fs.writeFileSync(extPath, JSON.stringify({ gallop: { compactNudgeBuffer: 40_960, compactNudgeDisabledAt: 6_000 } }));
+    fs.writeFileSync(extPath, JSON.stringify({ gallop: { compactNudgeBuffer: 40_960, compactNudgeDisabledAt: 6_000, compactNudgePct: 0.1 } }));
     await handlers.get("session_start")(null, ctx);
 
     // Enabled branch: 16_384 + 40_960 = 57_344 — the default buffer (18_432) would not have nudged at 55k
@@ -765,15 +810,16 @@ describe("context-pressure nudge", () => {
     expect(nudgeSteers()).toHaveLength(1);
     expect(nudgeSteers()[0]).toContain("~55k tokens remaining");
 
-    // Disabled branch: custom no-backstop threshold 6k (fresh cycle; settings
-    // survive the session_compact reset — they only reload at session_start)
+    // Disabled branch: max(6k floor, 0.1 × 200k) = 20k — proves the pct loaded
+    // (fresh cycle; settings survive the session_compact reset — they only
+    // reload at session_start)
     await resetState();
     writeSettings({ compaction: { enabled: false } });
-    await endTurn(7_000);
+    await endTurn(21_000);
     expect(nudgeSteers()).toHaveLength(1);
-    await endTurn(5_000);
+    await endTurn(19_000);
     expect(nudgeSteers()).toHaveLength(2);
-    expect(nudgeSteers()[1]).toContain("~5k tokens remaining");
+    expect(nudgeSteers()[1]).toContain("~19k tokens remaining");
     expect(nudgeSteers()[1]).toContain("automatic compaction is disabled");
   });
 

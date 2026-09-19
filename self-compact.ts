@@ -112,19 +112,36 @@ let nudgeBuffer = NUDGE_BUFFER_DEFAULT;
 export const NUDGE_DISABLED_AT_DEFAULT = 16_384;
 let nudgeDisabledAt = NUDGE_DISABLED_AT_DEFAULT;
 
+/** Fraction of the context window that FLOORS the nudge threshold (the
+ *  effective threshold is max(configured base, pct × window)). A fixed token
+ *  count is a late nudge on large windows — one big tool result or a batched
+ *  read turn can burn 16k+ tokens, so on a 114k+ window the context can run
+ *  out before the model reaches a pause point to compact. Default 0.25: 16384
+ *  is exactly 25% of a 64k window, so "floor + 25%" generalizes pi's default
+ *  margin (the floor holds on small windows — zero behavior change there).
+ *  Exposed setting: `compactNudgePct` in the same namespace; 0 = fixed base
+ *  only (the pre-scaling behavior). */
+export const NUDGE_PCT_DEFAULT = 0.25;
+let nudgePct = NUDGE_PCT_DEFAULT;
+
 /** session_start: load the nudge thresholds from settings-ext.json. Invalid
  *  values (missing / non-number / non-finite) keep the previous value;
  *  negatives clamp to 0 (a negative buffer would put the nudge at or behind
- *  the backstop). */
+ *  the backstop); pct clamps to [0, 1]. */
 export function setNudgeSettings(
-  settings: { compactNudgeBuffer?: unknown; compactNudgeDisabledAt?: unknown } = {},
+  settings: { compactNudgeBuffer?: unknown; compactNudgeDisabledAt?: unknown; compactNudgePct?: unknown } = {},
 ): void {
   nudgeBuffer = clampTokenSetting(settings.compactNudgeBuffer, nudgeBuffer);
   nudgeDisabledAt = clampTokenSetting(settings.compactNudgeDisabledAt, nudgeDisabledAt);
+  nudgePct = clampPctSetting(settings.compactNudgePct, nudgePct);
 }
 
 function clampTokenSetting(value: unknown, current: number): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.round(value)) : current;
+}
+
+function clampPctSetting(value: unknown, current: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : current;
 }
 
 /** Context size (tokens used) beyond which context_status suggests a
@@ -218,11 +235,21 @@ export function contextTokensFromUsage(usage: {
 }
 
 /** Remaining-token threshold at which gallop nudges the model to self-compact:
- *  just above pi's automatic threshold (reserveTokens + the configured nudge
- *  buffer) when auto-compact is on, or the configured no-backstop threshold
- *  (default 16384 = pi's default reserve) when it is off (nothing else would fire). */
-export function nudgeThreshold(settings: PiCompactionSettings = PI_COMPACTION_DEFAULTS): number {
-  return settings.enabled ? settings.reserveTokens + nudgeBuffer : nudgeDisabledAt;
+ *  the configured base — just above pi's automatic threshold (reserveTokens +
+ *  the configured nudge buffer) when auto-compact is on, or the configured
+ *  no-backstop threshold (default 16384 = pi's default reserve) when it is off
+ *  (nothing else would fire) — FLOORED by the configured fraction of the
+ *  context window. On large windows a fixed token count is a late nudge (one
+ *  big tool result or a batched read turn can burn more than the margin before
+ *  the model reaches a pause point), so the margin scales with the window;
+ *  the floor keeps small windows on the configured value. contextWindow <= 0
+ *  (no model / unknown window) → the fixed base. */
+export function nudgeThreshold(
+  settings: PiCompactionSettings = PI_COMPACTION_DEFAULTS,
+  contextWindow: number = 0,
+): number {
+  const base = settings.enabled ? settings.reserveTokens + nudgeBuffer : nudgeDisabledAt;
+  return contextWindow > 0 ? Math.max(base, Math.round(nudgePct * contextWindow)) : base;
 }
 
 /** Format a token count for the LLM: 950 → "950", 1200 → "1.2k", 200000 → "200k". */
@@ -237,9 +264,16 @@ export function formatTokenCount(n: number): string {
  *  recommendation, not raw math to interpret. Tiers: > 2× threshold → headroom
  *  OK; (threshold, 2×] → pressure building; ≤ threshold → near the backstop.
  *  A large context (> SOFT_NUDGE_TOKENS used) with otherwise-OK headroom gets
- *  a suggestion-only compact hint instead of "headroom OK". */
-export function contextStatusAdvice(remaining: number, tokens: number, settings: PiCompactionSettings): string {
-  const threshold = nudgeThreshold(settings);
+ *  a suggestion-only compact hint instead of "headroom OK". contextWindow
+ *  (default 0 = fixed base) scales the threshold with the window like the
+ *  nudge does. */
+export function contextStatusAdvice(
+  remaining: number,
+  tokens: number,
+  settings: PiCompactionSettings,
+  contextWindow: number = 0,
+): string {
+  const threshold = nudgeThreshold(settings, contextWindow);
   if (remaining <= threshold) {
     return settings.enabled
       ? "Advice: near the backstop — call compact_request now if at a pause point."
@@ -277,14 +311,14 @@ export function buildContextStatusText(
   ];
   if (settings.enabled) {
     lines.push(
-      `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings))} remaining · pi auto-compact ~${formatTokenCount(settings.reserveTokens)} remaining`,
+      `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings, usage.contextWindow))} remaining · pi auto-compact ~${formatTokenCount(settings.reserveTokens)} remaining`,
     );
   } else {
     lines.push(
-      `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings))} remaining · pi auto-compact OFF (no backstop)`,
+      `Thresholds: gallop nudge ~${formatTokenCount(nudgeThreshold(settings, usage.contextWindow))} remaining · pi auto-compact OFF (no backstop)`,
     );
   }
-  lines.push(contextStatusAdvice(remaining, usage.tokens, settings));
+  lines.push(contextStatusAdvice(remaining, usage.tokens, settings, usage.contextWindow));
   return lines.join("\n");
 }
 
@@ -389,9 +423,10 @@ let compactionInFlight = false;
  *  post-compaction re-trigger window. */
 let compactionRunning = false;
 /** Context-pressure nudge state, one nudge per compaction cycle. "idle" →
- *  advisory nudge just above pi's automatic threshold (reserveTokens + the
- *  configured nudge buffer, or the configured no-backstop threshold when
- *  auto-compact is disabled); "nudged" →
+ *  advisory nudge at the configured threshold (just above pi's automatic
+ *  threshold — reserveTokens + the configured nudge buffer — or the
+ *  configured no-backstop threshold when auto-compact is disabled), floored
+ *  by the configured fraction of the context window; "nudged" →
  *  silence — pi's automatic compaction is the backstop (or nothing, if it is
  *  disabled). Reset on every compaction and session reset. */
 let contextNudgeState: "idle" | "nudged" = "idle";
@@ -490,11 +525,14 @@ export function noteUserTurn(): void {
 }
 
 /** message_end (assistant): the context-pressure nudge — one advisory steer
- *  per compaction cycle, just above pi's automatic threshold (or at a fixed
- *  configured no-backstop threshold when auto-compact is disabled — then no
- *  backstop exists). A compliant
- *  model compacts cache-warm before the native backstop takes over; after the
- *  nudge, silence — the backstop (or overflow) decides. Like the old per-turn
+ *  per compaction cycle, at the configured threshold (just above pi's
+ *  automatic threshold, or the configured no-backstop threshold when
+ *  auto-compact is disabled — then no backstop exists), floored by the
+ *  configured fraction of the context window: on a large window a fixed token
+ *  margin is a late nudge (a single big tool result can burn it before the
+ *  model reaches a pause point), so the margin scales with the window. A
+ *  compliant model compacts cache-warm before the native backstop takes over;
+ *  after the nudge, silence — the backstop (or overflow) decides. Like the old per-turn
  *  context-usage injection (removed in v1.3 as ambient noise), this rides the
  *  session's cached prompt prefix — but it fires at most once per compaction
  *  cycle. compact_request triggers nothing here: pi emits message_end BEFORE
@@ -528,7 +566,7 @@ export function onMessageEnd(
   const remaining = window - tokens;
 
   const settings = readPiCompactionSettings(ctx.cwd);
-  if (remaining > nudgeThreshold(settings)) return;
+  if (remaining > nudgeThreshold(settings, window)) return;
   if (contextNudgeState === "nudged") return;    // one nudge per compaction cycle
   contextNudgeState = "nudged";
 
@@ -536,12 +574,12 @@ export function onMessageEnd(
   if (settings.enabled) {
     const m = Math.max(1, Math.round(settings.reserveTokens / 1000));
     pi.sendUserMessage(
-      `[Gallop] Context is nearly full (~${k}k tokens remaining; pi's automatic compaction triggers at ~${m}k). If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now so the summary stays cache-warm.`,
+      `[Gallop] Context is running low (~${k}k tokens remaining; pi's automatic compaction triggers at ~${m}k). If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now so the summary stays cache-warm.`,
       { deliverAs: "steer" },
     );
   } else {
     pi.sendUserMessage(
-      `[Gallop] Context is nearly full (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now — a context overflow would otherwise abort the run.`,
+      `[Gallop] Context is running low (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now — a context overflow would otherwise abort the run.`,
       { deliverAs: "steer" },
     );
   }

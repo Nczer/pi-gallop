@@ -81,6 +81,17 @@ describe("contextStatusAdvice", () => {
     expect(contextStatusAdvice(15_000, 190_000, s)).toContain("pressure building");
     expect(contextStatusAdvice(20_097, 90_000, s)).toBe("Advice: headroom OK.");
   });
+
+  it("scales the tiers with the context window (default pct 0.25)", () => {
+    // 114_688 window: threshold max(18_432, 0.25 × 114_688) = 28_672; 2× = 57_344
+    expect(contextStatusAdvice(28_672, 86_016, DEFAULTS, 114_688)).toContain("near the backstop");
+    expect(contextStatusAdvice(50_000, 64_688, DEFAULTS, 114_688)).toContain("pressure building");
+    expect(contextStatusAdvice(60_000, 54_688, DEFAULTS, 114_688)).toBe("Advice: headroom OK.");
+    // disabled: threshold max(16_384, 28_672) = 28_672
+    expect(contextStatusAdvice(20_000, 94_688, { ...DEFAULTS, enabled: false }, 114_688)).toContain(
+      "near the limit and auto-compact is off",
+    );
+  });
 });
 
 // ── buildContextStatusText ──
@@ -94,9 +105,10 @@ describe("buildContextStatusText", () => {
     const lines = text.split("\n");
     expect(lines).toHaveLength(3);
     expect(lines[0]).toBe("142.3k / 200k tokens (71.2%) — 57.7k remaining");
-    expect(lines[1]).toBe("Thresholds: gallop nudge ~18.4k remaining · pi auto-compact ~16.4k remaining");
+    // 200k window: threshold max(18_432, 0.25 × 200k) = 50k → 57.7k remaining is in the 2× band
+    expect(lines[1]).toBe("Thresholds: gallop nudge ~50k remaining · pi auto-compact ~16.4k remaining");
     expect(lines[2]).toBe(
-      "Advice: large context (~142.3k used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call compact_request at this boundary.",
+      "Advice: pressure building — if a large batch of reads or images is ahead, call compact_request at this boundary first.",
     );
   });
 
@@ -131,7 +143,7 @@ describe("buildContextStatusText", () => {
       { ...DEFAULTS, enabled: false },
     );
     expect(text.split("\n")[1]).toBe(
-      "Thresholds: gallop nudge ~16.4k remaining · pi auto-compact OFF (no backstop)",
+      "Thresholds: gallop nudge ~50k remaining · pi auto-compact OFF (no backstop)",
     );
     expect(text.split("\n")[2]).toContain("auto-compact is off");
   });
@@ -153,13 +165,14 @@ describe("buildContextStatusText", () => {
       expect(contextStatusAdvice(30_000, 90_000, DEFAULTS)).toContain("pressure building");
       expect(contextStatusAdvice(50_000, 40_000, DEFAULTS)).toBe("Advice: headroom OK.");
       const on = buildContextStatusText({ tokens: 142_300, contextWindow: WINDOW, percent: 71.2 }, DEFAULTS);
-      expect(on.split("\n")[1]).toBe("Thresholds: gallop nudge ~24.6k remaining · pi auto-compact ~16.4k remaining");
-      // disabled: no-backstop threshold 20k
+      // window floor (0.25 × 200k = 50k) wins over the configured base 24_576
+      expect(on.split("\n")[1]).toBe("Thresholds: gallop nudge ~50k remaining · pi auto-compact ~16.4k remaining");
+      // disabled: window floor wins over the no-backstop threshold 20k
       const off = buildContextStatusText(
         { tokens: 185_000, contextWindow: WINDOW, percent: 92.5 },
         { ...DEFAULTS, enabled: false },
       );
-      expect(off.split("\n")[1]).toBe("Thresholds: gallop nudge ~20k remaining · pi auto-compact OFF (no backstop)");
+      expect(off.split("\n")[1]).toBe("Thresholds: gallop nudge ~50k remaining · pi auto-compact OFF (no backstop)");
     } finally {
       setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT });
     }
@@ -226,9 +239,9 @@ describe("context_status tool (integration)", () => {
     expect(result.terminate).toBeUndefined();
     const lines = result.content[0].text.split("\n");
     expect(lines[0]).toBe("142.3k / 200k tokens (71.2%) — 57.7k remaining");
-    expect(lines[1]).toContain("gallop nudge ~18.4k");
+    expect(lines[1]).toContain("gallop nudge ~50k");
     expect(lines[1]).toContain("pi auto-compact ~16.4k");
-    expect(lines[2]).toContain("large context (~142.3k used)");
+    expect(lines[2]).toContain("pressure building");
   });
 
   it("reports the just-compacted window when pi's usage is null", async () => {

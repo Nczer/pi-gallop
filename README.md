@@ -245,26 +245,32 @@ Detects when the LLM acknowledges an error in its thinking but then calls the sa
 
 ### Context-pressure nudge
 
-As the context nears its limit, gallop steers the live model to self-compact:
+As the context runs low, gallop steers the live model to self-compact:
 one advisory steer per compaction cycle (state resets on `session_compact`),
-placed just above pi's automatic threshold — `reserveTokens + the nudge
-buffer` (default 2k → ~18k remaining) when auto-compact is on, or the
-no-backstop threshold (default 16384 = pi's default reserve) when it is off
-(then no backstop exists,
-and an overflow would abort the run). The threshold reads pi's compaction
-settings from the global + project `settings.json` (merged per key, project
-wins — same read-only reader shape as the context extension, falling back to
-pi's defaults), so it tracks a custom `reserveTokens` and stays proportionate
-on small context windows (e.g. 64k).
+at the configured threshold — `reserveTokens + the nudge buffer` (default
+2k → ~18k remaining) when auto-compact is on, or the no-backstop threshold
+(default 16384 = pi's default reserve) when it is off (then no backstop
+exists, and an overflow would abort the run) — **floored by 25% of the
+model's context window** (default). 16384 is exactly 25% of a 64k window, so
+small windows stay on the configured value (zero behavior change) while the
+margin scales up on large ones. The floor matters there: a fixed token count
+is a late nudge — one big tool result or a batched read turn can burn 16k+
+tokens, so on a 114k+ window the context runs out before the model reaches a
+pause point to compact. The threshold reads pi's compaction settings from the
+global + project `settings.json` (merged per key, project wins — same
+read-only reader shape as the context extension, falling back to pi's
+defaults), so it tracks a custom `reserveTokens`.
 
-Both thresholds are exposed settings in the `gallop` namespace of
+The thresholds are exposed settings in the `gallop` namespace of
 `~/.pi/agent/settings-ext.json` (loaded on `session_start`; a changed value
 takes effect on the next /reload or new session): `compactNudgeBuffer`
 (tokens, default 2048) — the warning margin above the backstop; widen it to
 compact earlier with more headroom, set it to 0 to let the backstop decide —
-and `compactNudgeDisabledAt` (tokens, default 16000) — the nudge threshold
-when auto-compact is off (no backstop to anchor a buffer to).
-`context_status`'s threshold line and advice tiers track both automatically. After the nudge, silence —
+`compactNudgeDisabledAt` (tokens, default 16384) — the nudge threshold when
+auto-compact is off (no backstop to anchor a buffer to) — and
+`compactNudgePct` (fraction 0–1, default 0.25) — the window floor on both
+bases; set it to 0 for the fixed-only behavior.
+`context_status`'s threshold line and advice tiers track all three automatically. After the nudge, silence —
 pi's automatic compaction (which also drives overflow recovery, so it stays
 enabled as the backstop) decides. No nudge while a compact is pending or in
 flight — including an en-route one whose `compact_request` call sits in the

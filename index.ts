@@ -41,6 +41,7 @@ const GALLOP_DEFAULTS = {
   repetitionCollapse: true,
   compactNudgeBuffer: selfCompact.NUDGE_BUFFER_DEFAULT,
   compactNudgeDisabledAt: selfCompact.NUDGE_DISABLED_AT_DEFAULT,
+  compactNudgePct: selfCompact.NUDGE_PCT_DEFAULT,
 };
 
 /** Reset all gallop state. Called on session start and compaction (and via
