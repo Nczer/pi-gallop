@@ -56,6 +56,7 @@ import { findCutPoint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { compactRequestRenderers, contextStatusRenderers } from "./render";
 import { halted as interventionHalted } from "./intervention";
+import { buildEvidenceBlocks, type EvidenceBlocks } from "./evidence";
 
 // ── Pi's compaction settings ──
 
@@ -136,6 +137,24 @@ export function setNudgeSettings(
   nudgePct = clampPctSetting(settings.compactNudgePct, nudgePct);
 }
 
+/** Default for `compactKeepRecentTokens` — pi's own default, so unset means
+ *  zero behavior change. */
+export const KEEP_RECENT_TOKENS_DEFAULT = 20_000;
+
+/** The keep window gallop's self-compaction keeps — the extension's own
+ *  `compactKeepRecentTokens` (settings-ext), NOT pi's compaction.keepRecent
+ *  Tokens: the tail size is part of gallop's compaction design, so the
+ *  extension owns it (and rollback is one setting flip). Named by the
+ *  checkpoint format and enforced by the minimum-context guard. */
+let keepRecentTokens = KEEP_RECENT_TOKENS_DEFAULT;
+
+/** session_start: load the keep window from settings-ext.json. Invalid
+ *  values (non-number, non-finite, ≤ 0) keep the previous. */
+export function setKeepRecentTokens(settings: { compactKeepRecentTokens?: unknown } = {}): void {
+  const v = settings.compactKeepRecentTokens;
+  keepRecentTokens = typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.round(v) : keepRecentTokens;
+}
+
 function clampTokenSetting(value: unknown, current: number): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.round(value)) : current;
 }
@@ -165,10 +184,10 @@ export const COMPACT_DONE_MARKER =
 
 /** Checkpoint summary format — the exact format the model must use, carried
  *  by the compact_request tool description (system prompt). The kept-tail
- *  line is parameterized: pi's compaction.keepRecentTokens (default 20k) is
- *  user-configurable, and the guidance must match what pi will actually keep
- *  verbatim. */
-export function checkpointFormat(keepRecentTokens: number = PI_COMPACTION_DEFAULTS.keepRecentTokens): string {
+ *  line is parameterized: the extension's compactKeepRecentTokens (default
+ *  20k) is user-configurable, and the guidance must match what the compact
+ *  will actually keep verbatim. */
+export function checkpointFormat(keepRecentTokens: number = KEEP_RECENT_TOKENS_DEFAULT): string {
   return `## Goal
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
@@ -322,12 +341,13 @@ export function buildContextStatusText(
   return lines.join("\n");
 }
 
-/** Minimum-context guard for compact_request. pi's compact keeps the most recent
- *  configuredKeep (compaction.keepRecentTokens, default 20k) verbatim and summarizes
- *  everything older; when the whole context fits in that window pi's prepareCompaction
- *  bails out (returns undefined) and the compact fails — including a nuke, which pi
- *  evaluates with the CONFIGURED window, before any extension hook runs. Returns the
- *  error message to fail the tool call with, or null when the call may proceed.
+/** Minimum-context guard for compact_request. The compact keeps the most
+ *  recent configuredKeep (gallop's compactKeepRecentTokens, default 20k) verbatim
+ *  and summarizes everything older; when the whole context fits in that window
+ *  pi's prepareCompaction bails out (returns undefined) and the compact fails —
+ *  including a nuke, which pi evaluates with the CONFIGURED window, before any
+ *  extension hook runs. Returns the error message to fail the tool call with,
+ *  or null when the call may proceed.
  *  tokens === null (the window right after a compaction, before the next assistant
  *  response carries usage) is unmeasurable → proceed and let pi decide. */
 export function tooSmallCompactError(
@@ -418,6 +438,10 @@ let stashedRedeliveryTimer: ReturnType<typeof setTimeout> | undefined;
  *  this stops a redundant second ctx.compact() (and its continue message) in the
  *  window before the next user turn. */
 let compactionInFlight = false;
+
+/** Post-compaction evidence blocks built in onBeforeCompact, delivered from
+ *  onCompacted only when the compact succeeded (null = none / failed). */
+let pendingBlocks: EvidenceBlocks | null = null;
 /** True while a ctx.compact() call is actually executing (from trigger to
  *  session_compact / onError). Distinguishes "compact running" from the
  *  post-compaction re-trigger window. */
@@ -653,17 +677,35 @@ export function onBeforeCompact(
     const summary = selfSummary;
     selfSummary = null;
     if (!summary || summary.length < MIN_SUMMARY_LENGTH) return undefined;
-    // Nuke (compact_request's `nuke`): pi computed preparation with its configured
-    // keep window — recompute the cut point with budget 0 (the same findCutPoint
-    // walker pi's prepareCompaction uses), keeping only the last turn's tail, and
-    // return the custom firstKeptEntryId; pi uses it verbatim. Applies to any
-    // trigger that consumes the stashed summary (the deferred manual path, or the
-    // automatic threshold compact that won the race). Falls back to pi's cut when
-    // no usable custom cut exists.
+    // Cut point: pi computed preparation with ITS configured keep window —
+    // gallop keeps its own (compactKeepRecentTokens, settings-ext; the tail
+    // size is part of gallop's compaction design, so the extension owns it).
+    // When gallop's window differs from pi's — or nuke (budget 0: keep only
+    // the last turn's tail) — recompute the cut with the same findCutPoint
+    // walker pi's prepareCompaction uses and return the custom
+    // firstKeptEntryId; pi uses it verbatim. Equal to pi's window → pi's cut
+    // as-is (zero divergence at the default). Applies to any trigger that
+    // consumes the stashed summary (the deferred manual path, or the
+    // automatic threshold compact that won the race). Falls back to pi's cut
+    // when no usable custom cut exists.
     let firstKeptEntryId = event.preparation.firstKeptEntryId;
-    if (pendingCompact?.nuke === true) {
-      const custom = computeCustomFirstKeptEntryId(event.branchEntries, 0);
+    const nuke = pendingCompact?.nuke === true;
+    const piKeep = readPiCompactionSettings(ctx.cwd).keepRecentTokens;
+    if (nuke || keepRecentTokens !== piKeep) {
+      const custom = computeCustomFirstKeptEntryId(event.branchEntries, nuke ? 0 : keepRecentTokens);
       if (custom) firstKeptEntryId = custom;
+    }
+    // Evidence package: the covered span and the final cut are both known
+    // here — build the blocks now, deliver from onCompacted only on success
+    // (a failed compact must not emit dangling blocks).
+    try {
+      pendingBlocks = buildEvidenceBlocks(
+        event.branchEntries,
+        firstKeptEntryId,
+        ctx.sessionManager?.getSessionFile?.() ?? null,
+      );
+    } catch {
+      pendingBlocks = null; // fail-open: never block compaction
     }
     return {
       compaction: {
@@ -830,9 +872,32 @@ export function onCompacted(ctx: ExtensionContext): { continueAfter: boolean; st
   // continuation — the generic proceed steer is skipped (the manual path's
   // onComplete is suppressed via stashedRedeliveryPending).
   const stashed = stashedInputs;
+  const blocks = pendingBlocks;
   pendingCompact = null;
+  pendingBlocks = null;
   stashedInputs = [];
-  return { continueAfter, stashed };
+  return { continueAfter, stashed, blocks };
+}
+
+/** Deliver the evidence blocks a beat after compaction — same delay
+ *  rationale as the stashed redelivery: session_compact fires while pi's
+ *  compaction-in-progress flag is still set, and prompt() refuses to submit
+ *  during compaction. Scheduled before the continue steer / stashed
+ *  redelivery so the blocks are in context before the next turn starts. */
+export function scheduleEvidenceBlocks(blocks: EvidenceBlocks, pi: ExtensionAPI): void {
+  setTimeout(() => {
+    for (const [customType, content] of [
+      ["gallop-protected", blocks.protected],
+      ["gallop-evidence", blocks.evidence],
+    ] as const) {
+      if (!content) continue;
+      try {
+        pi.sendMessage({ customType, content, display: false }, { triggerTurn: false });
+      } catch {
+        // fail-open: the blocks are a fidelity aid, never a blocker
+      }
+    }
+  }, 200);
 }
 
 /** session_compact_failed: the compact did not run — deliver the swallowed
@@ -840,6 +905,7 @@ export function onCompacted(ctx: ExtensionContext): { continueAfter: boolean; st
  *  dropping them would lose user input). Safe to submit now: pi clears its
  *  compaction-in-progress flag before emitting this event. */
 export function onCompactFailed(pi: ExtensionAPI): void {
+  pendingBlocks = null; // failed compact: no dangling blocks
   const stashed = stashedInputs;
   stashedInputs = [];
   if (stashed.length > 0) sendStashed(stashed, pi);
@@ -854,6 +920,7 @@ export function onCompactFailed(pi: ExtensionAPI): void {
 export function reset(): void {
   selfSummary = null;
   pendingCompact = null;
+  pendingBlocks = null;
   stashedInputs = [];
   stashedRedeliveryPending = false;
   if (stashedRedeliveryTimer) {
@@ -865,17 +932,15 @@ export function reset(): void {
 
 // ── Tool registration ──
 
-/** Register compact_request and context_status. `cwd` is used for the
- *  registration-time keepRecentTokens read: the extension factory gets no
- *  session ctx, so a normal pi launch's session cwd is process.cwd() — a
+/** Register compact_request and context_status. `registeredKeepTokens` is
+ *  the extension's keep window (compactKeepRecentTokens) read at load time —
+ *  the checkpoint guidance must name the tail the compact actually keeps; a
  *  changed value takes effect on the next /reload, like the rest of the
- *  extension's load-time state. The nudge and both tools still read
- *  ctx.cwd live per use. */
-export function registerTools(pi: ExtensionAPI, cwd: string): void {
-  // The checkpoint guidance must name the tail pi actually keeps: the user
-  // may customize compaction.keepRecentTokens (default 20k).
-  const keepRecentTokens = readPiCompactionSettings(cwd).keepRecentTokens;
-
+ *  extension's load-time state. The nudge, the minimum-context guard, and the
+ *  cut override read the module state live per use (the parameter name must
+ *  NOT shadow the module state — the tool's execute closure resolves
+ *  identifiers from this scope). */
+export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): void {
   pi.registerTool({
     name: "compact_request",
     label: "Request Compact",
@@ -889,7 +954,7 @@ export function registerTools(pi: ExtensionAPI, cwd: string): void {
           type: "string",
           description: `Checkpoint summary of the conversation so far, in this exact format:
 
-${checkpointFormat(keepRecentTokens)}`,
+${checkpointFormat(registeredKeepTokens)}`,
         },
         continue: {
           type: "boolean",
@@ -909,11 +974,11 @@ ${checkpointFormat(keepRecentTokens)}`,
       // window, never 0). Fail the tool call instead: the thrown error becomes the
       // tool result the model sees, and because the guard runs before anything is
       // stashed, no pending state exists and the deferred compact never fires. Usage
-      // is pi's own last-usage-anchored estimate (same as the automatic threshold
-      // check); the keep window is read live, like context_status.
-      const settings = readPiCompactionSettings(ctx.cwd);
+      // is pi's own last-usage-anchored estimate (same as the automatic
+      // threshold check); the keep window is gallop's own compactKeepRecent
+      // Tokens (module state, live).
       const usage = ctx.getContextUsage();
-      const tooSmall = tooSmallCompactError(usage?.tokens, settings.keepRecentTokens, params?.nuke === true);
+      const tooSmall = tooSmallCompactError(usage?.tokens, keepRecentTokens, params?.nuke === true);
       if (tooSmall) throw new Error(tooSmall);
 
       // Stash the model's checkpoint for session_before_compact. A too-short

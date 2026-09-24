@@ -18,6 +18,8 @@ import {
   computeCustomFirstKeptEntryId,
   COMPACT_DONE_MARKER,
   rewriteCompactContext,
+  setKeepRecentTokens,
+  KEEP_RECENT_TOKENS_DEFAULT,
 } from "../self-compact";
 
 // ── computeSelfCompactFileLists ──
@@ -158,6 +160,7 @@ function makeMockPi() {
     registerTool: vi.fn((tool: any) => { tools.set(tool.name, tool); }),
     registerCommand: vi.fn(),
     sendUserMessage: vi.fn(),
+    sendMessage: vi.fn(),
     appendEntry: vi.fn(),
   };
   return { pi, handlers, tools };
@@ -196,14 +199,23 @@ describe("self-compact wiring (in-session summary)", () => {
   let handlers: Map<string, any>;
   let tools: Map<string, any>;
   let ctx: any;
+  let tmpHome: string;
+  let tmpCwd: string;
 
   beforeEach(() => {
+    // Isolate both settings reads — settings-ext.json (the gallop namespace,
+    // loaded at factory time) and pi's global settings.json (the pi-keep
+    // window the cut override compares against) — so real user values never
+    // leak into the tests.
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-wiring-home-"));
+    tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-wiring-cwd-"));
+    vi.stubEnv("HOME", tmpHome);
     ({ pi, handlers, tools } = makeMockPi());
     gallopExtension(pi);
     ctx = {
       compact: vi.fn(),
       hasUI: false,
-      cwd: "/tmp/gallop-test",
+      cwd: tmpCwd,
       // Comfortably above the default 20k keep window so the minimum-context
       // guard stays out of the way (tests that exercise it override this).
       getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: 200_000, percent: 25 })),
@@ -219,6 +231,13 @@ describe("self-compact wiring (in-session summary)", () => {
     // the re-trigger window) — clear it via the real new-turn boundary.
     void handlers.get("session_compact")(null, { hasUI: false });
     void handlers.get("message_start")({ message: { role: "user" } }, ctx);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    setKeepRecentTokens({ compactKeepRecentTokens: KEEP_RECENT_TOKENS_DEFAULT });
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
   /** Run settles — the deferred compact trigger point (after pi's post-run loop). */
@@ -375,7 +394,9 @@ describe("self-compact wiring (in-session summary)", () => {
     compactDone();
   });
 
-  it("keeps pi's own cut when nuke is not set", async () => {
+  it("keeps pi's own cut when nuke is not set and the windows match", async () => {
+    // No settings-ext override → the extension window equals pi's configured
+    // window → zero divergence, pi's cut as-is.
     await callTool({ summary: LONG_SUMMARY });
 
     const result = await handlers.get("session_before_compact")(
@@ -439,6 +460,186 @@ describe("self-compact wiring (in-session summary)", () => {
       ctx,
     );
     expect(second).toBeUndefined();
+    compactDone();
+  });
+
+  // ── Keep window (compactKeepRecentTokens, extension-owned) ──
+
+  /** Write the gallop namespace into the (stubbed) settings-ext.json and fire
+   *  the session_start handler that loads it into module state. */
+  const startSessionWithKeep = (compactKeepRecentTokens: unknown) => {
+    const dir = path.join(tmpHome, ".pi", "agent");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "settings-ext.json"),
+      JSON.stringify({ gallop: { compactKeepRecentTokens } }),
+    );
+    handlers.get("session_start")();
+  };
+
+  it("the minimum-context guard uses the extension keep window, not pi's", async () => {
+    startSessionWithKeep(8_000);
+
+    // 10k would fail the default 20k window — under the 8k window it proceeds.
+    ctx.getContextUsage.mockReturnValue({ tokens: 10_000, contextWindow: 200_000, percent: 5 });
+    const result = await callTool({ summary: LONG_SUMMARY });
+    expect(result.terminate).toBe(true);
+    await settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+
+    // Below the 8k window it still fails.
+    await handlers.get("message_start")({ message: { role: "user" } }, ctx);
+    ctx.compact.mockClear();
+    ctx.getContextUsage.mockReturnValue({ tokens: 5_000, contextWindow: 200_000, percent: 2.5 });
+    await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("an invalid compactKeepRecentTokens falls back to the default window", async () => {
+    startSessionWithKeep("8000"); // a string — not a number
+    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
+    await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
+    await settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("compactKeepRecentTokens smaller than pi's window moves the cut later (extension owns the tail)", async () => {
+    startSessionWithKeep(5_000);
+    await callTool({ summary: LONG_SUMMARY });
+
+    const branchEntries = [
+      fixtureUser("u1", "hello there"),
+      fixtureAssistant("a1", BIG_TEXT),
+      fixtureUser("u2", "second " + BIG_TEXT),
+      fixtureAssistant("a2", "final"),
+    ];
+    const result = await handlers.get("session_before_compact")(
+      { preparation: prep(emptyOps()), branchEntries, signal: new AbortController().signal },
+      ctx,
+    );
+
+    // pi's own cut (entry-123, its ~20k window) is replaced by the 5k-budget cut.
+    expect(result?.compaction?.firstKeptEntryId).toBe(computeCustomFirstKeptEntryId(branchEntries, 5_000));
+    expect(result?.compaction?.firstKeptEntryId).not.toBe("entry-123");
+    compactDone();
+  });
+
+  it("the checkpoint guidance names the extension keep window from settings-ext", () => {
+    const dir = path.join(tmpHome, ".pi", "agent");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "settings-ext.json"), JSON.stringify({ gallop: { compactKeepRecentTokens: 8_000 } }));
+    const { pi: pi2, tools: tools2 } = makeMockPi();
+    gallopExtension(pi2);
+    expect(tools2.get("compact_request").parameters.properties.summary.description).toContain("~8k");
+
+    // No file → the materialized default names 20k.
+    fs.rmSync(path.join(dir, "settings-ext.json"));
+    const { pi: pi3, tools: tools3 } = makeMockPi();
+    gallopExtension(pi3);
+    expect(tools3.get("compact_request").parameters.properties.summary.description).toContain("~20k");
+  });
+
+  // ── Evidence blocks ──
+
+  it("delivers the evidence blocks after a self-compaction (invisible, no turn)", async () => {
+    await callTool({ summary: LONG_SUMMARY });
+    const result = await handlers.get("session_before_compact")(
+      {
+        preparation: { ...prep(emptyOps()), firstKeptEntryId: "u2" },
+        branchEntries: [
+          fixtureUser("u1", "please fix the guard"),
+          fixtureAssistant("a1", "on it"),
+          fixtureUser("u2", "also check the tests"),
+          fixtureAssistant("a2", "done"),
+        ],
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+    expect(result).toBeDefined();
+    pi.sendMessage.mockClear();
+    compactDone();
+    await flushTimers(300);
+
+    // The covered user message (u1) is protected verbatim; the session file
+    // does not exist, so the evidence index is skipped and only the protected
+    // block is delivered.
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    const [msg, meta] = pi.sendMessage.mock.calls[0];
+    expect(msg.customType).toBe("gallop-protected");
+    expect(msg.display).toBe(false);
+    expect(meta).toEqual({ triggerTurn: false });
+    expect(msg.content).toContain("please fix the guard");
+    compactDone();
+  });
+
+  it("delivers the evidence index with L pointers when the session file exists", async () => {
+    // A session file with the covered entries — the L pointers must map back
+    // to real lines.
+    const dir = path.join(tmpHome, "sess");
+    fs.mkdirSync(dir, { recursive: true });
+    const sessionFile = path.join(dir, "session.jsonl");
+    const callEntry = {
+      type: "message",
+      id: "a1",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tc1", name: "read", arguments: { path: "/proj/config.json" } }],
+        timestamp: 0,
+      },
+    };
+    const resultEntry = {
+      type: "message",
+      id: "t1",
+      message: {
+        role: "toolResult",
+        toolCallId: "tc1",
+        toolName: "read",
+        isError: false,
+        content: [{ type: "text", text: "compactKeepRecentTokens: 8000 — the gallop namespace owns the keep window" }],
+        timestamp: 0,
+      },
+    };
+    const lines = [
+      JSON.stringify({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "please fix the guard" }] } }),
+      JSON.stringify(callEntry),
+      JSON.stringify(resultEntry),
+      JSON.stringify({ type: "message", id: "u2", message: { role: "user", content: [{ type: "text", text: "also check the tests" }] } }),
+      JSON.stringify({ type: "message", id: "a2", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }),
+    ];
+    fs.writeFileSync(sessionFile, lines.join("\n") + "\n");
+    ctx.sessionManager.getSessionFile = () => sessionFile;
+
+    await callTool({ summary: LONG_SUMMARY });
+    const result = await handlers.get("session_before_compact")(
+      {
+        preparation: { ...prep(emptyOps()), firstKeptEntryId: "u2" },
+        branchEntries: [fixtureUser("u1", "please fix the guard"), callEntry, resultEntry, fixtureUser("u2", "also check the tests"), fixtureAssistant("a2", "done")],
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+    expect(result).toBeDefined();
+    pi.sendMessage.mockClear();
+    compactDone();
+    await flushTimers(300);
+
+    // Both blocks delivered — protected first, then the evidence index.
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    const [pMsg, pMeta] = pi.sendMessage.mock.calls[0];
+    const [eMsg, eMeta] = pi.sendMessage.mock.calls[1];
+    expect(pMsg.customType).toBe("gallop-protected");
+    expect(eMsg.customType).toBe("gallop-evidence");
+    expect(pMeta).toEqual({ triggerTurn: false });
+    expect(eMeta).toEqual({ triggerTurn: false });
+    expect(pMsg.display).toBe(false);
+    expect(eMsg.display).toBe(false);
+    // The L pointer names the toolResult line of the session file.
+    const m = eMsg.content.match(/L(\d+)/);
+    expect(m).not.toBeNull();
+    const line = lines[Number(m![1]) - 1];
+    expect(line).toContain("\"id\":\"t1\"");
     compactDone();
   });
 

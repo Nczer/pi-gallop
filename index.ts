@@ -42,6 +42,7 @@ const GALLOP_DEFAULTS = {
   compactNudgeBuffer: selfCompact.NUDGE_BUFFER_DEFAULT,
   compactNudgeDisabledAt: selfCompact.NUDGE_DISABLED_AT_DEFAULT,
   compactNudgePct: selfCompact.NUDGE_PCT_DEFAULT,
+  compactKeepRecentTokens: selfCompact.KEEP_RECENT_TOKENS_DEFAULT,
 };
 
 /** Reset all gallop state. Called on session start and compaction (and via
@@ -56,7 +57,12 @@ function resetAllState(): void {
 
 export default function gallopExtension(pi: ExtensionAPI) {
   intervention.setFullReset(resetAllState);
-  selfCompact.registerTools(pi, process.cwd());
+  // Load-time read of the gallop namespace (materialized into settings-ext.json
+  // on first touch; a changed value takes effect on the next /reload, like
+  // the rest of the extension's load-time state). The registration-time value
+  // feeds the checkpoint guidance (the named kept-tail size).
+  const loadSettings = loadExtSettings("gallop", GALLOP_DEFAULTS);
+  selfCompact.registerTools(pi, loadSettings.compactKeepRecentTokens);
   binary.registerCommands(pi);
   collapse.registerCommand(pi);
 
@@ -67,6 +73,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     binary.setToggles(gallopSettings);
     collapse.setToggles(gallopSettings);
     selfCompact.setNudgeSettings(gallopSettings);
+    selfCompact.setKeepRecentTokens(gallopSettings);
   });
 
   // ── Message liveness + the new-user-turn compact re-arm ──
@@ -147,6 +154,11 @@ export default function gallopExtension(pi: ExtensionAPI) {
     const outcome = selfCompact.onCompacted(ctx);
     // Reset all gallop state after compaction to avoid stale state
     resetAllState();
+    // Evidence blocks first: they must land in context before the
+    // continuation (steer / stashed redelivery) starts the next turn.
+    if (outcome.blocks) {
+      selfCompact.scheduleEvidenceBlocks(outcome.blocks, pi);
+    }
     if (outcome.stashed.length > 0) {
       selfCompact.scheduleStashedRedelivery(outcome.stashed, pi);
     } else if (outcome.continueAfter) {

@@ -47,12 +47,12 @@ Tool arguments:
 
 - `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
   Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
-  older work, since the recent tokens up to pi's `compaction.keepRecentTokens`
-  (default ~20k, user-configurable) are kept verbatim — the tool description names
-  the configured value. Stays in the kept tail as the tool call's arguments — one
-  copy, the price of in-session summarization.
+  older work, since the recent tokens up to the keep window
+  (`compactKeepRecentTokens`, default ~20k) are kept verbatim — the tool description
+  names the configured value. Stays in the kept tail as the tool call's arguments —
+  one copy, the price of in-session summarization.
 - `nuke` (boolean, optional) — summarize the *entire* context instead of keeping
-  the most recent `compaction.keepRecentTokens` (default ~20k) verbatim; only the
+  the most recent `compactKeepRecentTokens` (default ~20k) verbatim; only the
   last turn's tail survives. For contexts broken beyond repair (repeated failing
   tool calls), where the default tail is exactly the broken part. The cut point is
   recomputed with budget 0 by the same `findCutPoint` walker pi's `prepareCompaction`
@@ -65,11 +65,11 @@ Tool arguments:
   = the agent stops and you take the next step. No custom resume text is ever written
   or re-sent.
 
-Minimum context: the call **fails when the whole context fits in pi's keep
-window** (`compaction.keepRecentTokens`, default 20k) — there is nothing older
+Minimum context: the call **fails when the whole context fits in the keep
+window** (`compactKeepRecentTokens`, default 20k) — there is nothing older
 than the verbatim tail to summarize, and pi would fail the compact. The guard
 checks pi's own `getContextUsage()` (the same last-usage-anchored estimate the
-automatic threshold check uses) against the live settings before stashing
+automatic threshold check uses) against the live extension setting before stashing
 anything: a below-minimum call fails as the tool call itself (the thrown error
 becomes the tool result the model sees, with the reason and a retry-once-larger
 hint), and no deferred compact is armed. A `nuke` on such a session fails with an
@@ -123,6 +123,43 @@ turn.
 model to compact itself as the context fills, and pi's native `/compact`
 remains for an immediate user-initiated compact (cold one-shot — the trade for
 not needing a live-model checkpoint turn).
+
+#### Keep window (`compactKeepRecentTokens`)
+
+The keep window — how many recent tokens survive verbatim — is an extension
+setting in the `gallop` namespace of settings-ext.json (default 20000 = pi's
+default, so unset means zero behavior change). The tail size is part of
+gallop's compaction design (the checkpoint guidance names it; the evidence
+package below is tuned to it), so the extension owns it: the cut point is
+recomputed with pi's own `findCutPoint` walker whenever the extension window
+differs from pi's configured window (or `nuke`), and pi honors the custom
+`firstKeptEntryId` verbatim. Equal windows → pi's cut as-is. Rolling the design
+back is one setting flip (20000) — pi's settings.json is never touched.
+
+#### Post-compaction evidence blocks
+
+The checkpoint summary is a lossy rewrite; two deterministic blocks close the
+fidelity gap after each self-compaction. They are delivered as invisible custom
+messages (`display: false`, no turn triggered) 200 ms after `session_compact` —
+in context before the continue steer starts the next turn — and are
+regenerated per compaction (the keep window carries them only while inside it,
+so they self-clean):
+
+- **Protected user messages** — the user messages covered by the compaction,
+  verbatim (synthetic `[Gallop]`/`[Memory]` messages and recall-hint suffixes
+  stripped, newest-first within a 16k-char budget, omissions labeled). The
+  user's instructions never survive only as summary paraphrase.
+- **Evidence index** — `L<line>` pointers into the session JSONL for the
+  covered span's high-value tool output: errors from any tool first, then
+  successful read/edit/write/bash grouped by (tool, full command),
+  config/schema/test targets first, per group newest + oldest, the rest by
+  recency (8k-char budget). Each row: `L<n> tool target [ERR] :: head…tail` —
+  fetch the full payload with `session_recall(line=L<n>)`.
+
+The build is fail-open: any error (no covered range, unreadable session file)
+degrades to protected-only or no blocks — the blocks are a fidelity aid and
+never block the compaction. A native compact (no stashed checkpoint) delivers
+none.
 
 ### Read Guard (binary file blocking)
 
