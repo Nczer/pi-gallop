@@ -154,12 +154,17 @@ so they self-clean):
   verbatim (synthetic `[Gallop]`/`[Memory]` messages and recall-hint suffixes
   stripped, newest-first within a 16k-char budget, omissions labeled). The
   user's instructions never survive only as summary paraphrase.
-- **Evidence index** — `L<line>` pointers into the session JSONL for the
-  covered span's high-value tool output: errors from any tool first, then
-  successful read/edit/write/bash grouped by (tool, full command),
-  config/schema/test targets first, per group newest + oldest, the rest by
-  recency (8k-char budget). Each row: `L<n> tool target [ERR] :: head…tail` —
-  fetch the full payload with `session_recall`, line = the number after L.
+- **Evidence index** — the covered span's high-value tool output: errors
+  from any tool first, then successful read/edit/write/bash grouped by
+  (tool, full command), config/schema/test targets first, per group newest
+  + oldest, the rest by recency (8k-char budget). Each row:
+  `L<n> tool target [ERR] :: head…tail`, where `L<n>` is a pointer into the
+  session JSONL — fetch the full payload with `session_recall`, line = the
+  number after L. Pointers (and the fetch instruction) render only when the
+  model can actually call `session_recall` — the tool set is tracked from
+  the `tools` array of the last provider request; with the memory extension
+  absent the rows degrade to fragments only (`tool target [ERR] :: head…tail`),
+  built from the in-memory entries with no session-file read.
 
 The build is fail-open: any error (no covered range, unreadable session file)
 degrades to protected-only or no blocks — the blocks are a fidelity aid and

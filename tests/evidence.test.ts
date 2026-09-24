@@ -256,6 +256,19 @@ describe("buildEvidence", () => {
     expect(row).not.toContain("  "); // whitespace collapsed
   });
 
+  it("renders fragments without L pointers or fetch instruction when pointers is off", () => {
+    const entries = [
+      asstCall("a1", "c1", "bash", { command: "ls /x" }),
+      result("r1", "c1", "bash", "file1\nfile2"),
+    ];
+    const out = buildEvidence(entries, 0, 2, new Map(), false);
+    expect(out).toBeDefined();
+    expect(out).not.toContain("session_recall");
+    expect(out).not.toMatch(/\bL\d+/);
+    const row = out!.split("\n").find((l) => l.includes("ls /x"));
+    expect(row).toMatch(/^bash ls \/x :: file1 file2$/);
+  });
+
   it("stops at the budget without splitting a row", () => {
     const entries: SessionEntry[] = [];
     for (let i = 0; i < 40; i++) {
@@ -306,6 +319,22 @@ describe("buildEvidenceBlocks", () => {
     const blocks = buildEvidenceBlocks(entries, "u2", "/nonexistent/path.jsonl");
     expect(blocks?.protected).toContain("hello");
     expect(blocks?.evidence).toBeUndefined();
+  });
+
+  it("delivers fragments without pointers or a session file when recall is unavailable", () => {
+    const entries = [
+      user("u1", "make the port 8081"),
+      asstCall("a1", "c1", "read", { path: "/settings.json" }),
+      result("r1", "c1", "read", '{"port": 8080}'),
+      user("u2", "and keep it"),
+    ];
+    const blocks = buildEvidenceBlocks(entries, "u2", null, false);
+    expect(blocks?.protected).toContain("make the port 8081");
+    expect(blocks?.evidence).toBeDefined();
+    expect(blocks?.evidence).toContain("settings.json");
+    expect(blocks?.evidence).toContain('{"port": 8080}');
+    expect(blocks?.evidence).not.toContain("session_recall");
+    expect(blocks?.evidence).not.toMatch(/\bL\d+/);
   });
 
   it("is fail-open on bad input", () => {

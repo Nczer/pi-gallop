@@ -142,6 +142,14 @@ export default function gallopExtension(pi: ExtensionAPI) {
   });
 
   // ── Compaction lifecycle ──
+  // Track the tools the model can actually call — the provider request's
+  // tools array is the ground truth (no tool introspection in the extension
+  // API). The evidence block renders its L<line> pointers + session_recall
+  // fetch instruction only when session_recall is among them.
+  pi.on("before_provider_request", (event) => {
+    selfCompact.noteProviderTools(event.payload);
+  });
+
   pi.on("session_before_compact", (event, ctx) => {
     return selfCompact.onBeforeCompact(event, ctx);
   });

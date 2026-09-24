@@ -452,6 +452,43 @@ let pendingBlocks: EvidenceBlocks | null = null;
  *  session_compact / onError). Distinguishes "compact running" from the
  *  post-compaction re-trigger window. */
 let compactionRunning = false;
+
+// ── Available tools (from the last provider request) ──
+
+/** Tool names from the last provider request that carried a tools array — the
+ *  ground truth for whether the model can call session_recall (the extension
+ *  API exposes no tool introspection; the request payload does). Updated from
+ *  before_provider_request on every model call. null = no tools-carrying
+ *  request observed in this process yet. Handles both payload shapes:
+ *  Anthropic (tools[].name) and OpenAI-compatible (tools[].function.name).
+ *  Payloads without a tools array (e.g. the native one-shot summarizer's plain
+ *  completion) never overwrite the last known set. */
+let lastRequestTools: Set<string> | null = null;
+
+export function noteProviderTools(payload: unknown): void {
+  const tools = (payload as { tools?: unknown } | null | undefined)?.tools;
+  if (!Array.isArray(tools)) return;
+  const names = new Set<string>();
+  for (const t of tools) {
+    const o = t as { name?: unknown; function?: { name?: unknown } } | null;
+    const n =
+      typeof o?.name === "string" ? o.name
+      : typeof o?.function?.name === "string" ? o.function.name
+      : null;
+    if (n) names.add(n);
+  }
+  if (names.size > 0) lastRequestTools = names;
+}
+
+/** Whether the current model can call session_recall — the evidence block's
+ *  L<line> pointers and fetch instruction are rendered only when it can
+ *  (fragments only otherwise: a pointer nobody can fetch is a dead trap). No
+ *  tools-carrying request observed yet → assume available (fail-open =
+ *  previous behavior; unreachable in practice — a self-compact requires a
+ *  model turn, which requires a tools-carrying request). */
+export function sessionRecallAvailable(): boolean {
+  return lastRequestTools === null || lastRequestTools.has("session_recall");
+}
 /** Context-pressure nudge state, one nudge per compaction cycle. "idle" →
  *  advisory nudge at the configured threshold (just above pi's automatic
  *  threshold — reserveTokens + the configured nudge buffer — or the
@@ -706,12 +743,15 @@ export function onBeforeCompact(
     }
     // Evidence package: the covered span and the final cut are both known
     // here — build the blocks now, deliver from onCompacted only on success
-    // (a failed compact must not emit dangling blocks).
+    // (a failed compact must not emit dangling blocks). Pointers only when
+    // the model can actually call session_recall (memory ext loaded) —
+    // otherwise the rows degrade to fragments and the file is not read.
     try {
       pendingBlocks = buildEvidenceBlocks(
         event.branchEntries,
         firstKeptEntryId,
         ctx.sessionManager?.getSessionFile?.() ?? null,
+        sessionRecallAvailable(),
       );
     } catch {
       pendingBlocks = null; // fail-open: never block compaction
@@ -930,6 +970,7 @@ export function reset(): void {
   selfSummary = null;
   pendingCompact = null;
   pendingBlocks = null;
+  lastRequestTools = null;
   stashedInputs = [];
   stashedRedeliveryPending = false;
   if (stashedRedeliveryTimer) {

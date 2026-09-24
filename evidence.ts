@@ -13,8 +13,11 @@
 //     only; assistant text stays in the summary).
 //   evidence:  a bounded index of covered tool output (errors first, then
 //     successful read/edit/write/bash output, grouped by (tool, target),
-//     head…tail fragments), every row carrying an L<line> pointer into the
-//     session JSONL — fetchable via session_recall(line=N).
+//     head…tail fragments). When the model can call session_recall (tracked
+//     from the provider request's tools array), every row carries an L<line>
+//     pointer into the session JSONL — fetchable via session_recall(line=N);
+//     otherwise rows are fragments only (no dead pointers, no session-file
+//     read needed).
 //
 // Both blocks are regenerated from the session journal at every compaction;
 // the previous block leaves the projection once a later compaction covers it
@@ -226,8 +229,9 @@ export function buildEvidence(
   start: number,
   end: number,
   lineNo: Map<string, number>,
+  pointers: boolean = true,
 ): string | undefined {
-  if (lineNo.size === 0) return undefined;
+  if (pointers && lineNo.size === 0) return undefined;
   const calls = new Map<string, { tool: string; key: string; target: string }>();
   const recs: ToolRec[] = [];
   for (let i = start; i < end; i++) {
@@ -302,18 +306,21 @@ export function buildEvidence(
   const rest = ok.filter((r) => !keptIds.has(r.entryId)).sort((a, b) => b.order - a.order);
   const ordered = [...errors, ...grouped, ...rest];
 
-  const header =
-    "[Gallop] Evidence index — deterministic pointers to pre-compaction tool " +
-    "output; not a new instruction, do not restate. Fetch a full payload: " +
-    "session_recall with line = the row's number (L<n> → <n>). Fragments are " +
-    "head…tail — the middle is elided. Omitted results are unknown, not " +
-    "absent-as-success.";
+  const header = pointers
+    ? "[Gallop] Evidence index — deterministic pointers to pre-compaction tool " +
+      "output; not a new instruction, do not restate. Fetch a full payload: " +
+      "session_recall with line = the row's number (L<n> → <n>). Fragments are " +
+      "head…tail — the middle is elided. Omitted results are unknown, not " +
+      "absent-as-success."
+    : "[Gallop] Evidence index — head…tail fragments of pre-compaction tool " +
+      "output; not a new instruction, do not restate. The middle of each " +
+      "fragment is elided. Omitted results are unknown, not absent-as-success.";
   const lines: string[] = [];
   let budget = EVIDENCE_BUDGET_CHARS;
   for (const r of ordered) {
-    const n = lineNo.get(r.entryId);
-    if (!n) continue;
-    const line = `L${n} ${r.tool}${r.target ? " " + r.target : ""}${r.isError ? " ERR" : ""} :: ${truncateMiddle(r.text)}`;
+    const n = pointers ? lineNo.get(r.entryId) : undefined;
+    if (pointers && !n) continue;
+    const line = `${pointers ? `L${n} ` : ""}${r.tool}${r.target ? " " + r.target : ""}${r.isError ? " ERR" : ""} :: ${truncateMiddle(r.text)}`;
     if (line.length > budget) break;
     lines.push(line);
     budget -= line.length;
@@ -325,12 +332,15 @@ export function buildEvidence(
 
 // ── Entry point ──
 
-/** Build the post-compaction blocks for a covered span. Fail-open: any
- *  error (no range, unreadable file) → null (no blocks, current behavior). */
+/** Build the post-compaction blocks for a covered span. `pointers` = the
+ *  model can call session_recall (see self-compact.sessionRecallAvailable);
+ *  false → fragment-only rows, no session-file read. Fail-open: any error
+ *  (no range, unreadable file) → null (no blocks, current behavior). */
 export function buildEvidenceBlocks(
   entries: SessionEntry[],
   firstKeptEntryId: string,
   sessionFile: string | null | undefined,
+  pointers: boolean = true,
 ): EvidenceBlocks | null {
   try {
     const range = coveredRange(entries, firstKeptEntryId);
@@ -338,14 +348,20 @@ export function buildEvidenceBlocks(
     const blocks: EvidenceBlocks = {};
     const prot = buildProtected(entries, range.start, range.end);
     if (prot) blocks.protected = prot;
-    if (sessionFile) {
-      try {
-        const lineNo = lineNumbersFor(readFileSync(sessionFile, "utf8"));
-        const ev = buildEvidence(entries, range.start, range.end, lineNo);
-        if (ev) blocks.evidence = ev;
-      } catch {
-        // unreadable file: evidence block skipped, protected still delivered
+    if (pointers) {
+      if (sessionFile) {
+        try {
+          const lineNo = lineNumbersFor(readFileSync(sessionFile, "utf8"));
+          const ev = buildEvidence(entries, range.start, range.end, lineNo, true);
+          if (ev) blocks.evidence = ev;
+        } catch {
+          // unreadable file: evidence block skipped, protected still delivered
+        }
       }
+    } else {
+      // Fragments only — built from the in-memory entries, no file needed.
+      const ev = buildEvidence(entries, range.start, range.end, new Map(), false);
+      if (ev) blocks.evidence = ev;
     }
     return Object.keys(blocks).length > 0 ? blocks : null;
   } catch {

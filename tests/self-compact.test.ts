@@ -20,6 +20,9 @@ import {
   rewriteCompactContext,
   setKeepRecentTokens,
   KEEP_RECENT_TOKENS_DEFAULT,
+  noteProviderTools,
+  sessionRecallAvailable,
+  reset,
 } from "../self-compact";
 
 // ── computeSelfCompactFileLists ──
@@ -150,6 +153,34 @@ describe("computeCustomFirstKeptEntryId", () => {
   });
 });
 
+// ── noteProviderTools / sessionRecallAvailable ──
+
+describe("provider tool tracking", () => {
+  it("defaults to available until a tools-carrying request is observed", () => {
+    reset();
+    expect(sessionRecallAvailable()).toBe(true);
+  });
+
+  it("sees session_recall in both Anthropic and OpenAI-compatible shapes", () => {
+    noteProviderTools({ tools: [{ name: "read" }, { name: "session_recall" }] });
+    expect(sessionRecallAvailable()).toBe(true);
+    noteProviderTools({ tools: [{ type: "function", function: { name: "session_recall" } }] });
+    expect(sessionRecallAvailable()).toBe(true);
+  });
+
+  it("reports unavailable once the last tools-carrying request lacks session_recall", () => {
+    noteProviderTools({ tools: [{ name: "read" }, { name: "bash" }] });
+    expect(sessionRecallAvailable()).toBe(false);
+    // A tools-less payload (e.g. the one-shot summarizer's plain completion)
+    // never overwrites the last known set.
+    noteProviderTools({ model: "x", messages: [] });
+    expect(sessionRecallAvailable()).toBe(false);
+    // reset() (session_start) clears the state back to the fail-open default
+    reset();
+    expect(sessionRecallAvailable()).toBe(true);
+  });
+});
+
 // ── Integration: compact_request tool + session_before_compact wiring ──
 
 function makeMockPi() {
@@ -231,6 +262,10 @@ describe("self-compact wiring (in-session summary)", () => {
     // the re-trigger window) — clear it via the real new-turn boundary.
     void handlers.get("session_compact")(null, { hasUI: false });
     void handlers.get("message_start")({ message: { role: "user" } }, ctx);
+    // Normal session: the model's last request carried session_recall, so the
+    // evidence pointers render (tests that exercise the opposite set this
+    // explicitly first).
+    noteProviderTools({ tools: [{ name: "session_recall" }] });
   });
 
   afterEach(() => {
@@ -654,6 +689,64 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(m).not.toBeNull();
     const line = lines[Number(m![1]) - 1];
     expect(line).toContain("\"id\":\"t1\"");
+    compactDone();
+  });
+
+  it("delivers fragments without L pointers when session_recall is unavailable", async () => {
+    // The model's last request lacks session_recall (memory ext not loaded) —
+    // no dead pointers, no fetch instruction, and no session-file read (the
+    // default ctx points at a nonexistent file: fragments come from the
+    // in-memory entries, so a stray file read would fail open to no blocks).
+    noteProviderTools({ tools: [{ name: "read" }, { name: "bash" }] });
+
+    const callEntry = {
+      type: "message",
+      id: "a1",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tc1", name: "read", arguments: { path: "/proj/config.json" } }],
+        timestamp: 0,
+      },
+    };
+    const resultEntry = {
+      type: "message",
+      id: "t1",
+      message: {
+        role: "toolResult",
+        toolCallId: "tc1",
+        toolName: "read",
+        isError: false,
+        content: [{ type: "text", text: "compactKeepRecentTokens: 8000 — the gallop namespace owns the keep window" }],
+        timestamp: 0,
+      },
+    };
+    const pad1 = fixtureAssistant("p1", BIG_TEXT);
+    const pad2 = fixtureUser("p2", "padding " + BIG_TEXT);
+
+    await callTool({ summary: LONG_SUMMARY });
+    const result = await handlers.get("session_before_compact")(
+      {
+        preparation: { ...prep(emptyOps()), firstKeptEntryId: "u2" },
+        branchEntries: [fixtureUser("u1", "please fix the guard"), callEntry, resultEntry, pad1, pad2, fixtureUser("u2", "also check the tests"), fixtureAssistant("a2", "done")],
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+    expect(result).toBeDefined();
+    pi.sendMessage.mockClear();
+    compactDone();
+    await flushTimers(300);
+
+    // Both blocks still delivered — the evidence block is fragments only.
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    const [pMsg] = pi.sendMessage.mock.calls[0];
+    const [eMsg] = pi.sendMessage.mock.calls[1];
+    expect(pMsg.customType).toBe("gallop-protected");
+    expect(eMsg.customType).toBe("gallop-evidence");
+    expect(eMsg.content).toContain("config.json");
+    expect(eMsg.content).toContain("8000");
+    expect(eMsg.content).not.toContain("session_recall");
+    expect(eMsg.content).not.toMatch(/\bL\d+/);
     compactDone();
   });
 
