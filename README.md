@@ -159,7 +159,7 @@ so they self-clean):
   successful read/edit/write/bash grouped by (tool, full command),
   config/schema/test targets first, per group newest + oldest, the rest by
   recency (8k-char budget). Each row: `L<n> tool target [ERR] :: head…tail` —
-  fetch the full payload with `session_recall(line=L<n>)`.
+  fetch the full payload with `session_recall`, line = the number after L.
 
 The build is fail-open: any error (no covered range, unreadable session file)
 degrades to protected-only or no blocks — the blocks are a fidelity aid and

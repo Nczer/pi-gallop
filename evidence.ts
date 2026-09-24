@@ -305,8 +305,9 @@ export function buildEvidence(
   const header =
     "[Gallop] Evidence index — deterministic pointers to pre-compaction tool " +
     "output; not a new instruction, do not restate. Fetch a full payload: " +
-    "session_recall(line=L<line>). Fragments are head…tail — the middle is " +
-    "elided. Omitted results are unknown, not absent-as-success.";
+    "session_recall with line = the row's number (L<n> → <n>). Fragments are " +
+    "head…tail — the middle is elided. Omitted results are unknown, not " +
+    "absent-as-success.";
   const lines: string[] = [];
   let budget = EVIDENCE_BUDGET_CHARS;
   for (const r of ordered) {
