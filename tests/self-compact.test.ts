@@ -216,7 +216,7 @@ describe("self-compact wiring (in-session summary)", () => {
       compact: vi.fn(),
       hasUI: false,
       cwd: tmpCwd,
-      // Comfortably above the default 20k keep window so the minimum-context
+      // Comfortably above the default 8k keep window so the minimum-context
       // guard stays out of the way (tests that exercise it override this).
       getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: 200_000, percent: 25 })),
       sessionManager: {
@@ -321,7 +321,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("fails the call when the context is at or below the keep window — nothing stashed, no deferred compact", async () => {
-    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
+    ctx.getContextUsage.mockReturnValue({ tokens: 7_500, contextWindow: 200_000, percent: 3.75 });
     await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
 
     // The guard threw before stashing — the settle point must not fire a compact.
@@ -395,8 +395,9 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("keeps pi's own cut when nuke is not set and the windows match", async () => {
-    // No settings-ext override → the extension window equals pi's configured
-    // window → zero divergence, pi's cut as-is.
+    // Extension window explicitly set to pi's configured 20k → the windows
+    // match → zero divergence, pi's cut as-is.
+    setKeepRecentTokens({ compactKeepRecentTokens: 20_000 });
     await callTool({ summary: LONG_SUMMARY });
 
     const result = await handlers.get("session_before_compact")(
@@ -413,7 +414,7 @@ describe("self-compact wiring (in-session summary)", () => {
   });
 
   it("nuke on a too-small session fails with the escape-hatch message — nothing stashed", async () => {
-    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
+    ctx.getContextUsage.mockReturnValue({ tokens: 5_000, contextWindow: 200_000, percent: 2.5 });
     await expect(callTool({ summary: LONG_SUMMARY, nuke: true })).rejects.toThrow(/refuses to compact this session at all/);
 
     // The guard threw before stashing — the settle point must not fire a compact.
@@ -478,27 +479,32 @@ describe("self-compact wiring (in-session summary)", () => {
   };
 
   it("the minimum-context guard uses the extension keep window, not pi's", async () => {
-    startSessionWithKeep(8_000);
+    startSessionWithKeep(12_000);
 
-    // 10k would fail the default 20k window — under the 8k window it proceeds.
-    ctx.getContextUsage.mockReturnValue({ tokens: 10_000, contextWindow: 200_000, percent: 5 });
+    // 15k would fail pi's 20k window — under the extension's 12k window it proceeds.
+    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
     const result = await callTool({ summary: LONG_SUMMARY });
     expect(result.terminate).toBe(true);
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
 
-    // Below the 8k window it still fails.
+    // Below the 12k window it still fails.
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
     ctx.compact.mockClear();
-    ctx.getContextUsage.mockReturnValue({ tokens: 5_000, contextWindow: 200_000, percent: 2.5 });
+    ctx.getContextUsage.mockReturnValue({ tokens: 10_000, contextWindow: 200_000, percent: 5 });
     await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
     await settle();
     expect(ctx.compact).not.toHaveBeenCalled();
   });
 
-  it("an invalid compactKeepRecentTokens falls back to the default window", async () => {
-    startSessionWithKeep("8000"); // a string — not a number
-    ctx.getContextUsage.mockReturnValue({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 });
+  it("an invalid compactKeepRecentTokens keeps the previous window", async () => {
+    // Previous state: 15k (persists — resetAllState does not touch the keep
+    // window, matching the nudge-settings semantics). The invalid file value
+    // must NOT fall through to the 8k default: a 12k context rejects under
+    // 15k but proceeds under 8k.
+    setKeepRecentTokens({ compactKeepRecentTokens: 15_000 });
+    startSessionWithKeep("15000"); // a string — not a number
+    ctx.getContextUsage.mockReturnValue({ tokens: 12_000, contextWindow: 200_000, percent: 6 });
     await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
     await settle();
     expect(ctx.compact).not.toHaveBeenCalled();
@@ -528,16 +534,16 @@ describe("self-compact wiring (in-session summary)", () => {
   it("the checkpoint guidance names the extension keep window from settings-ext", () => {
     const dir = path.join(tmpHome, ".pi", "agent");
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "settings-ext.json"), JSON.stringify({ gallop: { compactKeepRecentTokens: 8_000 } }));
+    fs.writeFileSync(path.join(dir, "settings-ext.json"), JSON.stringify({ gallop: { compactKeepRecentTokens: 20_000 } }));
     const { pi: pi2, tools: tools2 } = makeMockPi();
     gallopExtension(pi2);
-    expect(tools2.get("compact_request").parameters.properties.summary.description).toContain("~8k");
+    expect(tools2.get("compact_request").parameters.properties.summary.description).toContain("~20k");
 
-    // No file → the materialized default names 20k.
+    // No file → the materialized default names 8k.
     fs.rmSync(path.join(dir, "settings-ext.json"));
     const { pi: pi3, tools: tools3 } = makeMockPi();
     gallopExtension(pi3);
-    expect(tools3.get("compact_request").parameters.properties.summary.description).toContain("~20k");
+    expect(tools3.get("compact_request").parameters.properties.summary.description).toContain("~8k");
   });
 
   // ── Evidence blocks ──
@@ -547,10 +553,12 @@ describe("self-compact wiring (in-session summary)", () => {
     const result = await handlers.get("session_before_compact")(
       {
         preparation: { ...prep(emptyOps()), firstKeptEntryId: "u2" },
+        // ~10k tokens total so the 8k keep window cuts before u2's tail —
+        // u1 ends up in the covered (summarized) span, not the verbatim tail.
         branchEntries: [
           fixtureUser("u1", "please fix the guard"),
-          fixtureAssistant("a1", "on it"),
-          fixtureUser("u2", "also check the tests"),
+          fixtureAssistant("a1", "on it " + BIG_TEXT),
+          fixtureUser("u2", "also check the tests " + BIG_TEXT),
           fixtureAssistant("a2", "done"),
         ],
         signal: new AbortController().signal,
@@ -601,10 +609,16 @@ describe("self-compact wiring (in-session summary)", () => {
         timestamp: 0,
       },
     };
+    // Padding after the target: ~10k tokens of tail so the 8k keep window cuts
+    // BEFORE p1 — u1/a1/t1 land in the covered (summarized) span.
+    const pad1 = fixtureAssistant("p1", BIG_TEXT);
+    const pad2 = fixtureUser("p2", "padding " + BIG_TEXT);
     const lines = [
       JSON.stringify({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "please fix the guard" }] } }),
       JSON.stringify(callEntry),
       JSON.stringify(resultEntry),
+      JSON.stringify(pad1),
+      JSON.stringify(pad2),
       JSON.stringify({ type: "message", id: "u2", message: { role: "user", content: [{ type: "text", text: "also check the tests" }] } }),
       JSON.stringify({ type: "message", id: "a2", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }),
     ];
@@ -615,7 +629,7 @@ describe("self-compact wiring (in-session summary)", () => {
     const result = await handlers.get("session_before_compact")(
       {
         preparation: { ...prep(emptyOps()), firstKeptEntryId: "u2" },
-        branchEntries: [fixtureUser("u1", "please fix the guard"), callEntry, resultEntry, fixtureUser("u2", "also check the tests"), fixtureAssistant("a2", "done")],
+        branchEntries: [fixtureUser("u1", "please fix the guard"), callEntry, resultEntry, pad1, pad2, fixtureUser("u2", "also check the tests"), fixtureAssistant("a2", "done")],
         signal: new AbortController().signal,
       },
       ctx,
@@ -799,7 +813,7 @@ describe("context-pressure nudge", () => {
       hasUI: false,
       cwd: tmpCwd,
       model: { contextWindow: WINDOW },
-      // Comfortably above the default 20k keep window — the minimum-context
+      // Comfortably above the default 8k keep window — the minimum-context
       // guard stays out of the way.
       getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: WINDOW, percent: 25 })),
       sessionManager: { getSessionFile: () => "/tmp/gallop-test/session.jsonl", getBranch: vi.fn(() => []) },
@@ -881,9 +895,9 @@ describe("context-pressure nudge", () => {
   });
 
   it("checkpointFormat names the kept tail it will actually keep", () => {
-    expect(checkpointFormat()).toContain("~20k tokens are kept verbatim");
+    expect(checkpointFormat()).toContain("~8k tokens are kept verbatim"); // default
     expect(checkpointFormat(40_000)).toContain("~40k tokens are kept verbatim");
-    expect(checkpointFormat(8_000)).toContain("~8k tokens are kept verbatim");
+    expect(checkpointFormat(16_000)).toContain("~16k tokens are kept verbatim");
   });
 
   it("follows a custom reserveTokens (auto-compact on → reserve + 2k, window floor still applies)", () => {

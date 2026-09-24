@@ -48,11 +48,11 @@ Tool arguments:
 - `summary` — the checkpoint summary in pi's format (Goal / Constraints & Preferences /
   Progress / Key Decisions / Next Steps / Critical Context); the model focuses on
   older work, since the recent tokens up to the keep window
-  (`compactKeepRecentTokens`, default ~20k) are kept verbatim — the tool description
+  (`compactKeepRecentTokens`, default ~8k) are kept verbatim — the tool description
   names the configured value. Stays in the kept tail as the tool call's arguments —
   one copy, the price of in-session summarization.
 - `nuke` (boolean, optional) — summarize the *entire* context instead of keeping
-  the most recent `compactKeepRecentTokens` (default ~20k) verbatim; only the
+  the most recent `compactKeepRecentTokens` (default ~8k) verbatim; only the
   last turn's tail survives. For contexts broken beyond repair (repeated failing
   tool calls), where the default tail is exactly the broken part. The cut point is
   recomputed with budget 0 by the same `findCutPoint` walker pi's `prepareCompaction`
@@ -66,7 +66,7 @@ Tool arguments:
   or re-sent.
 
 Minimum context: the call **fails when the whole context fits in the keep
-window** (`compactKeepRecentTokens`, default 20k) — there is nothing older
+window** (`compactKeepRecentTokens`, default 8k) — there is nothing older
 than the verbatim tail to summarize, and pi would fail the compact. The guard
 checks pi's own `getContextUsage()` (the same last-usage-anchored estimate the
 automatic threshold check uses) against the live extension setting before stashing
@@ -127,14 +127,19 @@ not needing a live-model checkpoint turn).
 #### Keep window (`compactKeepRecentTokens`)
 
 The keep window — how many recent tokens survive verbatim — is an extension
-setting in the `gallop` namespace of settings-ext.json (default 20000 = pi's
-default, so unset means zero behavior change). The tail size is part of
-gallop's compaction design (the checkpoint guidance names it; the evidence
-package below is tuned to it), so the extension owns it: the cut point is
-recomputed with pi's own `findCutPoint` walker whenever the extension window
-differs from pi's configured window (or `nuke`), and pi honors the custom
-`firstKeptEntryId` verbatim. Equal windows → pi's cut as-is. Rolling the design
-back is one setting flip (20000) — pi's settings.json is never touched.
+setting in the `gallop` namespace of settings-ext.json, default **8000**. The
+smaller default is the design point: the model-written checkpoint plus the
+post-compaction evidence package below carry what a 20k verbatim tail would,
+so self-compact runs a tighter tail. It applies to self-compaction only — the
+cut override is only reachable with a stashed checkpoint, and native compacts
+(`/compact`, the auto threshold without a stash, overflow recovery) keep pi's
+own `compaction.keepRecentTokens` (default 20k) untouched. Mechanically:
+whenever the extension window differs from pi's configured window (or `nuke`),
+the cut point is recomputed with pi's own `findCutPoint` walker and returned
+as a custom `firstKeptEntryId`, which pi honors verbatim; equal windows → pi's
+cut as-is; no branch entries in the event → pi's cut as-is (fail-open). Rolling
+back to the stock tail is one setting flip (20000) — pi's settings.json is
+never touched.
 
 #### Post-compaction evidence blocks
 

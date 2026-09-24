@@ -139,7 +139,13 @@ export function setNudgeSettings(
 
 /** Default for `compactKeepRecentTokens` — pi's own default, so unset means
  *  zero behavior change. */
-export const KEEP_RECENT_TOKENS_DEFAULT = 20_000;
+/** Self-compact's default keep window: 8k. The model-written checkpoint plus
+ *  the post-compaction evidence package (protected user messages + L-pointers)
+ *  carry what a 20k verbatim tail would, so self-compact runs a smaller tail
+ *  by default. Native compacts are never affected — the cut override only
+ *  applies when a stashed checkpoint exists (self-compact by definition), and
+ *  they keep pi's own `compaction.keepRecentTokens` (default 20k). */
+export const KEEP_RECENT_TOKENS_DEFAULT = 8_000;
 
 /** The keep window gallop's self-compaction keeps — the extension's own
  *  `compactKeepRecentTokens` (settings-ext), NOT pi's compaction.keepRecent
@@ -185,7 +191,7 @@ export const COMPACT_DONE_MARKER =
 /** Checkpoint summary format — the exact format the model must use, carried
  *  by the compact_request tool description (system prompt). The kept-tail
  *  line is parameterized: the extension's compactKeepRecentTokens (default
- *  20k) is user-configurable, and the guidance must match what the compact
+ *  8k) is user-configurable, and the guidance must match what the compact
  *  will actually keep verbatim. */
 export function checkpointFormat(keepRecentTokens: number = KEEP_RECENT_TOKENS_DEFAULT): string {
   return `## Goal
@@ -342,7 +348,7 @@ export function buildContextStatusText(
 }
 
 /** Minimum-context guard for compact_request. The compact keeps the most
- *  recent configuredKeep (gallop's compactKeepRecentTokens, default 20k) verbatim
+ *  recent configuredKeep (gallop's compactKeepRecentTokens, default 8k) verbatim
  *  and summarizes everything older; when the whole context fits in that window
  *  pi's prepareCompaction bails out (returns undefined) and the compact fails —
  *  including a nuke, which pi evaluates with the CONFIGURED window, before any
@@ -678,20 +684,23 @@ export function onBeforeCompact(
     selfSummary = null;
     if (!summary || summary.length < MIN_SUMMARY_LENGTH) return undefined;
     // Cut point: pi computed preparation with ITS configured keep window —
-    // gallop keeps its own (compactKeepRecentTokens, settings-ext; the tail
-    // size is part of gallop's compaction design, so the extension owns it).
-    // When gallop's window differs from pi's — or nuke (budget 0: keep only
-    // the last turn's tail) — recompute the cut with the same findCutPoint
-    // walker pi's prepareCompaction uses and return the custom
-    // firstKeptEntryId; pi uses it verbatim. Equal to pi's window → pi's cut
-    // as-is (zero divergence at the default). Applies to any trigger that
-    // consumes the stashed summary (the deferred manual path, or the
-    // automatic threshold compact that won the race). Falls back to pi's cut
-    // when no usable custom cut exists.
+    // gallop's self-compact keeps its own (compactKeepRecentTokens,
+    // settings-ext; the tail size is part of gallop's compaction design, so
+    // the extension owns it). When gallop's window differs from pi's — or
+    // nuke (budget 0: keep only the last turn's tail) — recompute the cut
+    // with the same findCutPoint walker pi's prepareCompaction uses and
+    // return the custom firstKeptEntryId; pi uses it verbatim. Equal to pi's
+    // window → pi's cut as-is. This code is only reachable with a stashed
+    // checkpoint (self-compact — the deferred manual path, or the automatic
+    // threshold compact that won the race); native compacts return
+    // undefined above and keep pi's own window untouched. Falls back to pi's
+    // cut when no usable custom cut exists.
     let firstKeptEntryId = event.preparation.firstKeptEntryId;
     const nuke = pendingCompact?.nuke === true;
     const piKeep = readPiCompactionSettings(ctx.cwd).keepRecentTokens;
-    if (nuke || keepRecentTokens !== piKeep) {
+    // Fail-open: no branch entries → the walker has nothing to cut → pi's cut
+    // as-is (never block the compaction on a missing event field).
+    if (event.branchEntries && (nuke || keepRecentTokens !== piKeep)) {
       const custom = computeCustomFirstKeptEntryId(event.branchEntries, nuke ? 0 : keepRecentTokens);
       if (custom) firstKeptEntryId = custom;
     }
