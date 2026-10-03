@@ -59,11 +59,17 @@ Tool arguments:
   uses (mirroring its previous-compaction boundary logic) and returned as a custom
   `firstKeptEntryId` — pi uses it verbatim. The checkpoint must then carry full
   state, since the verbatim tail no longer covers recent work.
-- `continue` (boolean) — if `true`, a fixed generic steer
+- `continue` (boolean, optional, **default `true`**) — if `true`, a fixed generic steer
   (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
-  the checkpoint's Next Steps section tells the agent what to do next. Omitted/`false`
-  = the agent stops and you take the next step. No custom resume text is ever written
+  the checkpoint's Next Steps section tells the agent what to do next. Only `false`
+  stops the agent so you take the next step. No custom resume text is ever written
   or re-sent.
+
+Both flags are declared `boolean | string`: some harnesses stringify a boolean, and
+pi's argument validator only coerces the exact lowercase `"true"`/`"false"` — a
+`"True"` would otherwise fail the call before the handler runs. `boolFlag()`
+normalizes `true/false/1/0/yes/no` in any case; anything unparseable falls back to
+the flag's default.
 
 Minimum context: the call **fails when the whole context fits in the keep
 window** (`compactKeepRecentTokens`, default 8k) — there is nothing older

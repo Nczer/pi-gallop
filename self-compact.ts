@@ -982,6 +982,26 @@ export function reset(): void {
 
 // ── Tool registration ──
 
+/** Normalize a boolean tool flag.
+ *  pi validates tool arguments against the declared schema and only coerces the
+ *  exact strings "true"/"false" (packages/ai/src/utils/validation.ts
+ *  coercePrimitiveByType). A harness that stringifies a boolean can send
+ *  "True"/"False"/"1": with `type: "boolean"` the call dies in validation before
+ *  the handler runs, and with a permissive schema `params.continue !== false` is
+ *  true for the string "False" — a requested stop becomes a continue. Unparseable
+ *  values fall back to the flag's default. */
+export function boolFlag(value: unknown, def: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isNaN(value) ? def : value !== 0;
+  if (typeof value === "string") {
+    const s = value.trim().toLowerCase();
+    if (s === "true" || s === "1" || s === "yes") return true;
+    if (s === "false" || s === "0" || s === "no") return false;
+    if (s === "") return def;
+  }
+  return def;
+}
+
 /** Register compact_request and context_status. `registeredKeepTokens` is
  *  the extension's keep window (compactKeepRecentTokens) read at load time —
  *  the checkpoint guidance must name the tail the compact actually keeps; a
@@ -1006,18 +1026,28 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
 
 ${checkpointFormat(registeredKeepTokens)}`,
         },
+        // boolean | string: a stringified boolean must reach the handler (boolFlag)
+        // rather than fail pi's schema validation.
         continue: {
-          type: "boolean",
+          type: ["boolean", "string"],
           description: "Continue working right after compaction or not (default: true — pass false to stop)",
         },
         nuke: {
-          type: "boolean",
+          type: ["boolean", "string"],
           description: `True = only compaction summary survives after compact, summarize everything you need (default: false)`,
         },
       },
       required: ["summary"],
     },
-    async execute(_id: string, params: { summary?: string; continue?: boolean; nuke?: boolean }, _signal, _onUpdate, ctx: ExtensionContext) {
+    async execute(
+      _id: string,
+      params: { summary?: string; continue?: boolean | string; nuke?: boolean | string },
+      _signal,
+      _onUpdate,
+      ctx: ExtensionContext,
+    ) {
+      const nuke = boolFlag(params?.nuke, false);
+      const continueAfter = boolFlag(params?.continue, true);
       // Minimum-context guard: when the whole context fits in pi's configured keep
       // window, pi's prepareCompaction bails before any hook runs — no compact can
       // happen at all (not even a nuke; pi evaluates the cut with the configured
@@ -1028,7 +1058,7 @@ ${checkpointFormat(registeredKeepTokens)}`,
       // threshold check); the keep window is gallop's own compactKeepRecent
       // Tokens (module state, live).
       const usage = ctx.getContextUsage();
-      const tooSmall = tooSmallCompactError(usage?.tokens, keepRecentTokens, params?.nuke === true);
+      const tooSmall = tooSmallCompactError(usage?.tokens, keepRecentTokens, nuke);
       if (tooSmall) throw new Error(tooSmall);
 
       // Stash the model's checkpoint for session_before_compact. A too-short
@@ -1056,7 +1086,7 @@ ${checkpointFormat(registeredKeepTokens)}`,
       // Default continue: an omitted argument keeps working. The failure costs
       // are asymmetric — a mistaken continue costs one idle "nothing to do"
       // turn; a mistaken stop strands the in-flight task at the boundary.
-      pendingCompact = { continue: params?.continue !== false, nuke: params?.nuke === true };
+      pendingCompact = { continue: continueAfter, nuke };
 
       // Do NOT echo the summary in the tool result: after compaction the
       // checkpoint lives in the compaction entry (top of context), and the

@@ -16,6 +16,7 @@ import {
   checkpointFormat,
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
+  boolFlag,
   COMPACT_DONE_MARKER,
   rewriteCompactContext,
   setKeepRecentTokens,
@@ -24,6 +25,28 @@ import {
   sessionRecallAvailable,
   reset,
 } from "../self-compact";
+
+// ── boolFlag (tool boolean args) ──
+
+describe("boolFlag", () => {
+  it("passes real booleans through and defaults on anything unparseable", () => {
+    expect(boolFlag(true, false)).toBe(true);
+    expect(boolFlag(false, true)).toBe(false);
+    expect(boolFlag(undefined, true)).toBe(true);
+    expect(boolFlag(undefined, false)).toBe(false);
+    expect(boolFlag(null, true)).toBe(true);
+    expect(boolFlag({}, true)).toBe(true);
+    expect(boolFlag(NaN, false)).toBe(false);
+  });
+
+  it("reads the strings a harness may stringify a boolean into", () => {
+    for (const t of ["true", "True", "TRUE", "  true  ", "1", "yes"]) expect(boolFlag(t, false)).toBe(true);
+    for (const f of ["false", "False", "FALSE", "  false  ", "0", "no"]) expect(boolFlag(f, true)).toBe(false);
+    // An empty string is "not stated", not "false".
+    expect(boolFlag("", true)).toBe(true);
+    expect(boolFlag("maybe", false)).toBe(false);
+  });
+});
 
 // ── computeSelfCompactFileLists ──
 
@@ -355,6 +378,30 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  // A harness that stringifies a boolean sends "True"/"False"; pi only coerces
+  // the exact lowercase strings, so these must reach the handler and be read
+  // correctly ("False" as a stop — `x !== false` would continue instead).
+  it('reads continue: "False" (stringified) as a stop — no proceed steer', async () => {
+    await callTool({ summary: LONG_SUMMARY, continue: "False" });
+    await settle();
+    const opts = ctx.compact.mock.calls[0][0];
+    pi.sendUserMessage.mockClear();
+    opts.onComplete();
+    await flushTimers();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('reads continue: "True" (stringified) as a continue — proceed steer sent', async () => {
+    await callTool({ summary: LONG_SUMMARY, continue: "True" });
+    await settle();
+    const opts = ctx.compact.mock.calls[0][0];
+    pi.sendUserMessage.mockClear();
+    opts.onComplete();
+    await flushTimers();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+  });
+
   it("fails the call when the context is at or below the keep window — nothing stashed, no deferred compact", async () => {
     ctx.getContextUsage.mockReturnValue({ tokens: 7_500, contextWindow: 200_000, percent: 3.75 });
     await expect(callTool({ summary: LONG_SUMMARY })).rejects.toThrow(/below the compaction minimum/);
@@ -376,8 +423,8 @@ describe("self-compact wiring (in-session summary)", () => {
     const tool = tools.get("compact_request");
     expect(tool.parameters.required).toEqual(["summary"]);
     expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "nuke", "summary"]);
-    expect(tool.parameters.properties.continue.type).toBe("boolean");
-    expect(tool.parameters.properties.nuke.type).toBe("boolean");
+    expect(tool.parameters.properties.continue.type).toEqual(["boolean", "string"]);
+    expect(tool.parameters.properties.nuke.type).toEqual(["boolean", "string"]);
     // The tool description carries the nuke bullet (trigger + full-state
     // obligation); the checkpoint format lives on the summary param — the model
     // reads it while constructing the call.
@@ -425,6 +472,22 @@ describe("self-compact wiring (in-session summary)", () => {
 
     // pi's own cut (entry-123, the configured ~20k window) is replaced by the
     // budget-0 cut point.
+    expect(result?.compaction?.firstKeptEntryId).toBe("a2");
+    compactDone();
+  });
+
+  it('nuke: "True" (stringified) still arms the budget-0 cut', async () => {
+    await callTool({ summary: LONG_SUMMARY, nuke: "True" });
+
+    const result = await handlers.get("session_before_compact")(
+      {
+        preparation: prep(emptyOps()),
+        branchEntries: [fixtureUser("u1", "hello there"), fixtureAssistant("a1", BIG_TEXT), fixtureUser("u2", "second " + BIG_TEXT), fixtureAssistant("a2", "final")],
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+
     expect(result?.compaction?.firstKeptEntryId).toBe("a2");
     compactDone();
   });
