@@ -263,6 +263,23 @@ const CIRCUIT_BREAKER_BLOCKS = 3;     // Total blocks before shutdown
  *  tool_execution_end events carry no args, so we stash them here. */
 const pendingToolCalls = new Map<string, { args: unknown; fingerprint: string }>();
 
+/** Tool calls gallop itself blocked (read guard, failure-loop / repetitive
+ *  enforcement, halt) — recorded by the composition root at tool_call.
+ *  Detection needs the IDENTITY of the block, not its text: gallop also
+ *  rewrites real tool output ("[Gallop] Binary output suppressed…", "[Gallop]
+ *  Collapsed repetitive output…"), and a failed call carrying that text used to
+ *  read as a gallop block — hiding a genuine failure from mismatch and
+ *  repetitive-call detection. pi emits tool_execution_end for blocked calls
+ *  too, so every entry is consumed; the cap bounds a lost end event. */
+const blockedCallIds = new Set<string>();
+export function noteBlockedCall(toolCallId: string): void {
+  blockedCallIds.add(toolCallId);
+  if (blockedCallIds.size > 200) {
+    const oldest = blockedCallIds.values().next().value;
+    if (oldest !== undefined) blockedCallIds.delete(oldest);
+  }
+}
+
 /** History of recent bash failures for loop detection */
 const failureHistory: {
   command: string;    // normalized command
@@ -574,6 +591,9 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
   // Args are not present on tool_execution_end events; retrieve what
   // tool_execution_start stashed for this call.
   const pending = pendingToolCalls.get(event.toolCallId);
+  // Gallop's own block, by call id (see blockedCallIds). Consumed here: pi
+  // always emits tool_execution_end, including for a blocked call.
+  const gallopBlocked = blockedCallIds.delete(event.toolCallId);
 
   // ── Bash failure-loop detection ──
   if (event.toolName === "bash") {
@@ -592,7 +612,11 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
         // Skip Gallop-generated failures: blocked calls still emit
         // tool_execution_end with the block reason as the error result, and
         // recording those would pollute the loop history with block text.
-        if (!fingerprint.startsWith("[gallop]")) {
+        // Identified by the blocked call id — never by the text starting with
+        // "[gallop]": gallop's own output shaping puts that prefix on genuine
+        // failures (binary suppression, repetitive-output collapse), and a
+        // failing grep over gallop's source ends with it too.
+        if (!gallopBlocked) {
           failureHistory.push({
             command: normalized,
             fingerprint,
@@ -609,10 +633,9 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
 
   // ── Track last failed tool call for mismatch detection ──
   const error = event.isError ? extractErrorFingerprint(event.result) : "";
-  // Gallop-generated failures (blocks, circuit breaker) — the block
-  // interceptor already handles those; mismatch and repetitive detection
-  // would only add noise on top of gallop's own signal.
-  const isGallopBlock = error.startsWith("[gallop]");
+  // Gallop's own blocks — the block interceptor already handled those; mismatch
+  // and repetitive detection would only add noise on top of gallop's signal.
+  const isGallopBlock = gallopBlocked;
   if (event.isError) {
     const argFingerprint = normalizeToolArgs(event.toolName, pending?.args);
     lastFailedToolCall = isGallopBlock
@@ -772,6 +795,7 @@ export function onMessageEnd(
  *  start, compaction, and circuit-breaker continue. */
 export function reset(): void {
   pendingToolCalls.clear();
+  blockedCallIds.clear();
   failureHistory.length = 0;
   failureLadder.clear();
   currentTurnIndex = 0;

@@ -118,13 +118,19 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   // ── Tool call interceptor: halt, read guard, enforced blocks ──
   pi.on("tool_call", async (event, ctx) => {
-    // User halted via circuit breaker — block everything
-    if (intervention.halted()) {
-      return { block: true, reason: intervention.haltReason() };
-    }
-    // Circuit breaker tripped — no more auto-intervention
-    if (intervention.tripped()) return;
-    return binary.guardRead(event, ctx) ?? (await intervention.guardToolCall(event, ctx, pi));
+    // User halted via circuit breaker — block everything; circuit breaker
+    // tripped — no more auto-intervention; otherwise the read guard, then the
+    // failure-loop / repetitive enforcement.
+    const decision = intervention.halted()
+      ? { block: true as const, reason: intervention.haltReason() }
+      : intervention.tripped()
+        ? undefined
+        : (binary.guardRead(event, ctx) ?? (await intervention.guardToolCall(event, ctx, pi)));
+    // Record every block gallop issues, by call id: detection tells gallop's own
+    // blocks apart from a real failure whose output gallop reshaped (binary
+    // suppression, repetitive-output collapse) — a text match cannot.
+    if (decision?.block) intervention.noteBlockedCall(event.toolCallId);
+    return decision;
   });
 
   // ── Binary output filter ──

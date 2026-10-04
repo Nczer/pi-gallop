@@ -109,21 +109,35 @@ as an unfulfilled request (the resumed model re-requested compaction, with
 the triggering pressure nudge still standing in the tail). When the summary
 text is verifiably carried by a `compactionSummary` message in context, the
 assistant message carrying the call is rewritten to a fixed completion marker
-(“Compaction complete — the summary at the top of context is your current
-state. Do not call compact_request again unless context pressure returns.”)
-and the paired toolResult is dropped. A call whose text is NOT carried
-(native-fallback compact) keeps its call as a true record and only gets its
-in-progress “Compacting.” result text marked done. Pre-compact tree views
-and aborted compacts (no `compactionSummary` in context) are left intact, so
-a re-request after an aborted compact is still the correct recovery. The
-session file and TUI transcript always retain the full summary; the rewrite
-is deterministic, so the prefix stays cache-stable.
+(“Compacted — proceed. The summary at the top of context is your current
+state; do not call compact_request again.”) and the paired toolResult is
+dropped. A call whose text is NOT carried (native-fallback compact) keeps its
+call as a true record and only gets its in-progress “Compacting.” result text
+marked done.
+
+Two gates decide whether an exchange may be presented as done, because a
+`compact_request` can fail in ways the model cannot see:
+
+- **failure gate** — a result that is not the tool's own `Compacting.` (pi's
+  thrown-error rendering, `isError: true`: validator rejection, too-short
+  checkpoint, minimum-context guard) is a *failed* compact. It is never carried
+  and never marked: the error stays in context so the model fixes the
+  checkpoint and calls again.
+- **timestamp gate** — the newest `compactionSummary` must not be older than the
+  exchange. An aborted/cancelled compact leaves no new entry, and a model
+  re-using an older checkpoint verbatim matches that older entry; in both cases
+  the exchange stays intact and a re-request is the correct recovery.
+
+Pre-compact tree views (no `compactionSummary` in context) are left intact. The
+session file and TUI transcript always retain the full summary; the rewrite is
+deterministic, so the prefix stays cache-stable.
 
 `message_end` triggers nothing (pi emits it *before* pending tools execute) —
 every compact request resolves deterministically at `agent_settled`. A
 re-entrancy guard skips re-triggered `ctx.compact()` calls while a compact is
-in flight (pi would throw "Already compacted"), re-armed at each new user
-turn.
+in flight (pi would throw "Already compacted"), re-armed at each new user turn
+and on a failed/cancelled compact (`session_compact_failed` also re-arms the
+pressure nudge — nothing compacted, so the cycle is not over).
 
 `/qcompact` (v2.0.0–v2.0.2) is gone: the context-pressure nudge below asks the
 model to compact itself as the context fills, and pi's native `/compact`

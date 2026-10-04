@@ -179,6 +179,12 @@ export const SOFT_NUDGE_TOKENS = 100_000;
  *  checkpoint and re-calls; pi's native one-shot never runs on the tool path. */
 const MIN_SUMMARY_LENGTH = 200;
 
+/** The tool's own fixed result text: the ONLY compact_request result that
+ *  means "a compaction is running". Any other text on a compact_request
+ *  toolResult (pi's thrown-error rendering, `isError: true`) is a FAILED
+ *  compact and stays visible to the model — see `rewriteCompactContext`. */
+export const COMPACT_RESULT_TEXT = "Compacting.";
+
 /** The in-context completion marker that replaces a compact_request exchange
  *  once the compaction has run (see the `context` handler). A fixed string —
  *  the rewrite must be deterministic or the request prefix loses cache
@@ -186,7 +192,7 @@ const MIN_SUMMARY_LENGTH = 200;
  *  top summary is pi's one-shot, not the model's checkpoint. Revocable by
  *  design — a later task that fills the context again may compact again. */
 export const COMPACT_DONE_MARKER =
-  "[Gallop] Compaction complete — the summary at the top of context is your current state. Do not call compact_request again unless context pressure returns.";
+  "[Gallop] Compacted — proceed. The summary at the top of context is your current state; do not call compact_request again.";
 
 /** Checkpoint summary format — the exact format the model must use, carried
  *  by the compact_request tool description (system prompt). The kept-tail
@@ -576,9 +582,13 @@ function triggerCompaction(
       }
     },
     onError: () => {
-      // Compaction failed or was cancelled — mark it as no longer running so a
-      // later attempt isn't blocked.
+      // Compaction failed or was cancelled — clear BOTH latches. Leaving
+      // compactionInFlight set re-arms only at the next user message, so a
+      // compact_request later in the same run hits the re-entrancy guard and
+      // silently no-ops after the tool already answered "Compacting." — a
+      // masked no-op, the same class as masking a failed compact.
       compactionRunning = false;
+      compactionInFlight = false;
     },
   });
 }
@@ -788,13 +798,25 @@ export function onBeforeCompact(
 //    toolResult is dropped. The marker closes the loop in place — right
 //    after the work, before the user's next message — and points to the
 //    summary at the top of context.
-//  - Not carried (native-fallback: a too-short/absent summary, so pi's
-//    one-shot ran): the call stays as a true record of the model's short
-//    text, but its "Compacting." result reads as in-progress — rewrite
-//    just the result text to the marker once any compaction summary is in
-//    context. (Edge: an ABORTED botched compact with an OLDER compaction in
-//    context is marked done too; a missed re-request then waits for the next
-//    pressure point — pi's overflow recovery still backstops.)
+//  - Not carried (native-fallback: pi's one-shot ran instead of the stashed
+//    checkpoint): the call stays as a true record of the model's text, but its
+//    "Compacting." result reads as in-progress — rewrite just the result text
+//    to the marker when a compaction summary NEWER than the exchange is in
+//    context.
+//
+// Two gates decide whether an exchange may be presented as done, because a
+// compact_request call can fail silently from the model's side:
+//  - failure gate: a result that is not the tool's own "Compacting." (pi's
+//    thrown-error rendering, `isError: true`) is a FAILED compact — validator
+//    rejection, too-short checkpoint, minimum-context guard. It is never
+//    carried and never marked: the model must see the error to fix the
+//    checkpoint and re-call. (Field: a params-validation rejection was
+//    rewritten to the done marker — the model read a compact that never ran as
+//    a completed one, and the summary at the top of context was an older one.)
+//  - timestamp gate: the newest compaction entry must not be older than the
+//    exchange. An aborted/cancelled compact leaves no new entry, and a model
+//    re-using an older checkpoint verbatim matches that older entry; in both
+//    cases the exchange stays intact and a re-request is the correct recovery.
 //  - Batched with sibling tool calls: the message, siblings and their
 //    results stay; the compact block drops and the marker is appended as a
 //    text block so the completion remains visible.
@@ -802,9 +824,8 @@ export function onBeforeCompact(
 //    no marker — a toolResult without its toolCall is an API error, and the
 //    top summary already says compaction happened.
 //
-// Pre-compact tree views (no compactionSummary message) and aborted compacts
-// leave everything intact — on abort "Compacting." is true, and a
-// re-request is the correct recovery. The triggering nudge is left untouched
+// Pre-compact tree views (no compactionSummary message) leave everything
+// intact. The triggering nudge is left untouched
 // (a live post-compaction nudge is indistinguishable from a stale one in the
 // rendered context); with the marker present it reads as fulfilled. The
 // session file is never touched (the TUI transcript still shows the full
@@ -812,6 +833,14 @@ export function onBeforeCompact(
 export function onContext(event: { messages: unknown }): { messages: any[] } | undefined {
   const rewritten = rewriteCompactContext(event.messages as any[]);
   return rewritten ? { messages: rewritten } : undefined;
+}
+
+/** True when the content is the tool's own fixed "Compacting." result — the
+ *  only result text that means a compaction is running. */
+function hasCompactingResultText(content: unknown): boolean {
+  return Array.isArray(content) && content.some(
+    (b: any) => b?.type === "text" && typeof b.text === "string" && b.text.trim() === COMPACT_RESULT_TEXT,
+  );
 }
 
 /** The pure context rewrite. Pure function of the in-context message list —
@@ -830,6 +859,54 @@ export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
     }
   }
   if (compactionSummaries.length === 0) return undefined;
+
+  // A compact_request result that is not the tool's own "Compacting." is a
+  // FAILED compact: pi renders a thrown error (validator rejection, too-short
+  // checkpoint, minimum-context guard) as the toolResult with `isError: true`.
+  // Such a call is never carried and its result is never marked done — the
+  // model must see the failure to fix the checkpoint and re-call. (Field:
+  // a params-validation rejection was rewritten to the done marker, so the
+  // model read a compact that never ran as a completed one.)
+  const failedCallIds = new Set<string>();
+  for (const m of messagesIn) {
+    if (m?.role !== "toolResult" || m?.toolName !== "compact_request") continue;
+    if (typeof m.toolCallId !== "string") continue;
+    if (m.isError === true || !hasCompactingResultText(m.content)) failedCallIds.add(m.toolCallId);
+  }
+
+  // Did a compaction actually run AFTER this exchange? A text match or an
+  // in-progress result is not proof on its own: an aborted/cancelled compact
+  // leaves no new entry at all, and a model that re-uses an older checkpoint
+  // verbatim matches that older entry. The newest compaction entry must not be
+  // older than the exchange (earliest of the call message and its result).
+  // Missing timestamps degrade to the pre-gate behavior (mark done) — the
+  // gate only vetoes what it can actually date.
+  let newestSummaryTs = -1;
+  for (const m of messagesIn) {
+    if (m?.role === "compactionSummary" && typeof m.timestamp === "number" && m.timestamp > newestSummaryTs) {
+      newestSummaryTs = m.timestamp;
+    }
+  }
+  const exchangeTs = new Map<string, number>();
+  const noteExchangeTs = (id: string, ts: unknown): void => {
+    if (typeof ts !== "number") return;
+    const prev = exchangeTs.get(id);
+    if (prev === undefined || ts < prev) exchangeTs.set(id, ts);
+  };
+  for (const m of messagesIn) {
+    if (m?.role === "toolResult" && m?.toolName === "compact_request" && typeof m.toolCallId === "string") {
+      noteExchangeTs(m.toolCallId, m.timestamp);
+    } else if (Array.isArray(m?.content)) {
+      for (const b of m.content) {
+        if (b?.type === "toolCall" && b.name === "compact_request" && typeof b.id === "string") noteExchangeTs(b.id, m.timestamp);
+      }
+    }
+  }
+  const compactRanAfter = (id: string): boolean => {
+    if (newestSummaryTs < 0) return false;
+    const t = exchangeTs.get(id);
+    return t === undefined || newestSummaryTs >= t;
+  };
 
   // Classify every compact_request call in context (also feeds orphan
   // detection):
@@ -850,6 +927,8 @@ export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
       if (
         typeof summary === "string" &&
         summary.length >= MIN_SUMMARY_LENGTH &&
+        !failedCallIds.has(block.id) &&
+        compactRanAfter(block.id) &&
         compactionSummaries.some((s) => s.startsWith(summary))
       ) {
         carriedCallIds.add(block.id);
@@ -861,13 +940,28 @@ export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
   const messages: any[] = [];
   for (const msg of messagesIn) {
     // compact_request toolResult: orphan (call summarized out of the window)
-    // → drop (an unpaired toolResult is an API error); paired with a carried
-    // call → drop (the marker message carries the closure); paired with a
-    // fallback call → rewrite the in-progress text to the marker.
+    // → drop (an unpaired toolResult is an API error); a FAILED result → pass
+    // through untouched; paired with a carried call → drop (the marker message
+    // carries the closure); paired with a fallback call → rewrite the
+    // in-progress text to the marker.
     if (msg?.role === "toolResult" && msg?.toolName === "compact_request") {
       const id = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
-      if (!id || !callIdsInContext.has(id) || carriedCallIds.has(id)) {
+      if (!id || !callIdsInContext.has(id)) {
         changed = true;
+        continue;
+      }
+      if (failedCallIds.has(id)) {
+        messages.push(msg);
+        continue;
+      }
+      if (carriedCallIds.has(id)) {
+        changed = true;
+        continue;
+      }
+      if (!compactRanAfter(id)) {
+        // No compaction entry newer than this call (aborted/cancelled compact):
+        // "Compacting." stays as it is — a re-request is the correct recovery.
+        messages.push(msg);
         continue;
       }
       messages.push({ ...msg, content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
@@ -952,9 +1046,16 @@ export function scheduleEvidenceBlocks(blocks: EvidenceBlocks, pi: ExtensionAPI)
 /** session_compact_failed: the compact did not run — deliver the swallowed
  *  messages anyway (they would have run on the un-compacted context, so
  *  dropping them would lose user input). Safe to submit now: pi clears its
- *  compaction-in-progress flag before emitting this event. */
+ *  compaction-in-progress flag before emitting this event.
+ *  Re-arms the cycle: nothing compacted, so the pressure nudge must be able
+ *  to fire again (reset() runs only on session_start / a successful compact,
+ *  so without this the nudge stays spent for the rest of the session) and the
+ *  compact latches must not strand a later request. */
 export function onCompactFailed(pi: ExtensionAPI): void {
   pendingBlocks = null; // failed compact: no dangling blocks
+  contextNudgeState = "idle";
+  compactionRunning = false;
+  compactionInFlight = false;
   const stashed = stashedInputs;
   stashedInputs = [];
   if (stashed.length > 0) sendStashed(stashed, pi);

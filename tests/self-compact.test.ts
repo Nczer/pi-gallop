@@ -1395,6 +1395,110 @@ describe("rewriteCompactContext (compact_request exchange → completion marker)
     expect(result.some((m: any) => m?.toolName === "compact_request" && m?.toolCallId === "tc1")).toBe(false); // tc1 result dropped
   });
 
+  it("leaves a failed compact_request result visible instead of marking it done", async () => {
+    // The masking defect (field): pi's params validator rejected the call
+    // (`expected boolean, got "True"`) before execute() ran, so no compaction
+    // happened — yet the rewrite marked the result done and the model read a
+    // failed compact as a completed one. A non-"Compacting." result must pass
+    // through untouched, and with nothing else to rewrite the handler is inert.
+    const failed = {
+      ...compactToolResult(),
+      isError: true,
+      content: [{ type: "text", text: 'Error: Invalid argument: params.continue expected boolean, got "True"' }],
+    };
+    const result = rewriteCompactContext([
+      compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+      requestCompactCall("A different checkpoint, long enough to matter. ".repeat(7)),
+      failed,
+    ]);
+    expect(result).toBeUndefined();
+  });
+
+  it("never treats a failed call as carried, even when its summary text matches the compaction entry", async () => {
+    // A carried classification alone used to be enough to drop the result and
+    // replace the call with the marker. An error result vetoes it: the whole
+    // exchange stays as the true record of the failure.
+    const failed = {
+      ...compactToolResult(),
+      isError: true,
+      content: [{ type: "text", text: "Error: Checkpoint summary too short (12 chars; minimum 200)." }],
+    };
+    const result = rewriteCompactContext([
+      compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+      requestCompactCall(LONG_SUMMARY),
+      failed,
+    ]);
+    expect(result).toBeUndefined();
+  });
+
+  it("treats a result without the tool's own text as failed even when isError is absent", async () => {
+    // pi sets isError on thrown-tool results, but the text check is the
+    // primary signal: an unexpected result body is not a running compaction.
+    const odd = { ...compactToolResult(), content: [{ type: "text", text: "Compaction skipped: nothing to do." }] };
+    const result = rewriteCompactContext([
+      compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+      requestCompactCall(LONG_SUMMARY),
+      odd,
+    ]);
+    expect(result).toBeUndefined();
+  });
+
+  it("marks the genuine compact done while a failed sibling call stays visible", async () => {
+    const failedCheckpoint = "A checkpoint whose compact was rejected by the validator. ".repeat(5);
+    const failed = {
+      ...compactToolResult("tc2"),
+      isError: true,
+      content: [{ type: "text", text: 'Error: Invalid argument: params.nuke expected boolean, got "True"' }],
+    };
+    const result = rewriteCompactContext([
+      compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)),
+      requestCompactCall(failedCheckpoint, "tc2"),
+      failed,
+      requestCompactCall(LONG_SUMMARY, "tc1"),
+      compactToolResult("tc1"),
+    ]);
+    expect(result).toBeDefined();
+    expect(result).toHaveLength(4);
+    expect(result[1]).toEqual(requestCompactCall(failedCheckpoint, "tc2")); // call kept as a record
+    expect(result[2]).toEqual(failed); // error text intact
+    expect(result[3]).toEqual({ role: "assistant", content: [{ type: "text", text: COMPACT_DONE_MARKER }] });
+    expect(result.some((m: any) => m?.toolCallId === "tc1")).toBe(false); // tc1 result dropped
+  });
+
+  it("leaves an in-progress result when the only compaction entry is older than the exchange (aborted compact)", async () => {
+    // The compact was cancelled: no new entry exists, so the tool's own
+    // "Compacting." must not read as done — the model re-requests.
+    const older = { ...compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)), timestamp: 1000 };
+    const call = { ...requestCompactCall("A fresh checkpoint, long enough to matter. ".repeat(7)), timestamp: 5000 };
+    const result = rewriteCompactContext([older, call, { ...compactToolResult(), timestamp: 5001 }]);
+    expect(result).toBeUndefined();
+  });
+
+  it("does not mark an exchange carried only by an OLDER compaction entry", async () => {
+    // The model re-used the previous checkpoint verbatim and that compact was
+    // aborted: the text match is real but predates the exchange, so the whole
+    // exchange stays as the record.
+    const older = { ...compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)), timestamp: 1000 };
+    const result = rewriteCompactContext([
+      older,
+      { ...requestCompactCall(LONG_SUMMARY), timestamp: 5000 },
+      { ...compactToolResult(), timestamp: 5001 },
+    ]);
+    expect(result).toBeUndefined();
+  });
+
+  it("replaces the exchange when the compaction entry is newer than it (timestamped control)", async () => {
+    const newer = { ...compactionSummaryMsg(appendSelfCompactFileOps(LONG_SUMMARY, emptyFileOps)), timestamp: 6000 };
+    const result = rewriteCompactContext([
+      newer,
+      { ...requestCompactCall(LONG_SUMMARY), timestamp: 5000 },
+      { ...compactToolResult(), timestamp: 5001 },
+    ]);
+    expect(result).toBeDefined();
+    expect(result[1].content).toEqual([{ type: "text", text: COMPACT_DONE_MARKER }]);
+    expect(result.some((m: any) => m?.toolName === "compact_request")).toBe(false);
+  });
+
   it("markers the newest compacted exchange when an older compaction entry sits in the kept tail", async () => {
     // Task-boundary compaction: the previous compaction entry falls inside
     // the newest compaction's kept tail, so context holds TWO compaction

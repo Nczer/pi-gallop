@@ -186,6 +186,35 @@ describe("circuit breaker dialog handling", () => {
   });
 });
 
+describe("gallop-shaped text on a real failure", () => {
+  let pi: any;
+  let handlers: Map<string, any>;
+
+  beforeEach(() => {
+    ({ pi, handlers } = makeMockPi());
+    gallopExtension(pi);
+    void handlers.get("session_compact")(null, NO_UI);
+  });
+
+  it("counts a genuine failure whose output carries gallop's own text", async () => {
+    // Gallop's output shaping prefixes real results ("[Gallop] Collapsed
+    // repetitive output…", "[Gallop] Binary output suppressed…"), and a failing
+    // grep over gallop's source ends with such a line too. Matching the text
+    // read those as gallop blocks and hid the failure from the failure-loop and
+    // mismatch detection; blocks are identified by call id now.
+    for (let i = 1; i <= 3; i++) {
+      await runCall(handlers, NO_UI, {
+        id: `g${i}`,
+        toolName: "bash",
+        args: { command: "grep -rn Gallop src" },
+        isError: true,
+        resultText: "grep: src: No such file or directory\n[Gallop] Collapsed repetitive output: 4000 lines",
+      });
+    }
+    expect(steers(pi).filter((t) => t.includes("Failure loop detected"))).toHaveLength(1);
+  });
+});
+
 describe("failure window across runs", () => {
   let pi: any;
   let handlers: Map<string, any>;
