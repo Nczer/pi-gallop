@@ -317,17 +317,38 @@ export function buildEvidence(
       "fragment is elided. Omitted results are unknown, not absent-as-success.";
   const lines: string[] = [];
   let budget = EVIDENCE_BUDGET_CHARS;
-  for (const r of ordered) {
+  let droppedNoPointer = 0;
+  let droppedBudget = 0;
+  for (let i = 0; i < ordered.length; i++) {
+    const r = ordered[i];
     const n = pointers ? lineNo.get(r.entryId) : undefined;
-    if (pointers && !n) continue;
+    if (pointers && !n) {
+      droppedNoPointer++;
+      continue;
+    }
     const line = `${pointers ? `L${n} ` : ""}${r.tool}${r.target ? " " + r.target : ""}${r.isError ? " ERR" : ""} :: ${truncateMiddle(r.text)}`;
-    if (line.length > budget) break;
+    if (line.length > budget) {
+      droppedBudget = ordered.length - i;
+      break;
+    }
     lines.push(line);
     budget -= line.length;
-    if (budget < 40) break;
+    if (budget < 40) {
+      droppedBudget = ordered.length - i - 1;
+      break;
+    }
   }
   if (lines.length === 0) return undefined;
-  return [header, ...lines].join("\n");
+  // What is missing has to be as visible as what is here: the model cannot
+  // tell a dropped result from one that never happened otherwise.
+  const notes: string[] = [];
+  if (droppedNoPointer > 0)
+    notes.push(
+      `${droppedNoPointer} result(s) have no line pointer and are not listed — reach them with session_recall keywords.`,
+    );
+  if (droppedBudget > 0)
+    notes.push(`${droppedBudget} older result(s) omitted (line budget).`);
+  return [header, ...notes, ...lines].join("\n");
 }
 
 // ── Entry point ──

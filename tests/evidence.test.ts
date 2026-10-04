@@ -275,7 +275,7 @@ describe("buildEvidence", () => {
       entries.push(asstCall(`a${i}`, `c${i}`, "bash", { command: `cmd${i}` }));
       entries.push(result(`r${i}`, `c${i}`, "bash", "out " + i + " " + "z".repeat(400)));
     }
-    const out = buildEvidence(entries, 0, entries.length, lineNo(entries.map((e) => e.id)));
+    const out = buildEvidence(entries, 0, entries.length, lineNoMap(entries.map((e) => e.id)));
     expect(out).toBeDefined();
     const rows = out!.split("\n").slice(1);
     expect(rows.length).toBeLessThan(40);
@@ -340,5 +340,42 @@ describe("buildEvidenceBlocks", () => {
   it("is fail-open on bad input", () => {
     expect(buildEvidenceBlocks([], "x", null)).toBeNull();
     expect(buildEvidenceBlocks([user("u1", "a")], "absent", null)).toBeNull();
+  });
+});
+
+const lineNoMap = (ids: string[]) => new Map(ids.map((id, i) => [id, i + 1]));
+
+describe("buildEvidence disclosure", () => {
+  it("discloses rows dropped by the line budget", () => {
+    const entries: SessionEntry[] = [];
+    const long = "x".repeat(600);
+    for (let i = 0; i < 40; i++) {
+      entries.push(asstCall(`a${i}`, `c${i}`, "read", { path: `/f${i}.ts` }));
+      entries.push(result(`r${i}`, `c${i}`, "read", long));
+    }
+    const out = buildEvidence(entries, 0, entries.length, lineNoMap(entries.map((e) => e.id)));
+    expect(out).toBeDefined();
+    const rows = out!.split("\n").filter((l) => /^L\d+ read /.test(l));
+    expect(rows.length).toBeLessThan(40); // the budget really did cut rows
+    const lines = out!.split("\n");
+    const noteIdx = lines.findIndex((l) => /^\d+ older result\(s\) omitted \(line budget\)\.$/.test(l));
+    const rowIdx = lines.findIndex((l) => /^L\d+ read /.test(l));
+    expect(noteIdx).toBeGreaterThan(0); // after the header
+    expect(noteIdx).toBeLessThan(rowIdx); // and before the rows it explains
+    expect(40 - rows.length).toBeGreaterThan(0);
+  });
+
+  it("discloses results that have no line pointer", () => {
+    const entries = [
+      asstCall("a1", "c1", "read", { path: "/x.ts" }),
+      result("r1", "c1", "read", "kept"),
+      asstCall("a2", "c2", "read", { path: "/y.ts" }),
+      result("r2", "c2", "read", "no pointer for this one"),
+    ];
+    const out = buildEvidence(entries, 0, 4, new Map([["r1", 2]])); // r2 missing
+    expect(out).toBeDefined();
+    expect(out).toContain("1 result(s) have no line pointer");
+    expect(out).toContain("session_recall keywords");
+    expect(out).not.toContain("no pointer for this one");
   });
 });
