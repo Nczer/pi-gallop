@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.2.0 — 2026-10-04
 
 ### Fixed
 - **User messages swallowed by the pending-compact input gate could be lost** — `onInput` tells the user the message "will run after the pending compaction", but delivery was fire-and-forget (`void pi.sendUserMessage`) from a timer closure, and the stash was emptied before the send. A send pi refuses (`prompt()` throws while its compaction-in-progress flag is still set) lost the message with no retry, and a second `session_compact` inside the 200 ms delay cancelled the timer and dropped its payload. The owed payload is now module-owned instead of captured by the timer closure, so a second compact folds it into the next redelivery and a re-scheduled redelivery appends rather than overwrites. A send pi refuses cannot be detected from the extension API at all: `ExtensionAPI.sendUserMessage` is typed `Promise<void>` (extensions/types.ts:400) while the runtime bridge returns `void` and swallows the rejection into `runner.emitError` (agent-session.ts:2469) — the handler type is `=> void` (types.ts:1585). Writing `.catch()` on it would throw a TypeError, and no retry can be conditioned on a signal that does not exist; pi's extension-error event is the only record.
@@ -39,7 +39,7 @@
 ### Tests
 - `keepRecentTokens` merge/fallback units (project wins over global, 20k default) and `checkpointFormat` interpolation. Marker-handler suite: carried exchange → marker (with the field double-compact repro — nudge in tail stays, exchange becomes the marker), native-fallback result rewrite, multi-call mixed carried/fallback, two-compaction tail, batched siblings + appended marker, orphan drop, no-compaction no-rewrite. Nudge suite: real pi order — message_end *before* the compact_request-bearing message's execute (no nudge; pending guard holds the same cycle) and message-scoped skip (a fresh cycle after `session_compact` still nudges). Nudge settings: `setNudgeSettings` units (both keys, partial updates keep missing values, invalid values keep the previous, negatives clamp to 0) and an integration through the real `session_start` load path (settings-ext.json → buffer on the enabled branch, custom no-backstop threshold on the disabled branch, settings surviving the `session_compact` reset). `context_status` units for both configured thresholds (advice tiers + threshold line, enabled and disabled). `context_status` suite: `formatTokenCount` (k/M trims), advice-tier units (both backstop states, custom `reserveTokens`), `buildContextStatusText` (full text, `null`/no-usage, auto-compact OFF, overflow clamp), and an integration test (no params, no terminate, live project-settings read with $HOME isolation). Renderer smoke for `context_status` (title line, collapsed usage line vs expanded full text, partial warning). Input-gate suite: swallow only while pending and only for interactive sources, in-order re-delivery with steer suppression (manual + auto paths), immediate delivery on `session_compact_failed`, steer preserved when nothing was stashed, stash discarded on session reset. Minimum-context guard: `tooSmallCompactError` units (at/below window, above, `null`/`undefined` usage, custom keep window, nuke on a small session → escape-hatch message) and integration (below-minimum call rejects and `agent_settled` arms no compact; `null` usage proceeds and defers normally; all `compact_request`-calling ctx mocks report usage above the window). `nuke` flag: `computeCustomFirstKeptEntryId` units (budget 0 → last turn's tail, intermediate keep, budget-above-context, empty, previous-compaction boundary) and integration (nuke replaces pi's cut with the budget-0 cut point; non-nuke keeps pi's cut; nuke on a small session rejects with no deferred compact). The marker suite now exercises `rewriteCompactContext` directly — the context rewrite extracted as a pure function, no extension boot. Escalation-ladder suite: the shared engine is now a state-owning ladder (`createEscalationLadder`) the detectors drive through `bump` — first-threshold nudge, immediate escalation on ignored warning, threshold block, silence at max, below-threshold entry removal, UI notification severity, quiesce while the breaker is tripped. `buildBinarySuppressionSummary` fixtures: verbatim full format (null bytes, read source), U+FFFD wall with bash source + long-command shortening, head/tail lines + total for long output. Window-scaled nudge: `nudgeThreshold` units (window floor + 25% default across 65k/114k/200k windows, both branches, no window → fixed base, window floor vs custom reserve), `compactNudgePct` units (0 = fixed base, invalid keeps previous, out-of-range clamps to [0, 1]), scaled nudge integration (enabled + disabled branches on a 200k window, pct 0 → fixed 16384), the `session_start` load path now includes the pct (disabled-branch threshold 20k = 10% of 200k proves the file value loaded), and `context_status` scaled-tier units (114k window) plus threshold-line assertions updated to the scaled values. Evidence package: 25 units (`lineNumbersFor` id→line map, `coveredRange` start/end + previous-compaction boundary, `buildProtected` verbatim/synthetic-filter/hint-strip/budget-newest-first/truncate-newest/labeled-omissions/empty, `buildEvidence` errors-first/grouping/priority-targets/row-format/budget, `buildEvidenceBlocks` fail-open incl. unreadable-file → protected-only) plus a smoke test against a real session JSONL (L pointers round-trip to the covered toolResults — which caught and fixed a multi-line bash target bug: group key = the full whitespace-collapsed command, display = 60 chars). Keep window: guard uses the extension window (12k: 15k proceeds where pi's 20k rejects, 10k rejects), an invalid file value keeps the *previous* window (15k pre-set: 12k rejects where the 8k default would proceed), cut override moves the cut later (5k ≠ 20k) and stays at pi's cut when the windows match (extension window explicitly 20k) or when the event carries no branch entries (fail-open), checkpoint guidance names the file value (~20k with file, ~8k default without), evidence delivery (protected-only when the session file is missing; both blocks when it exists, L pointer landing on the toolResult line, `display: false` + `triggerTurn: false` on both; fixtures padded ~10k tokens so the 8k default cut leaves the target in the covered span). The wiring suite is $HOME-isolated so the factory-time settings-ext.json read never touches the real user file. 248 tests total.
 
-## v2.1.0
+## v2.1.0 — 2026-08-19
 
 ### Fixed
 - **Double compact at the automatic threshold ("Compaction failed: Already compacted")** — when a run's final usage crossed pi's automatic threshold (default 16k remaining), the `request_compact` compact — fired inside the tool's `execute` — always lost the race: `ctx.compact()` first awaits the agent to go idle, which only happens AFTER pi's post-run loop where the automatic compact runs. The automatic compact consumed the stashed checkpoint first, then the manual compact threw "Already compacted" and the TUI showed an error. The compact is now deferred: the tool stashes the summary, marks the request pending, and returns `terminate: true`; the actual `ctx.compact()` fires on `agent_settled` (emitted after the post-run loop). If the automatic compact ran first, `session_compact` clears the pending state and the deferred trigger is a no-op (a second check that the branch does not already end in a compaction entry). In the race case the `continue` steer is sent from `session_compact` instead of the (never-run) manual `onComplete`. `message_end` now triggers nothing (pi emits it *before* pending tool calls execute), so the v2.0.1 pending-call special case is gone with it.
@@ -53,12 +53,12 @@
 ### Tests
 - Rewrote the self-compact suite for the deferred semantics (stashes + defers to `agent_settled`, re-entrancy guard, `message_end` with a pending `request_compact` triggers nothing, state reset on `session_compact`, branch-ending check, and the 16k race regression — automatic compact consumes the stashed summary → deferred trigger is a no-op, continue steer sent from `session_compact`). New `context-pressure nudge` suite (threshold math from settings — per-key merge, project override, disabled → 16k, missing/malformed fallback; one nudge on the enabled and disabled paths, reset after compaction, skip conditions) and `contextTokensFromUsage` units. 118 tests total.
 
-## v2.0.2
+## v2.0.2 — 2026-08-17
 
 ### Changed
 - **`/qcompact` steering message simplified** — it no longer embeds the full checkpoint format (~1k tokens); the format lives only in the `request_compact` tool description (system prompt), which the steering message now references. Saves duplicated tokens on every `/qcompact` steer.
 
-## v2.0.1
+## v2.0.1 — 2026-08-17
 
 ### Fixed
 - **`/qcompact` native fallback fired before the model's `request_compact` call executed** — pi emits `message_end` *before* pending tool calls run, so the "model did not comply" fallback saw the steering still armed, started an un-stashed native compact, and pi's `compact()` (which aborts the run first) killed the pending `request_compact` tool call — the tool result became `Operation aborted`, its trigger was blocked by the re-entrancy guard, and the compaction entry was a stale native one-shot rewrite instead of the model's checkpoint. The fallback now skips `message_end`s that carry a pending `request_compact` tool call (keeping the steering armed for the next `message_end`); any other pending tool call or text end still falls back immediately.
@@ -66,7 +66,7 @@
 ### Tests
 - Added 2 regression tests: pending `request_compact` defers the fallback (the subsequent tool execution triggers the in-session compact with the stashed summary), and a non-`request_compact` pending call still triggers the native fallback.
 
-## v2.0.0
+## v2.0.0 — 2026-08-17
 
 ### Changed
 - **Self-compact: the model writes the checkpoint summary in-session** — `request_compact` now requires a `summary` argument written by the live model (pi's checkpoint format, focused on older work since the recent ~20k tokens are kept verbatim). Summarization happens inside the session as a normal turn, so that LLM call rides the session's cached prompt prefix (cache-warm) — no subprocess, no cold prefill of the flattened conversation. Gallop stashes the summary and returns it as a custom `CompactionResult` in `session_before_compact` (with pi's file-list sections appended), so pi skips its one-shot summarizer.
@@ -84,7 +84,7 @@
 ### Tests
 - Rewrote `self-compact.test.ts` (110 tests passing total): file-list helpers, tool behavior (stashing, terminate result, message defaulting, no summary echo, `continue` on/off), `session_before_compact` (custom compaction with file ops, native fallback for missing/short summaries, abort-listener register/cleanup, no stale-summary reuse), re-entrancy guard, `/qcompact` (steering content, focus, non-compliance fallback, no double-compact on compliance, refusal while running), state reset on `session_compact`, and the `context` summary-arg pruning handler (prune on verbatim carry, no-op without a compaction summary, non-matching/too-short args intact, multi-call selection, non-array content tolerated).
 
-## v1.6.1
+## v1.6.1 — 2026-08-01
 
 ### Fixed
 - **Repetitive-call "nudge+" level dead for successful streaks** — the v1.6.0 success-clearing wiped the current streak's escalation entry too, so count 4 sent a plain nudge instead of the escalated "previous nudge was ignored" warning. Success now clears only entries for *other* fingerprints, keeping the active streak's nudge → nudge+ → block ladder intact while still un-sticking unrelated blocked calls.
@@ -92,7 +92,7 @@
 ### Tests
 - Added `escalate()` engine tests (level transitions, immediate escalation, max-level silence, below-threshold decay, UI notifications with severity) and `normalizeToolArgs` coverage for the `edit` branch.
 
-## v1.6.0
+## v1.6.0 — 2026-08-01
 
 ### Fixed
 - **Sticky repetitive-call blocks** — a blocked fingerprint stayed hard-blocked for the whole session (until compaction/restart), so a legitimate later re-use of the same call (e.g. `npm run build` after editing files) was blocked on first occurrence with a misleading message. A successful call now clears the repetitive escalation state, mirroring the failure-loop success clearing.
@@ -107,13 +107,13 @@
 ### Changed
 - Dead block thresholds (7) replaced with the effective 5.
 
-## v1.5.0
+## v1.5.0 — 2026-07-23
 
 ### Added
 - **Read guard for binary files** — `read` calls on known binary extensions (`.pdf`, `.docx`/`.xlsx`/`.pptx`, archives, databases, compiled binaries, media, fonts, design/CAD files, e-books) are blocked at `tool_call` with a remediation hint (e.g. "Use the pdf skill"). The pi read tool has no binary detection and would otherwise dump raw bytes as garbled text into context. Image formats are excluded — both natively supported ones (jpg/png/gif/webp/bmp) and unsupported ones (tiff/heic/...), since pi may add support without notice; the result sniff below covers them. Toggle via `/gallop-read-guard [on|off]` (persisted as `gallopReadGuardEnabled`, default on).
 - **Read-result binary sniffing** — the binary output filter now also covers `read` tool results as a safety net for misnamed or extension-less binaries (e.g. a PDF named `report.txt`) and unsupported image formats. Image reads are unaffected (their text note is printable).
 
-## v1.4.0
+## v1.4.0 — 2026-07-21
 
 ### Fixed
 - **False-positive repetitive-call blocks for nested args** — the default fingerprint branch used `JSON.stringify(a, Object.keys(a).sort())`, and an array replacer drops keys at *every* depth, so `{query:"q", options:{limit:5}}` and `{query:"q", options:{limit:99}}` fingerprinted identically. Replaced with a recursive stable stringify. The test covering this branch also used the `edit` tool name, which has its own branch — now uses `write` plus two nested-args regression tests.
@@ -122,7 +122,7 @@
 - **Potential `pendingToolCalls` leak** — `tool_execution_start` stashes before `tool_call` runs; if `tool_execution_end` never fires for a blocked call, the entry would leak. Map is now capped at 200 entries (oldest dropped).
 - **README** — hex head preview documented as 16 bytes; code dumps 64.
 
-## v1.3.0
+## v1.3.0 — 2026-07-03
 
 ### Fixed
 - **Stall detection for tool-call stops** — `lastItemIsToolUse` checked `type === "tool_use"` but assistant content blocks use `type === "toolCall"`, so it always returned false and "stopped after tool call" stalls were never detected. Now checks `"toolCall"`.
@@ -137,7 +137,7 @@
 ### Performance
 - **Binary filter** — encodes the bash output to bytes once instead of twice when building the suppression summary.
 
-## v1.2.2
+## v1.2.2 — 2026-06-29
 
 ### Added
 - **Binary suppression head/tail preview** — when suppressing binary output, now shows first 3 and last 5 readable lines (stripped of control chars) so the user can verify the command ran correctly without flooding context
@@ -145,13 +145,13 @@
 ### Changed
 - **request_compact tool description** — added "Call when" guidance for clearer LLM trigger conditions
 
-## v1.2.1
+## v1.2.1 — 2026-06-28
 
 ### Added
 - **Edit tool fingerprinting** — `edit` calls are fingerprinted by `path` + short `oldText` prefix per edit, so edits to different regions get distinct fingerprints and won't trigger false repetitive-call detection
 - **Edit repetitive-call hint** — suggests making multiple distinct edits in one call instead of repeating the same edit
 
-## v1.2.0
+## v1.2.0 — 2026-06-26
 
 ### Added
 - **Reasoning-action mismatch detection** — catches when LLM acknowledges an error in thinking but repeats the same failed tool call
