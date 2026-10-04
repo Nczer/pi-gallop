@@ -24,6 +24,8 @@ import {
   noteProviderTools,
   sessionRecallAvailable,
   reset,
+  scheduleStashedRedelivery,
+  onCompacted,
 } from "../self-compact";
 
 // ── boolFlag (tool boolean args) ──
@@ -1587,5 +1589,40 @@ describe("rewriteCompactContext (compact_request exchange → completion marker)
     // recovery — so the handler must not rewrite anything.
     const result = rewriteCompactContext([requestCompactCall("too short"), compactToolResult()]);
     expect(result).toBeUndefined();
+  });
+});
+
+// ── Stashed user input must survive a failed or interrupted delivery ──
+// onInput swallows a typed message with the promise that it runs after the
+// pending compaction. A send that pi refuses (prompt() throws while its
+// compaction-in-progress flag is still set) or a second compact landing
+// inside the redelivery delay must not turn that promise into a loss.
+
+describe("stashed redelivery (user input is never dropped)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    reset();
+  });
+
+  it("folds an owed redelivery into a second compact inside the delay window", () => {
+    reset();
+    const pi: any = { sendUserMessage: vi.fn(), sendMessage: vi.fn() };
+    scheduleStashedRedelivery([{ text: "first" }], pi);
+    // session_compact for a compact that finished before the 200 ms timer ran:
+    // the payload is module-owned, so it is carried into this redelivery
+    // instead of being dropped with the cancelled timer.
+    const outcome = onCompacted({ hasUI: false } as any);
+    expect(outcome.stashed.map((s: any) => s.text)).toEqual(["first"]);
+  });
+
+  it("keeps an owed redelivery when a second one is scheduled before delivery", async () => {
+    vi.useFakeTimers();
+    reset();
+    const pi: any = { sendUserMessage: vi.fn() };
+    scheduleStashedRedelivery([{ text: "first" }], pi);
+    scheduleStashedRedelivery([{ text: "second" }], pi); // re-arming must not overwrite
+    await vi.advanceTimersByTimeAsync(200);
+    const texts = pi.sendUserMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(texts).toEqual(["first", "second"]);
   });
 });

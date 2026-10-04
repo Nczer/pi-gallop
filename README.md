@@ -139,6 +139,16 @@ in flight (pi would throw "Already compacted"), re-armed at each new user turn
 and on a failed/cancelled compact (`session_compact_failed` also re-arms the
 pressure nudge — nothing compacted, so the cycle is not over).
 
+**Messages typed while a compact is pending** are swallowed by the input gate
+(queued interactively they would run on the stale context and delay the
+compact) with the promise that they run after it. The owed payload is
+module-owned rather than captured by the redelivery timer, so a second compact
+landing inside the 200 ms delay folds it into the next redelivery instead of
+cancelling it. A send that pi itself refuses is beyond gallop's reach:
+`ExtensionAPI` types `sendUserMessage` as `Promise<void>`, but pi's runtime
+bridge returns `void` and swallows the rejection into its own extension-error
+event — there is no delivery signal to act on (see CHANGELOG).
+
 `/qcompact` (v2.0.0–v2.0.2) is gone: the context-pressure nudge below asks the
 model to compact itself as the context fills, and pi's native `/compact`
 remains for an immediate user-initiated compact (cold one-shot — the trade for

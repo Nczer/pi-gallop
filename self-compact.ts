@@ -438,6 +438,10 @@ let pendingCompact: { continue: boolean; nuke: boolean } | null = null;
  *  compacted context. */
 type StashedInput = Pick<InputEvent, "text" | "images">;
 let stashedInputs: StashedInput[] = [];
+/** Messages whose redelivery is owed but not yet sent. Owned by the module,
+ *  not by a timer closure: a second compact arriving inside the redelivery
+ *  delay must fold them into the next redelivery, not drop them. */
+let pendingRedelivery: StashedInput[] = [];
 /** True between redelivery scheduling (session_compact) and delivery — the
  *  user's own messages are the continuation, so the manual path's continue
  *  steer must be suppressed. */
@@ -540,6 +544,10 @@ function sendStashed(stashed: StashedInput[], pi: ExtensionAPI): void {
       : m.text;
     // followUp: direct prompt when idle, queued when a run is already active.
     // expandPromptTemplates: interactive prompts expand by default — keep it.
+    // No delivery signal exists: ExtensionAPI types sendUserMessage as
+    // Promise<void>, but pi's runtime bridge returns void and swallows a
+    // rejection into its own extension-error event (agent-session.ts:2469), so
+    // a failed send is pi's record, not something this call can observe.
     void pi.sendUserMessage(content, { deliverAs: "followUp", expandPromptTemplates: true });
   }
 }
@@ -547,13 +555,21 @@ function sendStashed(stashed: StashedInput[], pi: ExtensionAPI): void {
 /** Re-deliver messages stashed while a compact was pending (input handler).
  *  Delayed: session_compact fires while pi's compaction-in-progress flag is
  *  still set, and prompt() refuses to submit during compaction — by the time
- *  the timer fires, compact() has finished and cleared the flag. */
+ *  the timer fires, compact() has finished and cleared the flag. The payload
+ *  is module-owned (`pendingRedelivery`), not captured by the timer: a second
+ *  compact inside this window folds it into the next redelivery instead of
+ *  cancelling it — a captured copy would be dropped with the timer. */
 export function scheduleStashedRedelivery(stashed: StashedInput[], pi: ExtensionAPI): void {
+  if (stashed.length === 0) return;
+  pendingRedelivery = [...pendingRedelivery, ...stashed];
   stashedRedeliveryPending = true;
+  if (stashedRedeliveryTimer) clearTimeout(stashedRedeliveryTimer);
   stashedRedeliveryTimer = setTimeout(() => {
     stashedRedeliveryTimer = undefined;
     stashedRedeliveryPending = false;
-    sendStashed(stashed, pi);
+    const payload = pendingRedelivery;
+    pendingRedelivery = [];
+    sendStashed(payload, pi);
   }, 200);
 }
 
@@ -1013,12 +1029,22 @@ export function onCompacted(ctx: ExtensionContext): { continueAfter: boolean; st
   // Messages swallowed while this compact was pending (input gate): the
   // compact just ran, so re-deliver them on the fresh context. They are the
   // continuation — the generic proceed steer is skipped (the manual path's
-  // onComplete is suppressed via stashedRedeliveryPending).
-  const stashed = stashedInputs;
+  // onComplete is suppressed via stashedRedeliveryPending). A redelivery still
+  // owed from the previous 200 ms window is folded in here: its payload lives
+  // in the module, so a second compact inside that window cannot drop it.
+  const stashed = pendingRedelivery.length > 0
+    ? [...pendingRedelivery, ...stashedInputs]
+    : stashedInputs;
   const blocks = pendingBlocks;
   pendingCompact = null;
   pendingBlocks = null;
   stashedInputs = [];
+  pendingRedelivery = [];
+  if (stashedRedeliveryTimer) {
+    clearTimeout(stashedRedeliveryTimer);
+    stashedRedeliveryTimer = undefined;
+    stashedRedeliveryPending = false;
+  }
   return { continueAfter, stashed, blocks };
 }
 
@@ -1056,7 +1082,8 @@ export function onCompactFailed(pi: ExtensionAPI): void {
   contextNudgeState = "idle";
   compactionRunning = false;
   compactionInFlight = false;
-  const stashed = stashedInputs;
+  const stashed = [...pendingRedelivery, ...stashedInputs];
+  pendingRedelivery = [];
   stashedInputs = [];
   if (stashed.length > 0) sendStashed(stashed, pi);
 }
@@ -1073,6 +1100,7 @@ export function reset(): void {
   pendingBlocks = null;
   lastRequestTools = null;
   stashedInputs = [];
+  pendingRedelivery = [];
   stashedRedeliveryPending = false;
   if (stashedRedeliveryTimer) {
     clearTimeout(stashedRedeliveryTimer);
