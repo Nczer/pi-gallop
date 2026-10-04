@@ -111,5 +111,7 @@ export function patchExtSettings(
     if (v === undefined) delete mine[k];
     else mine[k] = v;
   }
+  // Nothing to persist when the patch resolves to what the file already says
+  if (JSON.stringify(mine) === JSON.stringify(isPlainObject(raw) ? raw : {})) return;
   writeWhole(filePath, { ...file, [namespace]: mine });
 }
