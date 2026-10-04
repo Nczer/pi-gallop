@@ -14,10 +14,12 @@ import {
   NUDGE_DISABLED_AT_DEFAULT,
   NUDGE_PCT_DEFAULT,
   checkpointFormat,
+  checkpointSkeleton,
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
   boolFlag,
   COMPACT_DONE_MARKER,
+  CONTEXT_NUDGE_TYPE,
   rewriteCompactContext,
   setKeepRecentTokens,
   KEEP_RECENT_TOKENS_DEFAULT,
@@ -229,16 +231,13 @@ Test goal: refactor the compaction machinery of the gallop extension.
 ## Constraints & Preferences
 - Keep the extension silent in the main session except for status indicators.
 
-## Progress
+## State
 ### Done
 - [x] Removed the old fork summarizer
 - [x] Rewrote the compact_request tool
 
 ### In Progress
 - [ ] Rewriting the test suite
-
-### Blocked
-- (none)
 
 ## Key Decisions
 - **In-session summary**: the model writes the checkpoint itself so the LLM call is cache-warm.
@@ -247,8 +246,8 @@ Test goal: refactor the compaction machinery of the gallop extension.
 1. Finish the test suite and run it
 2. Update the README and CHANGELOG
 
-## Critical Context
-- MIN_SUMMARY_LENGTH is 200; shorter summaries fail the tool call.`;
+## Pointers
+- self-compact.ts: MIN_SUMMARY_LENGTH is 200; shorter summaries fail the tool call.`;
 
 describe("self-compact wiring (in-session summary)", () => {
   let pi: any;
@@ -428,12 +427,14 @@ describe("self-compact wiring (in-session summary)", () => {
     expect(tool.parameters.properties.continue.type).toEqual(["boolean", "string"]);
     expect(tool.parameters.properties.nuke.type).toEqual(["boolean", "string"]);
     // The tool description carries the nuke bullet (trigger + full-state
-    // obligation); the checkpoint format lives on the summary param — the model
-    // reads it while constructing the call.
+    // obligation); the summary param carries the checkpoint skeleton — the
+    // headings and the rules that change the output, not the per-section
+    // bracket hints (those ride the nudge and the near-backstop advice).
     expect(tool.description).toContain("nuke: true");
-    for (const section of ["## Goal", "## Progress", "## Next Steps", "## Critical Context"]) {
+    for (const section of ["## Goal", "## State", "## Next Steps", "## Pointers"]) {
       expect(tool.parameters.properties.summary.description).toContain(section);
     }
+    expect(tool.parameters.properties.summary.description).not.toContain("[What is the user trying to accomplish?");
   });
 
   // ── session_before_compact ──
@@ -1019,9 +1020,10 @@ describe("context-pressure nudge", () => {
   };
 
   const nudgeSteers = () =>
-    pi.sendUserMessage.mock.calls
-      .map(([t]) => t)
-      .filter((t) => t.startsWith("[Gallop] Context"));
+    pi.sendMessage.mock.calls
+      .filter(([m]: any) => m?.customType === CONTEXT_NUDGE_TYPE)
+      .map(([m]: any) => (typeof m.content === "string" ? m.content : m.content.map((b: any) => b.text).join("")))
+      .filter((t: string) => t.startsWith("[Gallop] Context"));
 
   const resetState = async () => {
     void handlers.get("session_compact")(null, { hasUI: false });
@@ -1056,6 +1058,19 @@ describe("context-pressure nudge", () => {
     expect(checkpointFormat()).toContain("~8k tokens are kept verbatim"); // default
     expect(checkpointFormat(40_000)).toContain("~40k tokens are kept verbatim");
     expect(checkpointFormat(16_000)).toContain("~16k tokens are kept verbatim");
+  });
+
+  it("checkpointSkeleton: every heading + the kept-tail rule, without the per-section hints", () => {
+    const s = checkpointSkeleton();
+    for (const h of ["## Goal", "## Constraints & Preferences", "### Done", "### In Progress", "### Blocked", "## Key Decisions", "## Next Steps", "## Pointers"]) {
+      expect(s).toContain(h);
+    }
+    expect(s).toContain("~8k tokens are kept verbatim");
+    expect(s).not.toContain("[What is the user trying to accomplish?");
+    // The point of the split: the request-side text is materially smaller than
+    // the template the nudge carries.
+    expect(checkpointFormat().length - s.length).toBeGreaterThan(200);
+    expect(checkpointSkeleton(40_000)).toContain("~40k tokens are kept verbatim");
   });
 
   it("follows a custom reserveTokens (auto-compact on → reserve + 2k, window floor still applies)", () => {
@@ -1217,6 +1232,19 @@ describe("context-pressure nudge", () => {
     await handlers.get("message_start")({ message: { role: "assistant" } }, noModel);
     await handlers.get("message_end")(usageMsg(15_000), noModel);
     expect(nudgeSteers()).toHaveLength(0);
+  });
+
+  it("delivers the nudge as a hidden custom message carrying the checkpoint template", async () => {
+    // The nudge is gallop's own instruction: display:false keeps it out of the
+    // transcript, the type makes it prunable, triggerTurn preserves the
+    // always-triggered-a-turn semantics sendUserMessage had.
+    await endTurn(15_000);
+    const calls = pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === CONTEXT_NUDGE_TYPE);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0].display).toBe(false);
+    expect(calls[0][1]).toEqual({ triggerTurn: true, deliverAs: "steer" });
+    expect(calls[0][0].content).toContain("Checkpoint format:");
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("does not nudge when the ending message itself calls compact_request (message_end precedes tool execution)", async () => {
@@ -1474,6 +1502,50 @@ describe("rewriteCompactContext (compact_request exchange → completion marker)
     const call = { ...requestCompactCall("A fresh checkpoint, long enough to matter. ".repeat(7)), timestamp: 5000 };
     const result = rewriteCompactContext([older, call, { ...compactToolResult(), timestamp: 5001 }]);
     expect(result).toBeUndefined();
+  });
+
+  const pressureNudge = (ts: number | undefined, text?: string) => ({
+    role: "custom",
+    customType: CONTEXT_NUDGE_TYPE,
+    display: false,
+    ...(ts === undefined ? {} : { timestamp: ts }),
+    content: [{ type: "text", text: text ?? "[Gallop] Context is running low (~31k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now." }],
+  });
+
+  it("drops a context-pressure nudge older than the newest compaction entry (fulfilled)", async () => {
+    // Its payload — now including the checkpoint template it carries — is
+    // spent guidance, and a stale nudge reads to the model as a live order.
+    const summary = { ...compactionSummaryMsg("A native one-shot summary."), timestamp: 5000 };
+    const result = rewriteCompactContext([pressureNudge(4000), summary]);
+    expect(result).toBeDefined();
+    expect(result).toHaveLength(1);
+    expect(result[0].role).toBe("compactionSummary");
+  });
+
+  it("keeps a nudge newer than the newest compaction entry (live: the next compact)", async () => {
+    const summary = { ...compactionSummaryMsg("A native one-shot summary."), timestamp: 5000 };
+    expect(rewriteCompactContext([summary, pressureNudge(6000)])).toBeUndefined();
+  });
+
+  it("keeps a nudge with no timestamp, and never drops a real user message", async () => {
+    const summary = { ...compactionSummaryMsg("A native one-shot summary."), timestamp: 5000 };
+    const user = { role: "user", timestamp: 1000, content: [{ type: "text", text: "do phase 2, then compact, then check again" }] };
+    expect(rewriteCompactContext([pressureNudge(undefined), user, summary])).toBeUndefined();
+  });
+
+  it("drops the legacy user-message wording too, and never drops another custom message", async () => {
+    // Sessions written before the nudge became a hidden message carry it as a
+    // user message; gallop's own evidence blocks are custom messages of other
+    // types and must survive the rewrite.
+    const summary = { ...compactionSummaryMsg("A native one-shot summary."), timestamp: 5000 };
+    const legacy = { role: "user", timestamp: 4000, content: "[Gallop] Context is running low (~9k tokens remaining)." };
+    const legacyBlocks = { role: "user", timestamp: 4000, content: [{ type: "text", text: "[Gallop] Context is running low (~9k tokens remaining; pi's automatic compaction triggers at ~18k)." }] };
+    const evidence = { role: "custom", customType: "gallop-evidence", display: false, timestamp: 4000, content: [{ type: "text", text: "[Gallop] Evidence index" }] };
+    const result = rewriteCompactContext([legacy, legacyBlocks, evidence, summary]);
+    expect(result).toBeDefined();
+    expect(result).toHaveLength(2);
+    expect(result[0].customType).toBe("gallop-evidence");
+    expect(result[1].role).toBe("compactionSummary");
   });
 
   it("does not mark an exchange carried only by an OLDER compaction entry", async () => {

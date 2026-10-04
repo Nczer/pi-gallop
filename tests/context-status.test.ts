@@ -51,20 +51,30 @@ describe("contextStatusAdvice", () => {
   });
 
   it("near the backstop at or below the threshold (auto-compact on)", () => {
-    expect(contextStatusAdvice(18_432, 180_000, DEFAULTS)).toBe(
-      "Advice: near the backstop — call compact_request now if at a pause point.",
-    );
+    const advice = contextStatusAdvice(18_432, 180_000, DEFAULTS);
+    expect(advice.startsWith("Advice: near the backstop — call compact_request now if at a pause point.")).toBe(true);
+    // A compact is imminent: the full per-section template rides the advice.
+    expect(advice).toContain("Checkpoint format:");
+    expect(advice).toContain("[What the user is trying to accomplish");
     expect(contextStatusAdvice(0, 200_000, DEFAULTS)).toContain("near the backstop");
   });
 
   it("names the missing backstop when auto-compact is off", () => {
     // disabled → fixed 16384 threshold
-    expect(contextStatusAdvice(15_000, 180_000, { ...DEFAULTS, enabled: false })).toBe(
-      "Advice: near the limit and auto-compact is off — call compact_request now if at a pause point.",
-    );
+    const advice = contextStatusAdvice(15_000, 180_000, { ...DEFAULTS, enabled: false });
+    expect(advice.startsWith("Advice: near the limit and auto-compact is off — call compact_request now if at a pause point.")).toBe(true);
+    expect(advice).toContain("Checkpoint format:");
     // disabled → 2× 16384 = 32768 still counts as pressure building
     expect(contextStatusAdvice(17_000, 180_000, { ...DEFAULTS, enabled: false })).toContain("pressure building");
     expect(contextStatusAdvice(33_000, 90_000, { ...DEFAULTS, enabled: false })).toBe("Advice: headroom OK.");
+  });
+
+  it("carries the full template on every tier that suggests compacting", () => {
+    // Not in the request prefix — in the result, on the turns that ask for it.
+    expect(contextStatusAdvice(50_000, 40_000, DEFAULTS)).not.toContain("Checkpoint format:");
+    expect(contextStatusAdvice(30_000, 150_000, DEFAULTS)).toContain("Checkpoint format:");
+    expect(contextStatusAdvice(150_000, 180_000, DEFAULTS, WINDOW)).toContain("Checkpoint format:");
+    expect(contextStatusAdvice(18_432, 180_000, DEFAULTS)).toContain("Checkpoint format:");
   });
 
   it("suggests compacting a large context with otherwise-OK headroom", () => {
@@ -103,13 +113,13 @@ describe("buildContextStatusText", () => {
       DEFAULTS,
     );
     const lines = text.split("\n");
-    expect(lines).toHaveLength(3);
     expect(lines[0]).toBe("142.3k / 200k tokens (71.2%) — 57.7k remaining");
     // 200k window: threshold max(18_432, 0.25 × 200k) = 50k → 57.7k remaining is in the 2× band
     expect(lines[1]).toBe("Thresholds: gallop nudge ~50k remaining · pi auto-compact ~16.4k remaining");
-    expect(lines[2]).toBe(
-      "Advice: pressure building — if a large batch of reads or images is ahead, call compact_request at this boundary first.",
-    );
+    // A tier that suggests compacting carries the full checkpoint template.
+    expect(lines[2]).toBe("Advice: pressure building — if a large batch of reads or images is ahead, call compact_request at this boundary first.");
+    expect(text).toContain("Checkpoint format:");
+    expect(text).toContain("## Pointers");
   });
 
   it("stays headroom OK below the soft size tier", () => {

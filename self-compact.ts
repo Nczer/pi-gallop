@@ -194,20 +194,27 @@ export const COMPACT_RESULT_TEXT = "Compacting.";
 export const COMPACT_DONE_MARKER =
   "[Gallop] Compacted — proceed. The summary at the top of context is your current state; do not call compact_request again.";
 
-/** Checkpoint summary format — the exact format the model must use, carried
- *  by the compact_request tool description (system prompt). The kept-tail
- *  line is parameterized: the extension's compactKeepRecentTokens (default
- *  8k) is user-configurable, and the guidance must match what the compact
- *  will actually keep verbatim. */
+/** Message type for the context-pressure nudge, delivered as a hidden custom
+ *  message (`display: false`, same mechanism as the post-compaction evidence
+ *  blocks). The nudge is gallop's own instruction, not user speech: it has no
+ *  place in the transcript, and the type makes it recognizable for pruning. */
+export const CONTEXT_NUDGE_TYPE = "gallop-nudge";
+
+/** Checkpoint summary format — the full per-section template. It no longer
+ *  rides in every provider request (see `checkpointSkeleton`); it is attached
+ *  to the messages that fire at the moment a checkpoint is actually being
+ *  written: the context-pressure nudge and the near-backstop context_status
+ *  advice. The kept-tail line is parameterized: the extension's
+ *  compactKeepRecentTokens (default 8k) is user-configurable, and the guidance
+ *  must match what the compact will actually keep verbatim. */
 export function checkpointFormat(keepRecentTokens: number = KEEP_RECENT_TOKENS_DEFAULT): string {
   return `## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+[What the user is trying to accomplish; multiple items if the session covers several tasks]
 
 ## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user or found]
-- [Or "(none)" if none were mentioned]
+- [Constraints, preferences, or requirements mentioned by the user or found]
 
-## Progress
+## State
 ### Done
 - [x] [Completed tasks/changes]
 
@@ -215,7 +222,7 @@ export function checkpointFormat(keepRecentTokens: number = KEEP_RECENT_TOKENS_D
 - [ ] [Current work]
 
 ### Blocked
-- [Issues preventing progress, if any]
+- [Issues preventing progress]
 
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
@@ -223,14 +230,46 @@ export function checkpointFormat(keepRecentTokens: number = KEEP_RECENT_TOKENS_D
 ## Next Steps
 1. [Ordered list of what should happen next]
 
-## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or "(none)" if not applicable]
+## Pointers
+- [Where the state lives: file:line, note id, memory entry, commit hash]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.
-Focus on OLDER work — the most recent ~${Math.round(keepRecentTokens / 1000)}k tokens are kept verbatim, so do not restate
-what is already recent. If a previous checkpoint summary is present in the conversation,
-fold its still-relevant content into this one.`;
+${checkpointRules(keepRecentTokens)}`;
+}
+
+/** The rules every checkpoint must follow — shared by the request-side skeleton
+ *  and the full template so the two can never drift apart. Written against the
+ *  failure modes self-compact actually produces: a checkpoint is re-sent on
+ *  every request until the next compact, and gallop already re-injects the
+ *  recent user messages, the tool-output evidence index, and the modified-file
+ *  list verbatim, so restating them is pure duplication. */
+function checkpointRules(keepRecentTokens: number): string {
+  return `Omit empty sections. Gallop re-injects recent user messages, tool-output pointers (L<n>) and the modified-file list — cite them, never restate them. Carry pointers and deltas (file:line, note id, commit hash), not payloads. Name the source of every number or claim. What must outlive this session goes to memory/Joplin/a file, not the checkpoint. Preserve exact paths, function names, error messages. Focus on OLDER work — the most recent ~${Math.round(keepRecentTokens / 1000)}k tokens are kept verbatim, so do not restate what is recent. Fold an earlier checkpoint's still-relevant content in.`;
+}
+
+/** What the compact_request `summary` parameter carries in every provider
+ *  request: the headings (so checkpoints stay uniform) plus the shared rules.
+ *  The per-section bracket hints are guidance for the moment of writing, so
+ *  they ride the pressure nudge and the near-backstop context_status advice
+ *  instead — guidance where a checkpoint is actually being written. */
+export function checkpointSkeleton(keepRecentTokens: number = KEEP_RECENT_TOKENS_DEFAULT): string {
+  return `Checkpoint summary of the conversation so far, in this exact format:
+
+## Goal
+## Constraints & Preferences
+## State
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Next Steps
+## Pointers
+
+- [x]/- [ ] markers under State; Key Decisions as "- **decision**: rationale". ${checkpointRules(keepRecentTokens)}`;
+}
+
+/** The full template, prefixed for use inside a nudge/advice message. */
+function checkpointFormatMessage(keepRecentTokens: number): string {
+  return `\n\nCheckpoint format:\n${checkpointFormat(keepRecentTokens)}`;
 }
 
 /** Shape of pi's FileOperations (read/written/edited path sets). Structurally
@@ -303,18 +342,22 @@ export function contextStatusAdvice(
   tokens: number,
   settings: PiCompactionSettings,
   contextWindow: number = 0,
+  keepRecentTokens: number = KEEP_RECENT_TOKENS_DEFAULT,
 ): string {
   const threshold = nudgeThreshold(settings, contextWindow);
   if (remaining <= threshold) {
-    return settings.enabled
+    const advice = settings.enabled
       ? "Advice: near the backstop — call compact_request now if at a pause point."
       : "Advice: near the limit and auto-compact is off — call compact_request now if at a pause point.";
+    // A compact is imminent here: hand over the full per-section template with
+    // the instruction, not just the skeleton the tool description carries.
+    return `${advice}${checkpointFormatMessage(keepRecentTokens)}`;
   }
   if (remaining <= 2 * threshold) {
-    return "Advice: pressure building — if a large batch of reads or images is ahead, call compact_request at this boundary first.";
+    return `Advice: pressure building — if a large batch of reads or images is ahead, call compact_request at this boundary first.${checkpointFormatMessage(keepRecentTokens)}`;
   }
   if (tokens > SOFT_NUDGE_TOKENS) {
-    return `Advice: large context (~${formatTokenCount(tokens)} used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call compact_request at this boundary.`;
+    return `Advice: large context (~${formatTokenCount(tokens)} used) — models (especially local) work best under ~100k; if the next task does not depend on the current context window, call compact_request at this boundary.${checkpointFormatMessage(keepRecentTokens)}`;
   }
   return "Advice: headroom OK.";
 }
@@ -664,18 +707,20 @@ export function onMessageEnd(
   contextNudgeState = "nudged";
 
   const k = Math.max(1, Math.round(remaining / 1000));
-  if (settings.enabled) {
-    const m = Math.max(1, Math.round(settings.reserveTokens / 1000));
-    pi.sendUserMessage(
-      `[Gallop] Context is running low (~${k}k tokens remaining; pi's automatic compaction triggers at ~${m}k). If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now so the summary stays cache-warm.`,
-      { deliverAs: "steer" },
-    );
-  } else {
-    pi.sendUserMessage(
-      `[Gallop] Context is running low (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now — a context overflow would otherwise abort the run.`,
-      { deliverAs: "steer" },
-    );
-  }
+  const fmt = checkpointFormatMessage(keepRecentTokens);
+  const text = settings.enabled
+    ? `[Gallop] Context is running low (~${k}k tokens remaining; pi's automatic compaction triggers at ~${Math.max(1, Math.round(settings.reserveTokens / 1000))}k). If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now so the summary stays cache-warm.${fmt}`
+    : `[Gallop] Context is running low (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now — a context overflow would otherwise abort the run.${fmt}`;
+  // Hidden custom message: the nudge is gallop's own instruction, so it does
+  // not belong in the transcript as a user bubble (pi renders `custom` only
+  // when display is true; interactive-mode.ts:3542). triggerTurn preserves
+  // sendUserMessage's semantics — it always triggered a turn — and while a run
+  // is streaming deliverAs:"steer" queues it as a steer instead.
+  pi.sendMessage(
+    { customType: CONTEXT_NUDGE_TYPE, content: text, display: false },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+  ctx.ui?.notify?.(`Gallop: context pressure (~${k}k tokens remaining) — the model was asked to checkpoint`, "info");
 }
 
 // ── Deferred compact trigger ──
@@ -841,11 +886,17 @@ export function onBeforeCompact(
 //    top summary already says compaction happened.
 //
 // Pre-compact tree views (no compactionSummary message) leave everything
-// intact. The triggering nudge is left untouched
-// (a live post-compaction nudge is indistinguishable from a stale one in the
-// rendered context); with the marker present it reads as fulfilled. The
-// session file is never touched (the TUI transcript still shows the full
-// summary) and the rewrite is deterministic, so the prefix stays cache-stable.
+// intact. The session file is never touched (the TUI transcript still shows
+// the full summary) and the rewrite is deterministic, so the prefix stays
+// cache-stable.
+//
+// A fulfilled context-pressure nudge is dropped. It used to be left in place
+// because a live post-compaction nudge looked identical to a stale one; the
+// compaction entry's timestamp settles it — a nudge older than the newest
+// compaction summary asked for a compact that has since run. Its payload (the
+// checkpoint template it carries) is spent, and leaving it reads to the model
+// as a standing instruction. A nudge newer than the newest compaction entry is
+// live; one without a timestamp stays (the safe side).
 export function onContext(event: { messages: unknown }): { messages: any[] } | undefined {
   const rewritten = rewriteCompactContext(event.messages as any[]);
   return rewritten ? { messages: rewritten } : undefined;
@@ -857,6 +908,22 @@ function hasCompactingResultText(content: unknown): boolean {
   return Array.isArray(content) && content.some(
     (b: any) => b?.type === "text" && typeof b.text === "string" && b.text.trim() === COMPACT_RESULT_TEXT,
   );
+}
+
+/** The context-pressure nudge: a hidden custom message (see CONTEXT_NUDGE_TYPE)
+ *  or, in sessions written before that, a user message with the nudge wording.
+ *  User and custom messages both carry a timestamp (pi's agent loop stamps
+ *  them), so `timestamp < newestSummaryTs` separates a fulfilled nudge from a
+ *  live one — position alone cannot: after a compact the kept tail sits AFTER
+ *  the summary. */
+const CONTEXT_PRESSURE_NUDGE = "[Gallop] Context is running low";
+function isContextPressureNudge(m: any): boolean {
+  if (m?.role === "custom") return m?.customType === CONTEXT_NUDGE_TYPE;
+  if (m?.role !== "user") return false;
+  const c = m.content;
+  if (typeof c === "string") return c.trim().startsWith(CONTEXT_PRESSURE_NUDGE);
+  if (!Array.isArray(c)) return false;
+  return c.some((b: any) => b?.type === "text" && typeof b.text === "string" && b.text.trim().startsWith(CONTEXT_PRESSURE_NUDGE));
 }
 
 /** The pure context rewrite. Pure function of the in-context message list —
@@ -955,6 +1022,13 @@ export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
   let changed = false;
   const messages: any[] = [];
   for (const msg of messagesIn) {
+    // Fulfilled context-pressure nudge (see the header above): the compact it
+    // asked for has run, so the message — and the checkpoint template it now
+    // carries — is spent guidance sitting in the kept tail.
+    if (isContextPressureNudge(msg) && typeof msg.timestamp === "number" && msg.timestamp < newestSummaryTs) {
+      changed = true;
+      continue;
+    }
     // compact_request toolResult: orphan (call summarized out of the window)
     // → drop (an unpaired toolResult is an API error); a FAILED result → pass
     // through untouched; paired with a carried call → drop (the marker message
@@ -1151,9 +1225,7 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
       properties: {
         summary: {
           type: "string",
-          description: `Checkpoint summary of the conversation so far, in this exact format:
-
-${checkpointFormat(registeredKeepTokens)}`,
+          description: checkpointSkeleton(registeredKeepTokens),
         },
         // boolean | string: a stringified boolean must reach the handler (boolFlag)
         // rather than fail pi's schema validation.

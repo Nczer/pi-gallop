@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **The context-pressure nudge is now a hidden custom message** (`customType: "gallop-nudge"`, `display: false`, `triggerTurn: true, deliverAs: "steer"`) instead of a user message. The nudge is gallop's own instruction, not user speech, so it has no place in the transcript as a user bubble; the type makes it recognizable for pruning instead of string-sniffing the wording. `triggerTurn: true` preserves `sendUserMessage`'s always-triggers-a-turn semantics (pi renders a `custom` message only when `display` is true — interactive-mode.ts:3542). A one-line `ctx.ui.notify` keeps the pressure visible to the user even though the instruction is not. Sessions written before this still prune: the legacy user-message wording is recognized too.
+- **The checkpoint format split in two** — `compact_request`'s `summary` parameter carried the full per-section template (1009 chars) in every provider request. It now carries the skeleton (904 chars): the headings plus the rules that change the output. The full template (1101 chars) rides the messages that fire at the moment a checkpoint is actually written — the context-pressure nudge and every `context_status` advice tier that suggests compacting (near-backstop, pressure building, the large-context tier); the "headroom OK" tier carries none. Headings renamed: `## Progress` → `## State`, `## Critical Context` → `## Pointers` (the catch-all section is where dead weight pooled). `checkpointRules()` is shared by both so they cannot drift.
+- **Checkpoint rules written against what self-compact actually produces** — omit empty sections; cite gallop's own re-injected blocks (recent user messages verbatim, the `L<n>` evidence index, the modified-file list) instead of restating them; carry pointers and deltas (`file:line`, note id, commit hash) rather than payloads; name the source of every number or claim; anything that must outlive the session goes to memory/Joplin/a file, not the checkpoint.
+
+### Fixed
+- **A fulfilled context-pressure nudge stayed in context** — the `context` handler deliberately left the nudge that triggered a compact in the kept tail, because "a live post-compaction nudge is indistinguishable from a stale one". User messages carry a timestamp (pi stamps them, packages/agent/src/agent.ts:420), so a nudge older than the newest `compactionSummary` is fulfilled and is now dropped from the rendered view; a newer one (the next cycle's request) stays, and so does one without a timestamp. Position alone cannot decide — after a compact the kept tail sits *after* the summary. Worth ~1.3k chars per cycle now that the nudge carries the checkpoint template.
+
 ## v2.2.0 — 2026-10-04
 
 ### Fixed
