@@ -1205,6 +1205,29 @@ export function boolFlag(value: unknown, def: boolean): boolean {
   return def;
 }
 
+/** Repair stringified booleans BEFORE pi's schema validation. pi's validator
+ *  coerces only the exact strings "true"/"false" (see boolFlag); a
+ *  capitalised "True"/"False" would die in validation and cost a round-trip.
+ *  Only case/whitespace is repaired — anything else stays put and fails
+ *  validation with pi's normal error, which names the parameter. */
+export function prepareCompactRequestArguments(
+  input: unknown,
+): { summary?: string; continue?: boolean; nuke?: boolean } {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    return input as { summary?: string; continue?: boolean; nuke?: boolean };
+  }
+  const args: Record<string, unknown> = { ...input };
+  for (const key of ["continue", "nuke"]) {
+    const v = args[key];
+    if (typeof v === "string") {
+      const s = v.trim().toLowerCase();
+      if (s === "true") args[key] = true;
+      else if (s === "false") args[key] = false;
+    }
+  }
+  return args as { summary?: string; continue?: boolean; nuke?: boolean };
+}
+
 /** Register compact_request and context_status. `registeredKeepTokens` is
  *  the extension's keep window (compactKeepRecentTokens) read at load time —
  *  the checkpoint guidance must name the tail the compact actually keeps; a
@@ -1227,22 +1250,23 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
           type: "string",
           description: checkpointSkeleton(registeredKeepTokens),
         },
-        // boolean | string: a stringified boolean must reach the handler (boolFlag)
-        // rather than fail pi's schema validation.
+        // Strict boolean: a capitalised "True" is repaired by prepareArguments
+        // before validation; boolFlag stays the runtime net for the rest.
         continue: {
-          type: ["boolean", "string"],
+          type: "boolean",
           description: "Continue working right after compaction or not (default: true — pass false to stop)",
         },
         nuke: {
-          type: ["boolean", "string"],
+          type: "boolean",
           description: `True = only compaction summary survives after compact, summarize everything you need (default: false)`,
         },
       },
       required: ["summary"],
     },
+    prepareArguments: prepareCompactRequestArguments,
     async execute(
       _id: string,
-      params: { summary?: string; continue?: boolean | string; nuke?: boolean | string },
+      params: { summary?: string; continue?: boolean; nuke?: boolean },
       _signal,
       _onUpdate,
       ctx: ExtensionContext,

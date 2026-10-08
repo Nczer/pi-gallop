@@ -18,6 +18,7 @@ import {
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
   boolFlag,
+  prepareCompactRequestArguments,
   COMPACT_DONE_MARKER,
   CONTEXT_NUDGE_TYPE,
   rewriteCompactContext,
@@ -49,6 +50,43 @@ describe("boolFlag", () => {
     // An empty string is "not stated", not "false".
     expect(boolFlag("", true)).toBe(true);
     expect(boolFlag("maybe", false)).toBe(false);
+  });
+});
+
+// ── prepareCompactRequestArguments (stringified booleans, pre-validation) ──
+
+describe("prepareCompactRequestArguments", () => {
+  it("coerces capitalised stringified booleans — the case pi's validator rejects", () => {
+    expect(prepareCompactRequestArguments({ summary: "s", continue: "True" })).toEqual({ summary: "s", continue: true });
+    expect(prepareCompactRequestArguments({ summary: "s", nuke: "False" })).toEqual({ summary: "s", nuke: false });
+  });
+
+  it("is case- and whitespace-insensitive", () => {
+    expect(prepareCompactRequestArguments({ summary: "s", continue: "  FALSE ", nuke: "TRUE" })).toEqual({
+      summary: "s",
+      continue: false,
+      nuke: true,
+    });
+  });
+
+  it("leaves booleans and unparseable values untouched (validation names them)", () => {
+    expect(prepareCompactRequestArguments({ summary: "s", continue: true, nuke: 1 })).toEqual({
+      summary: "s",
+      continue: true,
+      nuke: 1,
+    });
+    expect(prepareCompactRequestArguments({ summary: "s", continue: "maybe" })).toEqual({
+      summary: "s",
+      continue: "maybe",
+    });
+  });
+
+  it("does not mutate the input and passes non-objects through", () => {
+    const input = { summary: "s", continue: "True" };
+    prepareCompactRequestArguments(input);
+    expect(input.continue).toBe("True");
+    expect(prepareCompactRequestArguments(null)).toBe(null);
+    expect(prepareCompactRequestArguments("x")).toBe("x");
   });
 });
 
@@ -325,6 +363,14 @@ describe("self-compact wiring (in-session summary)", () => {
 
   // ── compact_request tool ──
 
+  it("repairs a stringified boolean through the pi flow (prepareArguments before execute)", async () => {
+    const tool = tools.get("compact_request") as any;
+    const args = tool.prepareArguments({ summary: LONG_SUMMARY, continue: "False" });
+    expect(args.continue).toBe(false);
+    const result = await tool.execute("id1", args, new AbortController().signal, undefined, ctx);
+    expect(result.terminate).toBe(true);
+  });
+
   it("stashes the summary, defers the compact to agent_settled, and returns the short message with terminate", async () => {
     const result = await callTool({ summary: LONG_SUMMARY });
 
@@ -424,8 +470,10 @@ describe("self-compact wiring (in-session summary)", () => {
     const tool = tools.get("compact_request");
     expect(tool.parameters.required).toEqual(["summary"]);
     expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "nuke", "summary"]);
-    expect(tool.parameters.properties.continue.type).toEqual(["boolean", "string"]);
-    expect(tool.parameters.properties.nuke.type).toEqual(["boolean", "string"]);
+    // Strict booleans: a capitalised "True" is repaired by prepareArguments
+    // before pi's validation, so the schema no longer has to admit strings.
+    expect(tool.parameters.properties.continue.type).toBe("boolean");
+    expect(tool.parameters.properties.nuke.type).toBe("boolean");
     // The tool description carries the nuke bullet (trigger + full-state
     // obligation); the summary param carries the checkpoint skeleton — the
     // headings and the rules that change the output, not the per-section
