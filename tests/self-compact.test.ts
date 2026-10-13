@@ -1,3 +1,5 @@
+import { Value } from "typebox/value";
+
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
@@ -17,8 +19,6 @@ import {
   checkpointSkeleton,
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
-  boolFlag,
-  prepareCompactRequestArguments,
   COMPACT_DONE_MARKER,
   CONTEXT_NUDGE_TYPE,
   rewriteCompactContext,
@@ -30,65 +30,6 @@ import {
   scheduleStashedRedelivery,
   onCompacted,
 } from "../self-compact";
-
-// ── boolFlag (tool boolean args) ──
-
-describe("boolFlag", () => {
-  it("passes real booleans through and defaults on anything unparseable", () => {
-    expect(boolFlag(true, false)).toBe(true);
-    expect(boolFlag(false, true)).toBe(false);
-    expect(boolFlag(undefined, true)).toBe(true);
-    expect(boolFlag(undefined, false)).toBe(false);
-    expect(boolFlag(null, true)).toBe(true);
-    expect(boolFlag({}, true)).toBe(true);
-    expect(boolFlag(NaN, false)).toBe(false);
-  });
-
-  it("reads the strings a harness may stringify a boolean into", () => {
-    for (const t of ["true", "True", "TRUE", "  true  ", "1", "yes"]) expect(boolFlag(t, false)).toBe(true);
-    for (const f of ["false", "False", "FALSE", "  false  ", "0", "no"]) expect(boolFlag(f, true)).toBe(false);
-    // An empty string is "not stated", not "false".
-    expect(boolFlag("", true)).toBe(true);
-    expect(boolFlag("maybe", false)).toBe(false);
-  });
-});
-
-// ── prepareCompactRequestArguments (stringified booleans, pre-validation) ──
-
-describe("prepareCompactRequestArguments", () => {
-  it("coerces capitalised stringified booleans — the case pi's validator rejects", () => {
-    expect(prepareCompactRequestArguments({ summary: "s", continue: "True" })).toEqual({ summary: "s", continue: true });
-    expect(prepareCompactRequestArguments({ summary: "s", nuke: "False" })).toEqual({ summary: "s", nuke: false });
-  });
-
-  it("is case- and whitespace-insensitive", () => {
-    expect(prepareCompactRequestArguments({ summary: "s", continue: "  FALSE ", nuke: "TRUE" })).toEqual({
-      summary: "s",
-      continue: false,
-      nuke: true,
-    });
-  });
-
-  it("leaves booleans and unparseable values untouched (validation names them)", () => {
-    expect(prepareCompactRequestArguments({ summary: "s", continue: true, nuke: 1 })).toEqual({
-      summary: "s",
-      continue: true,
-      nuke: 1,
-    });
-    expect(prepareCompactRequestArguments({ summary: "s", continue: "maybe" })).toEqual({
-      summary: "s",
-      continue: "maybe",
-    });
-  });
-
-  it("does not mutate the input and passes non-objects through", () => {
-    const input = { summary: "s", continue: "True" };
-    prepareCompactRequestArguments(input);
-    expect(input.continue).toBe("True");
-    expect(prepareCompactRequestArguments(null)).toBe(null);
-    expect(prepareCompactRequestArguments("x")).toBe("x");
-  });
-});
 
 // ── computeSelfCompactFileLists ──
 
@@ -348,9 +289,15 @@ describe("self-compact wiring (in-session summary)", () => {
 
   const emptyOps = () => ({ read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() });
 
-  /** Call the compact_request tool and return its result. */
-  const callTool = (params: any) =>
-    tools.get("compact_request").execute("id1", params, new AbortController().signal, undefined, ctx);
+  /** Call compact_request the way pi does: Value.Convert against the declared
+   *  schema (pi's validateToolArguments runs it before Check and before the
+   *  handler), then execute. Stringified args in tests therefore take the same
+   *  path the harness takes. */
+  const callTool = (params: any) => {
+    const tool = tools.get("compact_request");
+    Value.Convert(tool.parameters, params);
+    return tool.execute("id1", params, new AbortController().signal, undefined, ctx);
+  };
 
   const flushTimers = (ms = 250) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -362,12 +309,42 @@ describe("self-compact wiring (in-session summary)", () => {
   const compactDone = () => handlers.get("session_compact")(null, { hasUI: false });
 
   // ── compact_request tool ──
+  // ── boolean args: the schema is the coercion path ──
+  // pi validates tool arguments with Value.Convert(schema, args) (in place) and
+  // then Check, for TypeBox-declared tools (packages/ai/src/utils/validation.ts,
+  // validateToolArguments). Pinned against the same typebox the harness loads
+  // (extensions/node_modules), so a schema that stops being TypeBox — or a
+  // typebox that stops coercing these — fails here instead of at call time.
 
-  it("repairs a stringified boolean through the pi flow (prepareArguments before execute)", async () => {
-    const tool = tools.get("compact_request") as any;
-    const args = tool.prepareArguments({ summary: LONG_SUMMARY, continue: "False" });
-    expect(args.continue).toBe(false);
-    const result = await tool.execute("id1", args, new AbortController().signal, undefined, ctx);
+    describe("compact_request boolean schema (TypeBox coercion)", () => {
+    it("coerces the stringified booleans a harness may send", () => {
+      const tool = tools.get("compact_request") as any;
+      for (const [raw, want] of [["True", true], ["False", false], ["1", true], [1, true], [0, false]] as const) {
+        const args: any = { summary: "s", nuke: raw };
+        Value.Convert(tool.parameters, args);
+        expect(Value.Check(tool.parameters, args), JSON.stringify(raw)).toBe(true);
+        expect(args.nuke, JSON.stringify(raw)).toBe(want);
+      }
+    });
+
+    it("leaves what it cannot coerce as a string, so Check fails loudly", () => {
+      const tool = tools.get("compact_request") as any;
+      const args: any = { summary: "s", nuke: "yes" };
+      Value.Convert(tool.parameters, args);
+      expect(args.nuke).toBe("yes");
+      expect(Value.Check(tool.parameters, args)).toBe(false);
+    });
+
+    it("summary stays the only required parameter", () => {
+      const tool = tools.get("compact_request") as any;
+      expect(Value.Check(tool.parameters, { continue: true })).toBe(false);
+      expect(Value.Check(tool.parameters, { summary: "s" })).toBe(true);
+    });
+  });
+
+
+  it('coerces continue: "False" to a real false before the handler runs', async () => {
+    const result = await callTool({ summary: LONG_SUMMARY, continue: "False" });
     expect(result.terminate).toBe(true);
   });
 
@@ -470,8 +447,8 @@ describe("self-compact wiring (in-session summary)", () => {
     const tool = tools.get("compact_request");
     expect(tool.parameters.required).toEqual(["summary"]);
     expect(Object.keys(tool.parameters.properties).sort()).toEqual(["continue", "nuke", "summary"]);
-    // Strict booleans: a capitalised "True" is repaired by prepareArguments
-    // before pi's validation, so the schema no longer has to admit strings.
+    // Strict booleans: TypeBox puts the request on pi's Value.Convert path,
+    // which turns "True"/"False"/"1" into real booleans before Check.
     expect(tool.parameters.properties.continue.type).toBe("boolean");
     expect(tool.parameters.properties.nuke.type).toBe("boolean");
     // The tool description carries the nuke bullet (trigger + full-state

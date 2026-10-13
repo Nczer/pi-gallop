@@ -54,6 +54,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { findCutPoint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { compactRequestRenderers, contextStatusRenderers } from "./render";
 import { halted as interventionHalted } from "./intervention";
 import { buildEvidenceBlocks, type EvidenceBlocks } from "./evidence";
@@ -1185,49 +1186,6 @@ export function reset(): void {
 
 // ── Tool registration ──
 
-/** Normalize a boolean tool flag.
- *  pi validates tool arguments against the declared schema and only coerces the
- *  exact strings "true"/"false" (packages/ai/src/utils/validation.ts
- *  coercePrimitiveByType). A harness that stringifies a boolean can send
- *  "True"/"False"/"1": with `type: "boolean"` the call dies in validation before
- *  the handler runs, and with a permissive schema `params.continue !== false` is
- *  true for the string "False" — a requested stop becomes a continue. Unparseable
- *  values fall back to the flag's default. */
-export function boolFlag(value: unknown, def: boolean): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return Number.isNaN(value) ? def : value !== 0;
-  if (typeof value === "string") {
-    const s = value.trim().toLowerCase();
-    if (s === "true" || s === "1" || s === "yes") return true;
-    if (s === "false" || s === "0" || s === "no") return false;
-    if (s === "") return def;
-  }
-  return def;
-}
-
-/** Repair stringified booleans BEFORE pi's schema validation. pi's validator
- *  coerces only the exact strings "true"/"false" (see boolFlag); a
- *  capitalised "True"/"False" would die in validation and cost a round-trip.
- *  Only case/whitespace is repaired — anything else stays put and fails
- *  validation with pi's normal error, which names the parameter. */
-export function prepareCompactRequestArguments(
-  input: unknown,
-): { summary?: string; continue?: boolean; nuke?: boolean } {
-  if (input === null || typeof input !== "object" || Array.isArray(input)) {
-    return input as { summary?: string; continue?: boolean; nuke?: boolean };
-  }
-  const args: Record<string, unknown> = { ...input };
-  for (const key of ["continue", "nuke"]) {
-    const v = args[key];
-    if (typeof v === "string") {
-      const s = v.trim().toLowerCase();
-      if (s === "true") args[key] = true;
-      else if (s === "false") args[key] = false;
-    }
-  }
-  return args as { summary?: string; continue?: boolean; nuke?: boolean };
-}
-
 /** Register compact_request and context_status. `registeredKeepTokens` is
  *  the extension's keep window (compactKeepRecentTokens) read at load time —
  *  the checkpoint guidance must name the tail the compact actually keeps; a
@@ -1243,27 +1201,16 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
     description: `Compact context to remove unrelated old context and increase performance while preserving active tasks.
 - Call when: edit keeps failing (broken text matching), a major task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure.
 - Context broken beyond repair (tool calls failing repeatedly): pass nuke: true — the checkpoint must then carry full state, not just older work`,
-    parameters: {
-      type: "object",
-      properties: {
-        summary: {
-          type: "string",
-          description: checkpointSkeleton(registeredKeepTokens),
-        },
-        // Strict boolean: a capitalised "True" is repaired by prepareArguments
-        // before validation; boolFlag stays the runtime net for the rest.
-        continue: {
-          type: "boolean",
-          description: "Continue working right after compaction or not (default: true — pass false to stop)",
-        },
-        nuke: {
-          type: "boolean",
-          description: `True = only compaction summary survives after compact, summarize everything you need (default: false)`,
-        },
-      },
-      required: ["summary"],
-    },
-    prepareArguments: prepareCompactRequestArguments,
+    parameters: Type.Object({
+      summary: Type.String({ description: checkpointSkeleton(registeredKeepTokens) }),
+      // TypeBox is the coercion path that works: pi runs Value.Convert on the
+      // schema before Check (validation.ts), and typebox 1.3.7 coerces
+      // "True"/"False"/"1"/1/0/null to real booleans in place. Anything it
+      // cannot coerce ("yes", "") stays a string and fails Check loudly, so no
+      // repair hook or runtime flag-parser is needed here.
+      continue: Type.Optional(Type.Boolean({ description: "Continue working right after compaction or not (default: true — pass false to stop)" })),
+      nuke: Type.Optional(Type.Boolean({ description: `True = only compaction summary survives after compact, summarize everything you need (default: false)` })),
+    }),
     async execute(
       _id: string,
       params: { summary?: string; continue?: boolean; nuke?: boolean },
@@ -1271,8 +1218,8 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
       _onUpdate,
       ctx: ExtensionContext,
     ) {
-      const nuke = boolFlag(params?.nuke, false);
-      const continueAfter = boolFlag(params?.continue, true);
+      const nuke = params?.nuke ?? false;
+      const continueAfter = params?.continue ?? true;
       // Minimum-context guard: when the whole context fits in pi's configured keep
       // window, pi's prepareCompaction bails before any hook runs — no compact can
       // happen at all (not even a nuke; pi evaluates the cut with the configured
@@ -1346,10 +1293,7 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
     label: "Context Status",
     description: `Report current context usage, remaining tokens, and compaction thresholds.
 - Call when: at a task boundary or before a large batch of reads or images (~1.6k tokens each). If the advice is not "headroom OK", call compact_request first.`,
-    parameters: {
-      type: "object",
-      properties: {},
-    },
+    parameters: Type.Object({}),
     async execute(_id: string, _params: {}, _signal, _onUpdate, ctx: ExtensionContext) {
       const usage = ctx.getContextUsage();
       const settings = readPiCompactionSettings(ctx.cwd);

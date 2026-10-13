@@ -65,11 +65,14 @@ Tool arguments:
   stops the agent so you take the next step. No custom resume text is ever written
   or re-sent.
 
-Both flags are declared `boolean | string`: some harnesses stringify a boolean, and
-pi's argument validator only coerces the exact lowercase `"true"`/`"false"` — a
-`"True"` would otherwise fail the call before the handler runs. `boolFlag()`
-normalizes `true/false/1/0/yes/no` in any case; anything unparseable falls back to
-the flag's default.
+Both flags are declared as strict TypeBox booleans, and the schema carries the
+coercion: pi runs `Value.Convert(schema, args)` (in place) before `Check` for
+TypeBox tools (`packages/ai/src/utils/validation.ts::validateToolArguments`), and
+typebox 1.3.7 turns `"True"`, `"False"`, `"true"`, `"1"`, `1`, `0` into real
+booleans. A value it cannot coerce (`"yes"`, `""`) stays a string and the call
+fails validation with pi's error naming the parameter — no repair hook and no
+runtime flag parser. This is why both tools stay on TypeBox: a raw JSON Schema
+takes pi's separate `coerceWithJsonSchema` path instead.
 
 Minimum context: the call **fails when the whole context fits in the keep
 window** (`compactKeepRecentTokens`, default 8k) — there is nothing older
