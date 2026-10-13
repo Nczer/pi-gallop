@@ -188,7 +188,6 @@ function targetOf(tool: string, args: unknown): { key: string; target: string } 
     return { key, target: key.slice(0, 60) };
   }
   if (typeof a.path === "string") return { key: a.path, target: a.path };
-  if (typeof a.note_id === "string") return { key: a.note_id, target: a.note_id };
   return { key: "", target: "" };
 }
 
