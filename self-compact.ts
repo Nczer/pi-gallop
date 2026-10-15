@@ -1208,7 +1208,7 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
       // "True"/"False"/"1"/1/0/null to real booleans in place. Anything it
       // cannot coerce ("yes", "") stays a string and fails Check loudly, so no
       // repair hook or runtime flag-parser is needed here.
-      continue: Type.Optional(Type.Boolean({ description: "Continue working right after compaction or not (default: true — pass false to stop)" })),
+      continue: Type.Optional(Type.Boolean({ description: "Steer the agent to resume right after the compact (default: true); false waits for the user" })),
       nuke: Type.Optional(Type.Boolean({ description: `True = only compaction summary survives after compact, summarize everything you need (default: false)` })),
     }),
     async execute(
