@@ -1,14 +1,24 @@
 /**
  * stall.ts — stalled-generation detection.
  *
- * An assistant message that ends on a thinking or toolCall block with a stop
- * reason other than "toolUse" means generation stopped mid-stream. Gallop
- * sends a resume steer (throttled to one per 10s so a stuck loop doesn't
- * spam); after STALL_WARN consecutive stalls the steers become warnings, and
- * at STALL_STOP gallop stops auto-resuming (context is likely corrupted) and
- * notifies the user once — further stalls stay silent so the notice itself
- * doesn't loop. A healthy tool-call handoff (stopReason "toolUse") resets
- * the streak, as does any other normal message end.
+ * An assistant message that ends on a thinking block with a stop reason other
+ * than "aborted"/"error" means generation stopped mid-thought: nothing is left
+ * to execute, so pi's loop ends and the task strands. Gallop sends a resume
+ * steer (throttled to one per 10s so a stuck loop doesn't spam); after
+ * STALL_WARN consecutive stalls the steers become warnings, and at STALL_STOP
+ * gallop stops auto-resuming (context is likely corrupted) and notifies the
+ * user once — further stalls stay silent so the notice itself doesn't loop.
+ * Any other message end resets the streak.
+ *
+ * A message ending on a tool call is NOT a stall. pi executes the tool calls in
+ * a message whatever the provider's finish_reason says — only "error" and
+ * "aborted" end the run early, and the loop keeps going unless the tool batch
+ * asked to terminate (pi-agent-core/dist/agent-loop.js:108,118-126) — and
+ * providers do report finish_reason "stop" on tool-call messages (field:
+ * llama.cpp + Qwen, 2026-10-14). The old `stopReason !== "toolUse"` test read
+ * that as a stall, and the resume steer it injected restarted pi's post-run
+ * loop, holding gallop's own deferred compact (agent_settled) off for 14 more
+ * tool calls.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -32,79 +42,65 @@ export function lastItemIsThinking(message: { content?: unknown }): boolean {
   return typeof last === "object" && last !== null && (last as any).type === "thinking";
 }
 
-export function lastItemIsToolUse(message: { content?: unknown }): boolean {
-  const content = message.content;
-  if (!content || !Array.isArray(content) || content.length === 0) return false;
-  const last = content[content.length - 1];
-  // Assistant tool-call content blocks use type "toolCall" (not "tool_use").
-  return typeof last === "object" && last !== null && (last as any).type === "toolCall";
-}
-
 /** One assistant message end (the caller has already filtered by role):
  *  counts stalls and sends the resume/warning/stop steers. */
 export function onMessageEnd(message: StallMessage, ctx: ExtensionContext, pi: ExtensionAPI): void {
-  if (lastItemIsThinking(message) || lastItemIsToolUse(message)) {
-    const stopReason = message.stopReason;
-    if (stopReason === "aborted" || stopReason === "error") return;
+  if (!lastItemIsThinking(message)) {
+    // Text answer, tool-call handoff (executed or not — pi runs them either
+    // way), or empty content: not a stall, and it breaks a stall streak.
+    stallCount = 0;
+    stallStopNotified = false;
+    return;
+  }
 
-    // Normal tool call flow: LLM stops with stopReason "toolUse" to let the tool run.
-    if (lastItemIsToolUse(message) && stopReason === "toolUse") {
-      // Healthy handoff — resets the consecutive-stall streak.
-      stallCount = 0;
-      stallStopNotified = false;
-      return;
-    }
+  const stopReason = message.stopReason;
+  if (stopReason === "aborted" || stopReason === "error") return;   // user or pi ended the run — not a stall
 
-    stallCount++;
-    const reason = lastItemIsThinking(message)
-      ? "stopped mid-thought"
-      : "stopped after tool call";
+  // A genuine mid-thought stall.
+  stallCount++;
+  const reason = "stopped mid-thought";
 
-    // Count every stall so fast stuck loops still escalate, but throttle
-    // resume messages to one per 10s so a stuck loop doesn't spam.
-    const messageAllowed = Date.now() >= cooldownUntil;
-    if (messageAllowed) {
-      cooldownUntil = Date.now() + RESUME_COOLDOWN_MS;
-    }
+  // Count every stall so fast stuck loops still escalate, but throttle
+  // resume messages to one per 10s so a stuck loop doesn't spam.
+  const messageAllowed = Date.now() >= cooldownUntil;
+  if (messageAllowed) {
+    cooldownUntil = Date.now() + RESUME_COOLDOWN_MS;
+  }
 
-    if (stallCount >= STALL_STOP) {
-      // Stop sending resumes — context is likely corrupted.
-      // Notify once; further stalls stay silent so the notice itself doesn't loop.
-      if (!stallStopNotified) {
-        stallStopNotified = true;
-        const msg = `[Gallop] Agent has stalled ${stallCount} times consecutively. Stopping auto-resume to prevent infinite loop. Please try /new, /compact, or change the prompt.`;
-        pi.sendUserMessage(msg, { deliverAs: "steer" });
-
-        if (ctx.hasUI) {
-          ctx.ui.notify(`Gallop: stall loop stopped (${stallCount} stalls)`, "error");
-        }
-      }
-      return;
-    }
-
-    if (stallCount >= STALL_WARN) {
-      if (messageAllowed) {
-        const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason}). This is stall #${stallCount} — if generation keeps stopping, consider compacting or restarting.`;
-        pi.sendUserMessage(msg, { deliverAs: "steer" });
-
-        if (ctx.hasUI) {
-          ctx.ui.notify(`Gallop: repeated stall #${stallCount} (${reason})`, "warning");
-        }
-      }
-      return;
-    }
-
-    if (messageAllowed) {
-      const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason})`;
+  if (stallCount >= STALL_STOP) {
+    // Stop sending resumes — context is likely corrupted.
+    // Notify once; further stalls stay silent so the notice itself doesn't loop.
+    if (!stallStopNotified) {
+      stallStopNotified = true;
+      const msg = `[Gallop] Agent has stalled ${stallCount} times consecutively. Stopping auto-resume to prevent infinite loop. Please try /new, /compact, or change the prompt.`;
       pi.sendUserMessage(msg, { deliverAs: "steer" });
 
       if (ctx.hasUI) {
-        ctx.ui.notify(`Gallop: ${reason} (stopReason: ${stopReason})`, "info");
+        ctx.ui.notify(`Gallop: stall loop stopped (${stallCount} stalls)`, "error");
       }
     }
-  } else {
-    stallCount = 0;
-    stallStopNotified = false;
+    return;
+  }
+
+  if (stallCount >= STALL_WARN) {
+    if (messageAllowed) {
+      const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason}). This is stall #${stallCount} — if generation keeps stopping, consider compacting or restarting.`;
+      pi.sendUserMessage(msg, { deliverAs: "steer" });
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Gallop: repeated stall #${stallCount} (${reason})`, "warning");
+      }
+    }
+    return;
+  }
+
+  if (messageAllowed) {
+    const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason})`;
+    pi.sendUserMessage(msg, { deliverAs: "steer" });
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(`Gallop: ${reason} (stopReason: ${stopReason})`, "info");
+    }
   }
 }
 

@@ -568,6 +568,23 @@ export function messageContainsRequestCompact(message: { content?: unknown }): b
   );
 }
 
+/** True while a model-requested compaction is en route: the just-ended message
+ *  carries the `compact_request` call (pi emits `message_end` BEFORE the tool's
+ *  execute, so the state guards below cannot see the request yet), the stashed
+ *  request is waiting for `agent_settled`, or a compact is running.
+ *
+ *  Every gallop steer in this window is harmful, not just noise: a steer
+ *  refills pi's steering queue, and the post-run loop keeps running while it is
+ *  non-empty (pi-agent-core/dist/agent-loop.js:86,163) — so the compact that is
+ *  deferred to `agent_settled` waits behind whatever work the steer starts, and
+ *  the pending-compact input gate keeps swallowing typed messages meanwhile.
+ *  Field case (2026-10-14, session 01a138f9): a false stall resume after
+ *  `compact_request` delayed the compaction by 14 tool calls, so the stashed
+ *  checkpoint was already stale when it was written into context. */
+export function compactEnRoute(message?: { content?: unknown }): boolean {
+  return compactionRunning || pendingCompact !== null || (message !== undefined && messageContainsRequestCompact(message));
+}
+
 // ── Delivery ──
 
 const CONTINUE_STEER_MESSAGE = "[Gallop] Compact done — proceed as commanded.";
@@ -688,14 +705,10 @@ export function onMessageEnd(
   pi: ExtensionAPI,
 ): void {
   if (interventionHalted()) return;              // agent halted — a steer would restart a run where every tool is blocked
-  if (pendingCompact) return;                     // a compact request is already pending
-  if (compactionRunning) return;                 // compact in flight — usage about to drop
-  // pi emits message_end BEFORE this message's tool calls execute — a message
-  // containing compact_request has a compact en route the two state guards
-  // above cannot see yet (execute runs after this event). Skip, or the nudge
-  // steer lands around the compaction boundary: "call compact_request now"
-  // right after the model just called it.
-  if (messageContainsRequestCompact(message)) return;
+  // No steer while a compact is en route — see compactEnRoute: it would queue
+  // work that the deferred compact then has to wait behind (and the nudge steer
+  // lands as "call compact_request now" right after the model just called it).
+  if (compactEnRoute(message)) return;
   if (message.stopReason === "aborted" || message.stopReason === "error") return;
   const window = ctx.model?.contextWindow ?? 0;
   const tokens = contextTokensFromUsage(message.usage);

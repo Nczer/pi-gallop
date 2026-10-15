@@ -97,6 +97,11 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
     selfCompact.onMessageEnd(event.message, ctx, pi);
     sawAssistantMessage = false;
+    // A self-compact is en route (this message carries compact_request, or its
+    // stashed request is waiting for agent_settled). Any steer from here —
+    // mismatch, stall — refills pi's steering queue, and the post-run loop keeps
+    // running while that queue is non-empty, delaying the compaction itself.
+    if (selfCompact.compactEnRoute(event.message)) return;
     intervention.onMessageEnd(event.message, ctx, pi);
     stall.onMessageEnd(event.message, ctx, pi);
   });

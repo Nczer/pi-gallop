@@ -5,7 +5,7 @@ import {
   normalizeToolArgs,
   pruneFailureHistory,
 } from "../intervention";
-import { lastItemIsThinking, lastItemIsToolUse } from "../stall";
+import { lastItemIsThinking } from "../stall";
 import { detectBinaryContent, buildBinarySuppressionSummary } from "../binary";
 
 // ── normalizeCommand ──
@@ -286,37 +286,6 @@ describe("lastItemIsThinking", () => {
 
   it("returns false for missing content", () => {
     expect(lastItemIsThinking({})).toBe(false);
-  });
-});
-
-// ── lastItemIsToolUse ──
-
-describe("lastItemIsToolUse", () => {
-  it("returns true when last content item is a tool call", () => {
-    const msg = {
-      content: [
-        { type: "text", text: "let me check" },
-        { type: "toolCall", name: "read", arguments: { path: "x" } },
-      ],
-    };
-    expect(lastItemIsToolUse(msg)).toBe(true);
-  });
-
-  it("returns false when last item is not a tool call", () => {
-    const msg = { content: [{ type: "thinking", thinking: "..." }] };
-    expect(lastItemIsToolUse(msg)).toBe(false);
-  });
-
-  it("returns false for empty content", () => {
-    expect(lastItemIsToolUse({ content: [] })).toBe(false);
-  });
-
-  it("returns false for string content", () => {
-    expect(lastItemIsToolUse({ content: "hello" } as any)).toBe(false);
-  });
-
-  it("returns false for missing content", () => {
-    expect(lastItemIsToolUse({})).toBe(false);
   });
 });
 

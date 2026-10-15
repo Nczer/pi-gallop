@@ -240,12 +240,13 @@ On a hit the result becomes head/tail examples + a count + a re-run hint; pi's t
 
 ### Stall Detection
 
-Monitors assistant messages for unexpected stops. When the LLM halts mid-thought or mid-tool-call (not a clean `tool_use` handoff), sends a resume prompt.
+Monitors assistant messages for unexpected stops. When the LLM halts **mid-thought** — a `thinking` block as the last content, with nothing left to execute — gallop sends a resume prompt.
 
-- Triggers on: `message_end` where last content is `thinking` or `tool_use`
-- Skips: `aborted`, `error`, and normal `tool_use` stops (a normal tool handoff **resets** the stall streak)
+- Triggers on: `message_end` whose last content block is `thinking`
+- Skips: `aborted` and `error` (the user or pi ended the run), and **every message ending on a tool call**. pi executes the tool calls in a message whatever the provider's `finish_reason` says, and keeps the loop running unless the tool batch asked to terminate — so a tool call that stopped on anything other than `tool_use` is a provider quirk (local servers report `stop` there regularly), not a stall
 - Resume messages throttled to one per 10s to avoid spam, but **every** stall counts toward escalation — a fast stuck loop escalates instead of resuming forever
-- Sends `[Gallop] Resume: <reason> (stopReason: <value>)` as steer message
+- Sends `[Gallop] Resume: stopped mid-thought (stopReason: <value>)` as steer message
+- Silent while a self-compact is en route (`compact_request` in the message that just ended, its stashed checkpoint waiting for `agent_settled`, or a compact running): a steer refills pi's steering queue, and the deferred compact has to wait behind whatever work the steer starts
 
 #### Stall Escalation
 
@@ -257,7 +258,7 @@ Consecutive stalls escalate to prevent infinite resume loops:
 | 4+ | Stronger resume with stall count warning |
 | 5+ | **Stop** auto-resume; notify user to try `/new` or `/compact` |
 
-Stall counter resets on any non-stall assistant message (a final text answer or a normal tool-use handoff).
+Stall counter resets on any non-stall assistant message (a final text answer or a tool-call handoff).
 
 ### Failure-Loop Detection
 
