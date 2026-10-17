@@ -11,6 +11,15 @@
  *  - reasoning-action mismatch: the model's thinking acknowledged an error,
  *    yet the next tool call repeats the exact call that just failed
  *
+ * A length-truncated assistant message is invisible to all three: pi fails
+ * every tool call in it itself ("...was not executed: the response hit the
+ * output token limit... Re-issue the tool call...", pi-agent-core
+ * failToolCallsFromTruncatedMessage) and emits tool_execution_start/end for the
+ * synthetic errors. Counting them would climb
+ * the failure loop on a pi-generated message and the repetitive ladder on the
+ * re-issue pi explicitly asks for, and the truncated arguments the fingerprints
+ * were built from are not what the model meant to send. See noteAssistantStopReason.
+ *
  * Enforcement happens in tool_call (the block reasons teach the model a
  * different approach); detection in tool_execution_start/end (args are only
  * available at start). After CIRCUIT_BREAKER_BLOCKS total enforced blocks the
@@ -330,6 +339,21 @@ let lastFailedToolCall: {
 /** Whether LLM's thinking acknowledged an error */
 let llmAcknowledgedError = false;
 
+/** True while the tool calls of the most recent assistant message belong to a
+ *  response that hit the output token limit (see noteAssistantStopReason). */
+let truncatedBatch = false;
+
+/** message_end (assistant), called by the composition root for every assistant
+ *  message before any other intervention work: remembers whether that message
+ *  stopped on "length", so the tool calls pi then fails for it (and their
+ *  possibly-truncated arguments) never feed the detection ladders. The flag
+ *  flips again at the next assistant message_end, which cannot arrive before
+ *  this message's tool batch has run (agent-loop executes tools after emitting
+ *  message_end). */
+export function noteAssistantStopReason(stopReason?: string): void {
+  truncatedBatch = stopReason === "length";
+}
+
 // ── Reasoning-action mismatch keywords ──
 
 /** Keywords that suggest the LLM acknowledged an error or strategy change */
@@ -567,7 +591,11 @@ export function onToolExecutionStart(event: ToolExecStartEvent): void {
     if (oldest !== undefined) pendingToolCalls.delete(oldest);
   }
 
-  // Track ALL tools for repetitive-call detection
+  // Track ALL tools for repetitive-call detection. A call from a
+  // length-truncated response neither starts nor extends a streak — pi never
+  // executed it and its args may be cut off mid-call. (The args stay stashed
+  // above: tool_execution_end still matches the call up by id.)
+  if (truncatedBatch) return;
   if (repetitiveCallState && repetitiveCallState.fingerprint === callFingerprint) {
     repetitiveCallState.count += 1;
   } else {
@@ -594,6 +622,14 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
   // Gallop's own block, by call id (see blockedCallIds). Consumed here: pi
   // always emits tool_execution_end, including for a blocked call.
   const gallopBlocked = blockedCallIds.delete(event.toolCallId);
+
+  // Pi's synthetic failures for a length-truncated response (see
+  // noteAssistantStopReason): the call never ran, so no ladder learns anything
+  // — but the stashed args still have to be released.
+  if (truncatedBatch) {
+    pendingToolCalls.delete(event.toolCallId);
+    return;
+  }
 
   // ── Bash failure-loop detection ──
   if (event.toolName === "bash") {
@@ -751,6 +787,9 @@ export function onMessageEnd(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
 ): void {
+  // Truncated response: its tool-call blocks may be cut off mid-arguments, so
+  // comparing them against the last failed call proves nothing.
+  if (truncatedBatch) return;
   if (lastFailedToolCall) {
     const content = Array.isArray(message.content) ? message.content : [];
     const thinkingContent = content.find(
@@ -794,6 +833,7 @@ export function onMessageEnd(
 /** Reset all intervention state. Called by the composition root on session
  *  start, compaction, and circuit-breaker continue. */
 export function reset(): void {
+  truncatedBatch = false;
   pendingToolCalls.clear();
   blockedCallIds.clear();
   failureHistory.length = 0;

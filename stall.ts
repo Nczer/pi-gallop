@@ -10,6 +10,14 @@
  * user once — further stalls stay silent so the notice itself doesn't loop.
  * Any other message end resets the streak.
  *
+ * A "length" stop is not a stall either, and gets no resume steer. The output
+ * hit the token limit, so what is missing is output budget, not a nudge: with
+ * tool calls in the message pi fails them itself and keeps the run going, and
+ * with none, a resumed generation on the same exhausted budget just truncates
+ * again (field: session 01a14841, 2026-10-17 — the message ended mid-thought on
+ * "length", the resume steer bought a 32-token fragment, and the next message
+ * truncated too). The context-pressure nudge is the steer that helps there.
+ *
  * A message ending on a tool call is NOT a stall. pi executes the tool calls in
  * a message whatever the provider's finish_reason says — only "error" and
  * "aborted" end the run early, and the loop keeps going unless the tool batch
@@ -55,6 +63,10 @@ export function onMessageEnd(message: StallMessage, ctx: ExtensionContext, pi: E
 
   const stopReason = message.stopReason;
   if (stopReason === "aborted" || stopReason === "error") return;   // user or pi ended the run — not a stall
+  // Output hit the token limit — pi owns this case, and resuming does not fix
+  // it (see the header). Neither counted nor streak-breaking: it says nothing
+  // about whether the model keeps halting mid-thought.
+  if (stopReason === "length") return;
 
   // A genuine mid-thought stall.
   stallCount++;

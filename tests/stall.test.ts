@@ -106,6 +106,28 @@ describe("stall detection", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  it("sends nothing for a mid-thought stop cut off by the output token limit", () => {
+    // pi owns "length": it fails the message's tool calls itself, and a
+    // resumed generation on the same exhausted budget truncates again.
+    endMessage(assistantMessage([{ type: "thinking", thinking: "now I will write the checkpoint a" }], "length"));
+    endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "length"));
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("neither counts a truncation nor breaks a stall streak", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-17T06:15:00Z"));
+    for (let i = 0; i < 3; i++) {
+      endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "stop"));
+      vi.advanceTimersByTime(11_000);
+    }
+    endMessage(assistantMessage([{ type: "thinking", thinking: "cut off by the token lim" }], "length"));
+    vi.advanceTimersByTime(11_000);
+    endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "stop"));
+    expect(steers()[3]).toContain("stall #4");   // truncation left the count at 3
+    expect(steers()).toHaveLength(4);            // and sent nothing for itself
+  });
+
   it("sends no stall steer while a compact is pending", async () => {
     await tools.get("compact_request").execute("id1", { summary: SUMMARY }, new AbortController().signal, undefined, ctx);
     pi.sendUserMessage.mockClear();

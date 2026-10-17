@@ -91,6 +91,10 @@ export default function gallopExtension(pi: ExtensionAPI) {
   pi.on("message_end", (event, ctx) => {
     if (event.message.role !== "assistant" || !sawAssistantMessage) return;
 
+    // Record the stop reason before anything else reads it: it is what tells
+    // intervention which tool batch pi truncated (see noteAssistantStopReason).
+    intervention.noteAssistantStopReason(event.message.stopReason);
+
     // Circuit breaker tripped — no more auto-intervention, including the
     // context nudge (a steer would restart a run gallop is backing off from).
     if (intervention.tripped()) return;

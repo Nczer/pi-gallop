@@ -21,7 +21,7 @@ flowchart TB
 
 Everything else keeps the run alive and the context clean:
 
-- **Stall detection** — resumes a model that halts mid-thought or mid-tool-call, escalating to a strategy nudge instead of resuming forever
+- **Stall detection** — resumes a model that halts mid-thought, escalating to a strategy nudge instead of resuming forever
 - **Failure-loop, repetitive-call & mismatch detection** — spots stuck command patterns, then a circuit breaker halts the agent
 - **Read guard** — blocks binary files (PDFs, archives, binaries, ...) before they garble the context, with a result-sniffing safety net
 - **Binary output filter** — replaces binary bash output with a readable summary
@@ -243,7 +243,7 @@ On a hit the result becomes head/tail examples + a count + a re-run hint; pi's t
 Monitors assistant messages for unexpected stops. When the LLM halts **mid-thought** — a `thinking` block as the last content, with nothing left to execute — gallop sends a resume prompt.
 
 - Triggers on: `message_end` whose last content block is `thinking`
-- Skips: `aborted` and `error` (the user or pi ended the run), and **every message ending on a tool call**. pi executes the tool calls in a message whatever the provider's `finish_reason` says, and keeps the loop running unless the tool batch asked to terminate — so a tool call that stopped on anything other than `tool_use` is a provider quirk (local servers report `stop` there regularly), not a stall
+- Skips: `aborted` and `error` (the user or pi ended the run), `length` (the output hit the token limit — see **Truncated responses**), and **every message ending on a tool call**. pi executes the tool calls in a message whatever the provider's `finish_reason` says, and keeps the loop running unless the tool batch asked to terminate — so a tool call that stopped on anything other than `tool_use` is a provider quirk (local servers report `stop` there regularly), not a stall
 - Resume messages throttled to one per 10s to avoid spam, but **every** stall counts toward escalation — a fast stuck loop escalates instead of resuming forever
 - Sends `[Gallop] Resume: stopped mid-thought (stopReason: <value>)` as steer message
 - Silent while a self-compact is en route (`compact_request` in the message that just ended, its stashed checkpoint waiting for `agent_settled`, or a compact running): a steer refills pi's steering queue, and the deferred compact has to wait behind whatever work the steer starts
@@ -258,7 +258,16 @@ Consecutive stalls escalate to prevent infinite resume loops:
 | 4+ | Stronger resume with stall count warning |
 | 5+ | **Stop** auto-resume; notify user to try `/new` or `/compact` |
 
-Stall counter resets on any non-stall assistant message (a final text answer or a tool-call handoff).
+Stall counter resets on any non-stall assistant message (a final text answer or a tool-call handoff). `length` truncations are neither counted nor streak-breaking — they say nothing about whether the model keeps halting mid-thought.
+
+### Truncated Responses (`stopReason: length`)
+
+A response cut off by the output token limit is pi's case, not gallop's, and gallop sends nothing for it:
+
+- **No resume steer**, even when the message ends on a `thinking` block. What is missing is output budget, not a nudge: with tool calls in the message pi fails them itself and keeps the run going; with none, a resumed generation on the same exhausted budget truncates again (field: session `01a14841`, 2026-10-17 — the resume steer bought a 32-token fragment and the next message truncated too). The context-pressure nudge is the steer that helps there.
+- **Invisible to the detection ladders.** pi emits `tool_execution_start`/`end` for every unexecuted call with its own error ("…was not executed: the response hit the output token limit… Re-issue the tool call with complete arguments."). Counting those would climb the failure loop on a message pi wrote, and the repetitive ladder on the re-issue pi explicitly asks for — and the truncated arguments the fingerprints are built from are not what the model meant to send. The composition root records the stop reason at `message_end` (`intervention.noteAssistantStopReason`); the calls of that message neither start nor extend a streak, set no failure-loop history, and no mismatch signal, while the reasoning-action mismatch check skips the message itself (its `toolCall` blocks may be cut off mid-arguments).
+
+A real failure in the next round is detected normally.
 
 ### Failure-Loop Detection
 
