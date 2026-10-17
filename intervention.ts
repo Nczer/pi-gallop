@@ -794,9 +794,12 @@ export function onMessageEnd(
     const content = Array.isArray(message.content) ? message.content : [];
     const thinkingContent = content.find(
       (item: any) => item.type === "thinking",
-    ) as { text?: string } | undefined;
+    ) as { thinking?: string } | undefined;
+    // pi's ThinkingContent carries the text in `thinking` (types.ts:403-405);
+    // reading `text` here saw an empty string, so the check never acknowledged
+    // anything and no mismatch steer was ever issued.
     llmAcknowledgedError = thinkingContent
-      ? thinkingAcknowledgesError(thinkingContent.text ?? "")
+      ? thinkingAcknowledgesError(thinkingContent.thinking ?? "")
       : false;
 
     if (llmAcknowledgedError) {

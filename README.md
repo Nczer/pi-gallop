@@ -328,7 +328,7 @@ A global circuit breaker prevents total doom loops when multiple patterns are bl
 Detects when the LLM acknowledges an error in its thinking but then calls the same tool that just failed. Catches the gap between what the model says and what it does.
 
 - After any tool call fails, records the fingerprint (tool + args + error)
-- On the next `tool_call`, checks if the thinking block contains error keywords ("wrong", "failed", "retry", "different", "instead", etc.)
+- On the next assistant `message_end`, checks if the thinking block contains error keywords ("wrong", "failed", "retry", "different", "instead", etc.) — reading pi's `thinking` field, which is where the text lives
 - If thinking acknowledges an error AND the tool call matches the last failed fingerprint → injects `[Gallop] Mismatch: ...` steer message
 - One-shot: clears after firing or on any successful tool call
 - Operates independently of failure-loop and repetitive-call escalation
