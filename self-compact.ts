@@ -270,7 +270,10 @@ export function checkpointSkeleton(keepRecentTokens: number = KEEP_RECENT_TOKENS
 
 /** The full template, prefixed for use inside a nudge/advice message. */
 function checkpointFormatMessage(keepRecentTokens: number): string {
-  return `\n\nCheckpoint format:\n${checkpointFormat(keepRecentTokens)}`;
+  // The framing is the point: the template is an ARGUMENT, not a reply. A
+  // model that reads it as output guidance writes the checkpoint in the open
+  // and never calls the tool (see `checkpointProseText`).
+  return `\n\nPass the checkpoint as compact_request's \`summary\` argument — never as reply text.\nCheckpoint format:\n${checkpointFormat(keepRecentTokens)}`;
 }
 
 /** Shape of pi's FileOperations (read/written/edited path sets). Structurally
@@ -552,6 +555,31 @@ export function sessionRecallAvailable(): boolean {
  *  disabled). Reset on every compaction and session reset. */
 let contextNudgeState: "idle" | "nudged" = "idle";
 
+/** A checkpoint the model wrote as reply text instead of passing it to
+ *  `compact_request` (see `checkpointProseText`). Stashed as the cycle's
+ *  summary at detection (so pi's automatic threshold compaction in the post-run
+ *  loop uses it instead of its cold one-shot) and consumed by `onSettled`,
+ *  which triggers the compact the model never requested. Cleared by a real
+ *  `compact_request`, a new user turn and every session/compaction reset. */
+let proseCheckpoint: string | null = null;
+
+/** The remaining-tokens label the pressure nudge printed ("~12k left"), kept so
+ *  the footer line can be re-stated at settle time — `agent_settled` has no
+ *  usage to recompute it from. Set with the nudge, cleared with the nudge gate. */
+let pressureLabel: string | null = null;
+
+/** Gallop's line in the footer's `compact` status slot — the slot pi's bottom
+ *  bar keeps for the compaction, so the pressure states and `⟳ Compacting...`
+ *  follow one another in one place (and `onCompacted` / the abort listener
+ *  already clear it). The footer drops items from the tail on a narrow
+ *  terminal, and `compact` is 4th of 6 in its priority list, so this line
+ *  survives. The user-facing nudge used to be a `ui.notify` toast: it shares
+ *  one field with halter's dspa toasts and the two overwrote each other. */
+function setPressureStatus(ctx: ExtensionContext, text: string): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", text)}`);
+}
+
 // ── Message-shape helpers ──
 
 /** True when the message contains a compact_request tool call. pi emits
@@ -566,6 +594,47 @@ export function messageContainsRequestCompact(message: { content?: unknown }): b
       typeof item === "object" && item !== null &&
       (item as any).type === "toolCall" && (item as any).name === "compact_request",
   );
+}
+
+/** The checkpoint skeleton's headings — gallop's own fingerprint, used to
+ *  recognize a checkpoint the model emitted as reply text. A single heading is
+ *  ordinary prose (`## Next Steps` in a plan is not a checkpoint); three of
+ *  them, including the shapes no plan uses (`### Done`,
+ *  `## Constraints & Preferences`), only occur in gallop's own format. Lines
+ *  are compared whole and trimmed, so a decorated heading (`## Goal — X`) does
+ *  not match: detection fails closed, which is today's behavior, never a
+ *  wrong compaction. */
+const CHECKPOINT_HEADINGS = [
+  "## Goal",
+  "## Constraints & Preferences",
+  "## State",
+  "### Done",
+  "### In Progress",
+  "### Blocked",
+  "## Key Decisions",
+  "## Next Steps",
+  "## Pointers",
+];
+
+/** The checkpoint text of an assistant message that asked for nothing: prose
+ *  that follows gallop's skeleton (≥3 headings, at least MIN_SUMMARY_LENGTH)
+ *  and carries no `compact_request` call. Null when the message is not a
+ *  prose checkpoint — including a `length`-truncated one, where the text is a
+ *  fragment and pi handles the truncation itself. */
+export function checkpointProseText(message: { content?: unknown; stopReason?: string }): string | null {
+  if (message.stopReason === "length") return null;
+  if (messageContainsRequestCompact(message)) return null;
+  if (!Array.isArray(message.content)) return null;
+  const text = message.content
+    .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+    .map((b: any) => b.text)
+    .join("\n")
+    .trim();
+  if (text.length < MIN_SUMMARY_LENGTH) return null;
+  const lines = new Set(text.split("\n").map((l) => l.trim()));
+  let hits = 0;
+  for (const h of CHECKPOINT_HEADINGS) if (lines.has(h)) hits++;
+  return hits >= 3 ? text : null;
 }
 
 /** True while a model-requested compaction is en route: the just-ended message
@@ -676,6 +745,9 @@ function triggerCompaction(
  *  re-trigger window is over, so allow future compaction. */
 export function noteUserTurn(): void {
   compactionInFlight = false;
+  // A prose checkpoint belongs to the run that wrote it; agent_settled is the
+  // only consumer and it has already run by the next user turn.
+  proseCheckpoint = null;
 }
 
 /** message_end (assistant): the context-pressure nudge — one advisory steer
@@ -710,6 +782,23 @@ export function onMessageEnd(
   // lands as "call compact_request now" right after the model just called it).
   if (compactEnRoute(message)) return;
   if (message.stopReason === "aborted" || message.stopReason === "error") return;
+  // Prose checkpoint: gallop asked for a compact, the model answered with the
+  // checkpoint as reply text and no tool call. Recover instead of waiting for
+  // the user: stash the text as this cycle's summary — the automatic-threshold
+  // compaction in the post-run loop then uses it instead of pi's cold one-shot
+  // — and let `onSettled` trigger the compact if nothing compacted. Gated on a
+  // live nudge (gallop actually asked), so a checkpoint-shaped progress report
+  // in a roomy context can never start a compaction.
+  if (contextNudgeState === "nudged" && !pendingCompact && !compactionRunning) {
+    const prose = checkpointProseText(message);
+    if (prose) {
+      proseCheckpoint = prose;
+      selfSummary = prose;
+      setPressureStatus(ctx, `⚠ ${pressureLabel ?? "context low"} · prose → compacting`);
+      return; // no nudge for this message: the checkpoint it asks for already exists
+    }
+  }
+
   const window = ctx.model?.contextWindow ?? 0;
   const tokens = contextTokensFromUsage(message.usage);
   if (window <= 0 || tokens <= 0) return;
@@ -721,10 +810,20 @@ export function onMessageEnd(
   contextNudgeState = "nudged";
 
   const k = Math.max(1, Math.round(remaining / 1000));
+  pressureLabel = `~${k}k left`;
   const fmt = checkpointFormatMessage(keepRecentTokens);
+  // One instruction, and it is the tool call. The previous wording ("write a
+  // checkpoint summary AND call compact_request") read as a two-step task, and
+  // the template that follows it reads as output guidance — models completed
+  // step 1 as prose, ended the turn, and the user typed "you forgot the tool
+  // call" (field: sessions 2026-10-17 L261, 2026-10-19 L1084 and L1244 —
+  // 7.7-9.4 KB of checkpoint text, stopReason stop, no call). Calling at a
+  // pause point stays a subordinate hint, not a condition to evaluate.
+  const ask =
+    "Call compact_request now: the checkpoint is its `summary` argument, not reply text — a checkpoint printed in your reply compacts nothing.";
   const text = settings.enabled
-    ? `[Gallop] Context is running low (~${k}k tokens remaining; pi's automatic compaction triggers at ~${Math.max(1, Math.round(settings.reserveTokens / 1000))}k). If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now so the summary stays cache-warm.${fmt}`
-    : `[Gallop] Context is running low (~${k}k tokens remaining) and pi's automatic compaction is disabled. If the current work is at a sensible pause point, write a checkpoint summary and call compact_request now — a context overflow would otherwise abort the run.${fmt}`;
+    ? `[Gallop] Context is running low (~${k}k tokens remaining; pi's automatic compaction triggers at ~${Math.max(1, Math.round(settings.reserveTokens / 1000))}k). ${ask} A sensible pause point keeps the summary cache-warm.${fmt}`
+    : `[Gallop] Context is running low (~${k}k tokens remaining) and pi's automatic compaction is disabled. ${ask} Otherwise a context overflow aborts the run.${fmt}`;
   // Hidden custom message: the nudge is gallop's own instruction, so it does
   // not belong in the transcript as a user bubble (pi renders `custom` only
   // when display is true; interactive-mode.ts:3542). triggerTurn preserves
@@ -734,7 +833,7 @@ export function onMessageEnd(
     { customType: CONTEXT_NUDGE_TYPE, content: text, display: false },
     { triggerTurn: true, deliverAs: "steer" },
   );
-  ctx.ui?.notify?.(`Gallop: context pressure (~${k}k tokens remaining) — the model was asked to checkpoint`, "info");
+  setPressureStatus(ctx, `⚠ ${pressureLabel} → compact_request`);
 }
 
 // ── Deferred compact trigger ──
@@ -746,7 +845,27 @@ export function onMessageEnd(
 // already ran leaves nothing pending, so the manual compact that would
 // otherwise throw "Already compacted" is never started.
 export function onSettled(ctx: ExtensionContext, pi: ExtensionAPI): void {
-  if (!pendingCompact) return;
+  if (!pendingCompact) {
+    // Harvest the prose checkpoint if no compaction ran during the run: an
+    // automatic-threshold compaction consumed the stashed summary and
+    // session_compact reset the state (closing the nudge gate and clearing
+    // proseCheckpoint), so reaching here with a candidate means the model's
+    // prose was the only checkpoint and nothing compacted. Continue by default
+    // — the model believes it compacted and the checkpoint did land.
+    if (!proseCheckpoint || contextNudgeState !== "nudged") {
+      // The nudge went unanswered — no tool call, no prose checkpoint, nothing
+      // compacted. Say so in the footer line, where the user can act: with
+      // auto-compact on, pi's backstop already had its chance in the post-run
+      // loop; with it off only a /compact (or re-asking) saves the context.
+      // Idempotent — every settle in an unanswered cycle restates the same line.
+      if (contextNudgeState === "nudged" && !compactionRunning && pressureLabel) {
+        setPressureStatus(ctx, `⚠ ${pressureLabel} · stalled — /compact`);
+      }
+      return;
+    }
+    proseCheckpoint = null;
+    pendingCompact = { continue: true, nuke: false };
+  }
   const continueAfter = pendingCompact.continue;
   pendingCompact = null;
   // Second line of defense (session_compact normally already cleared the
@@ -1168,6 +1287,7 @@ export function scheduleEvidenceBlocks(blocks: EvidenceBlocks, pi: ExtensionAPI)
 export function onCompactFailed(pi: ExtensionAPI): void {
   pendingBlocks = null; // failed compact: no dangling blocks
   contextNudgeState = "idle";
+  pressureLabel = null;
   compactionRunning = false;
   compactionInFlight = false;
   const stashed = [...pendingRedelivery, ...stashedInputs];
@@ -1185,6 +1305,7 @@ export function onCompactFailed(pi: ExtensionAPI): void {
 export function reset(): void {
   selfSummary = null;
   pendingCompact = null;
+  proseCheckpoint = null;
   pendingBlocks = null;
   lastRequestTools = null;
   stashedInputs = [];
@@ -1195,6 +1316,7 @@ export function reset(): void {
     stashedRedeliveryTimer = undefined;
   }
   contextNudgeState = "idle";
+  pressureLabel = null;
 }
 
 // ── Tool registration ──
@@ -1261,6 +1383,9 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
         );
       }
       selfSummary = summary;
+      // The model's own checkpoint supersedes any prose text from earlier in
+      // the run — no harvest on top of a real call.
+      proseCheckpoint = null;
 
       // Defer the actual compact to agent_settled (the run ends right after this
       // terminate result). If the run's final usage crossed pi's automatic

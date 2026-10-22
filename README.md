@@ -371,6 +371,24 @@ agent.
 
 Compaction resets all escalation state (blocks, nudges, stall count).
 
+**What the user sees.** The nudge's user-facing half is gallop's line in the
+footer's `compact` status slot — `· ⚠ ~12k left → compact_request` — the same
+slot the `⟳ Compacting...` line uses, so one place carries the whole pressure
+lifecycle (a `ui.notify` toast lost it: one field shared with halter's dspa
+toasts, overwriting each other). If the nudge goes unanswered — no tool call,
+no prose checkpoint, nothing compacted — the line escalates at `agent_settled`
+to `· ⚠ ~12k left · stalled — /compact`.
+
+**A checkpoint that arrives as prose is harvested, not re-asked.** While a
+nudge is live, an assistant message that *is* a checkpoint (`checkpointProseText`:
+≥3 of the skeleton's exact whole-line headings, past `MIN_SUMMARY_LENGTH`, no
+tool call in it, not `length`-truncated) is stashed as the cycle's summary — so
+pi's automatic threshold compaction uses it instead of its cold one-shot — and
+`agent_settled` triggers the compact if nothing compacted. A real
+`compact_request` later in the run supersedes it; a new user turn, a compaction
+or a session reset drops it. Detection fails closed: two headings (a progress
+report) or a decorated heading (`## Goal — ship it`) harvest nothing.
+
 ### Context status (active usage query)
 
 The model has no passive view of context usage — the nudge above only fires

@@ -17,6 +17,7 @@ import {
   NUDGE_PCT_DEFAULT,
   checkpointFormat,
   checkpointSkeleton,
+  checkpointProseText,
   tooSmallCompactError,
   computeCustomFirstKeptEntryId,
   COMPACT_DONE_MARKER,
@@ -1310,6 +1311,317 @@ describe("context-pressure nudge", () => {
     await resetState();
     await endTurn(15_000);
     expect(nudgeSteers()).toHaveLength(1);
+  });
+});
+
+
+// ── Prose checkpoint: the model writes the summary instead of calling ──
+//
+// Field signature (3 sessions, 2026-10-17 L261, 2026-10-19 L1084 and L1244):
+// the pressure nudge lands, the model answers with the whole checkpoint as
+// reply text (7.7-9.4 KB), stopReason "stop", NO compact_request call, and the
+// run ends — the user typed "you forgot the tool call" every time. The harvest
+// turns that message into the compaction instead of into a keystroke.
+
+describe("prose checkpoint harvest (checkpoint as reply text, no tool call)", () => {
+  const WINDOW = 200_000;
+  let pi: any;
+  let handlers: Map<string, any>;
+  let tools: Map<string, any>;
+  let ctx: any;
+  let tmpHome: string;
+  let tmpCwd: string;
+
+  /** A full checkpoint in gallop's own format (well past MIN_SUMMARY_LENGTH). */
+  const checkpointText = [
+    "## Goal",
+    "Ship the halter dspa intent floor, steps 4-7. ".repeat(8),
+    "## Constraints & Preferences",
+    "- no new dependencies, token-conscious. ".repeat(8),
+    "## State",
+    "### Done",
+    "- [x] stage model landed in 3.38.0. ".repeat(8),
+    "### In Progress",
+    "- [ ] the reach floor measures reach, not glob syntax",
+    "## Key Decisions",
+    "- **typed miss**: the floor names and clears the intent",
+    "## Next Steps",
+    "1. run the suite, then commit step 5",
+    "## Pointers",
+    "- self-compact.ts:700 (onMessageEnd)",
+  ].join("\n");
+
+  /** The prose message's replacement: a real tool call's summary. */
+  const toolSummary = "## Goal\nthe tool's own checkpoint, not the prose one. ".repeat(10);
+
+  beforeEach(() => {
+    ({ pi, handlers, tools } = makeMockPi());
+    gallopExtension(pi);
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-prose-home-"));
+    tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-prose-cwd-"));
+    vi.stubEnv("HOME", tmpHome);
+    ctx = {
+      compact: vi.fn(),
+      hasUI: false,
+      cwd: tmpCwd,
+      model: { contextWindow: WINDOW },
+      getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: WINDOW, percent: 25 })),
+      sessionManager: { getSessionFile: () => "/tmp/gallop-test/session.jsonl", getBranch: vi.fn(() => []) },
+    };
+    void handlers.get("session_compact")(null, { hasUI: false });
+    void handlers.get("message_start")({ message: { role: "user" } }, ctx);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT, compactNudgePct: NUDGE_PCT_DEFAULT });
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  /** assistant message_end whose usage leaves `remaining` tokens. */
+  const endAssistant = async (content: any[], remaining: number, stopReason = "stop") => {
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        role: "assistant",
+        content,
+        stopReason,
+        usage: {
+          input: WINDOW - remaining, output: 0, cacheRead: 0, cacheWrite: 0,
+          totalTokens: WINDOW - remaining,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+      },
+    }, ctx);
+  };
+
+  const text = (t: string) => [{ type: "text", text: t }];
+  const settle = () => handlers.get("agent_settled")(null, ctx);
+
+  /** Cross the nudge threshold with an ordinary working message. */
+  const fireNudge = async () => {
+    await endAssistant(text("working on step 5"), 8_000);
+    expect(pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === CONTEXT_NUDGE_TYPE)).toHaveLength(1);
+  };
+
+  /** The custom compaction pi would build from whatever summary is stashed. */
+  const stashedCompaction = async () =>
+    handlers.get("session_before_compact")(
+      { preparation: { firstKeptEntryId: "entry-123", tokensBefore: 50_000, fileOps: { read: new Set(), written: new Set(), edited: new Set() } }, signal: new AbortController().signal },
+      ctx,
+    );
+
+  it("nudge + prose checkpoint + settle compacts, with the prose as the summary", async () => {
+    await fireNudge();
+    await endAssistant(text(checkpointText), 6_000);
+    settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+
+    const result = await stashedCompaction();
+    expect(result?.compaction?.summary).toContain("## Pointers");
+    expect(result?.compaction?.summary).toContain("halter dspa intent floor");
+  });
+
+  it("settles once — the harvest does not re-trigger", async () => {
+    await fireNudge();
+    await endAssistant(text(checkpointText), 6_000);
+    settle();
+    settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it("no nudge this cycle: a checkpoint-shaped reply in a roomy context compacts nothing", async () => {
+    await endAssistant(text(checkpointText), 150_000);
+    settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("an ordinary progress report is not a checkpoint (two headings)", async () => {
+    await fireNudge();
+    await endAssistant(
+      text("## Goal\nStill mid-task. " + "filler ".repeat(200) + "\n\n## Next Steps\nrun the suite"),
+      6_000,
+    );
+    settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("a length-truncated checkpoint is left to pi", async () => {
+    await fireNudge();
+    await endAssistant(text(checkpointText), 6_000, "length");
+    settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("a real compact_request later in the run supersedes the prose", async () => {
+    await fireNudge();
+    await endAssistant(text(checkpointText), 6_000);
+    // The call path: pi's Value.Convert + execute (same as the wiring suite).
+    const t = tools.get("compact_request");
+    const params: any = { summary: toolSummary };
+    Value.Convert(t.parameters, params);
+    await t.execute("id1", params, new AbortController().signal, undefined, ctx);
+    settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    const result = await stashedCompaction();
+    expect(result?.compaction?.summary).toContain("the tool's own checkpoint");
+    expect(result?.compaction?.summary).not.toContain("halter dspa intent floor");
+  });
+
+  it("a new user turn drops a candidate that never settled", async () => {
+    await fireNudge();
+    await endAssistant(text(checkpointText), 6_000);
+    await handlers.get("message_start")({ message: { role: "user" } }, ctx);
+    settle();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+});
+
+// ── checkpointProseText (the pure detector) ──
+
+describe("checkpointProseText", () => {
+  const body = (headings: string[]) =>
+    headings.join("\n") + "\n" + "filler text ".repeat(60); // past MIN_SUMMARY_LENGTH
+
+  it("needs three exact headings", () => {
+    expect(checkpointProseText({ content: [{ type: "text", text: body(["## Goal", "## Next Steps"]) }] })).toBeNull();
+    expect(checkpointProseText({ content: [{ type: "text", text: body(["## Goal", "## Next Steps", "### Done"]) }] })).not.toBeNull();
+  });
+
+  it("a decorated heading does not count (fails closed)", () => {
+    expect(checkpointProseText({ content: [{ type: "text", text: body(["## Goal — ship it", "## Next Steps", "### Done"]) }] })).toBeNull();
+  });
+
+  it("a call in the message means the tool path runs, not the harvest", () => {
+    const msg = {
+      content: [
+        { type: "text", text: body(["## Goal", "## Next Steps", "### Done"]) },
+        { type: "toolCall", id: "c1", name: "compact_request", arguments: { summary: "x" } },
+      ],
+    };
+    expect(checkpointProseText(msg)).toBeNull();
+  });
+
+  it("a fragment below the minimum summary length is not a checkpoint", () => {
+    expect(checkpointProseText({ content: [{ type: "text", text: "## Goal\n## Next Steps\n### Done" }] })).toBeNull();
+  });
+
+  it("joins multiple text blocks", () => {
+    const t = body(["## Goal", "## Next Steps"]) ;
+    const msg = { content: [{ type: "text", text: t }, { type: "text", text: "### Done" }] };
+    expect(checkpointProseText(msg)).not.toBeNull();
+  });
+});
+
+
+// ── The pressure signal lives in the footer, not in a toast ──
+//
+// The nudge's user-facing half used to be ui.notify — one field shared with
+// halter's dspa toasts, where the two overwrote each other. It is now gallop's
+// line in the footer's "compact" status slot: the same slot the "⟳ Compacting..."
+// line uses, so the pressure states and the compaction follow one another.
+
+describe("context pressure in the footer status slot", () => {
+  const WINDOW = 200_000;
+  let pi: any;
+  let handlers: Map<string, any>;
+  let ctx: any;
+  let statuses: Array<[string, string | undefined]>;
+  let tmpHome: string;
+  let tmpCwd: string;
+
+  beforeEach(() => {
+    ({ pi, handlers } = makeMockPi());
+    gallopExtension(pi);
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-status-home-"));
+    tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-status-cwd-"));
+    vi.stubEnv("HOME", tmpHome);
+    statuses = [];
+    ctx = {
+      compact: vi.fn(),
+      hasUI: true,
+      cwd: tmpCwd,
+      ui: {
+        notify: vi.fn(),
+        setStatus: (key: string, text: string | undefined) => statuses.push([key, text]),
+        theme: { fg: (_kind: string, s: string) => s },
+      },
+      model: { contextWindow: WINDOW },
+      getContextUsage: vi.fn(() => ({ tokens: 50_000, contextWindow: WINDOW, percent: 25 })),
+      sessionManager: { getSessionFile: () => "/tmp/gallop-test/session.jsonl", getBranch: vi.fn(() => []) },
+    };
+    void handlers.get("session_compact")(null, { hasUI: false });
+    void handlers.get("message_start")({ message: { role: "user" } }, ctx);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    setNudgeSettings({ compactNudgeBuffer: NUDGE_BUFFER_DEFAULT, compactNudgeDisabledAt: NUDGE_DISABLED_AT_DEFAULT, compactNudgePct: NUDGE_PCT_DEFAULT });
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  /** Cross the threshold with an ordinary assistant message. */
+  const cross = async (remaining = 8_000) => {
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        role: "assistant", content: [{ type: "text", text: "working on step 5" }], stopReason: "stop",
+        usage: { input: WINDOW - remaining, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: WINDOW - remaining, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      },
+    }, ctx);
+  };
+
+  const lastStatus = (): [string, string | undefined] => statuses[statuses.length - 1];
+
+  it("the nudge writes the footer line and sends no toast", async () => {
+    await cross();
+    expect(lastStatus()[0]).toBe("compact");
+    expect(lastStatus()[1]).toContain("~8k left → compact_request");
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("an unanswered nudge escalates to the actionable line at settle", async () => {
+    await cross();
+    handlers.get("agent_settled")(null, ctx);
+    expect(lastStatus()[1]).toContain("~8k left · stalled — /compact");
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("escalation is idempotent — the same line every settle", async () => {
+    await cross();
+    handlers.get("agent_settled")(null, ctx);
+    handlers.get("agent_settled")(null, ctx);
+    expect(statuses.filter(([, t]) => t?.includes("stalled"))).toHaveLength(2);
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+
+  it("a harvested prose checkpoint says so in the same slot, not as a toast", async () => {
+    await cross();
+    const prose = [
+      "## Goal", "Ship the footer status move. ".repeat(20),
+      "## Next Steps", "1. run the suite", "### Done", "- [x] the nudge writes a status",
+    ].join("\n");
+    await handlers.get("message_start")({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")({
+      message: {
+        role: "assistant", content: [{ type: "text", text: prose }], stopReason: "stop",
+        usage: { input: WINDOW - 6_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: WINDOW - 6_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      },
+    }, ctx);
+    expect(lastStatus()[1]).toContain("~8k left · prose → compacting");
+    handlers.get("agent_settled")(null, ctx);
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("the footer line survives a UI-less context", async () => {
+    ctx.hasUI = false;
+    ctx.ui.setStatus = vi.fn();
+    await cross();
+    expect(ctx.ui.setStatus).not.toHaveBeenCalled();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1); // the model-facing nudge still lands
   });
 });
 
