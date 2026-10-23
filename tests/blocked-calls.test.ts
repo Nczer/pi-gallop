@@ -16,6 +16,7 @@ function makeMockPi() {
     registerTool: vi.fn((tool: any) => { tools.set(tool.name, tool); }),
     registerCommand: vi.fn(),
     sendUserMessage: vi.fn(),
+    sendMessage: vi.fn(),
     appendEntry: vi.fn(),
   };
   return { pi, handlers, tools };
@@ -29,6 +30,8 @@ const uiCtx = (choice: string | undefined) => ({
   ui: {
     notify: vi.fn(),
     select: vi.fn(async () => choice),
+    setStatus: vi.fn(),
+    theme: { fg: (_kind: string, text: string) => text },
   },
 });
 
@@ -63,8 +66,12 @@ async function runCall(
   return verdict ?? {};
 }
 
-const steers = (pi: any) =>
-  pi.sendUserMessage.mock.calls.map(([t]) => t as string).filter((t) => t.startsWith("[Gallop]"));
+/** Steers gallop put in front of the model: hidden custom messages (steer.ts)
+ *  for the ladder, plus the plain user messages the circuit breaker still sends. */
+const steers = (pi: any) => [
+  ...pi.sendUserMessage.mock.calls.map(([t]) => t as string),
+  ...pi.sendMessage.mock.calls.map(([m]) => (m && typeof m.content === "string" ? m.content : "")),
+].filter((t) => t.startsWith("[Gallop]"));
 
 describe("gallop-blocked calls vs the repetitive ladder", () => {
   let pi: any;

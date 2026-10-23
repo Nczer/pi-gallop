@@ -55,7 +55,9 @@ describe("reasoning-action mismatch", () => {
   });
 
   const steers = () =>
-    pi.sendUserMessage.mock.calls.map(([t]: any[]) => t as string).filter((t) => t.startsWith("[Gallop] Mismatch:"));
+    pi.sendMessage.mock.calls
+      .map(([m]: any[]) => m?.content as string)
+      .filter((t) => typeof t === "string" && t.startsWith("[Gallop] Mismatch:"));
 
   /** The model re-issues the exact failed call; only the thinking differs. */
   async function reIssue(thinking: string) {

@@ -245,7 +245,7 @@ Monitors assistant messages for unexpected stops. When the LLM halts **mid-thoug
 - Triggers on: `message_end` whose last content block is `thinking`
 - Skips: `aborted` and `error` (the user or pi ended the run), `length` (the output hit the token limit — see **Truncated responses**), and **every message ending on a tool call**. pi executes the tool calls in a message whatever the provider's `finish_reason` says, and keeps the loop running unless the tool batch asked to terminate — so a tool call that stopped on anything other than `tool_use` is a provider quirk (local servers report `stop` there regularly), not a stall
 - Resume messages throttled to one per 10s to avoid spam, but **every** stall counts toward escalation — a fast stuck loop escalates instead of resuming forever
-- Sends `[Gallop] Resume: stopped mid-thought (stopReason: <value>)` as steer message
+- Sends `[Gallop] Resume: stopped mid-thought (stopReason: <value>)` as a hidden steer (`customType: gallop-stall`); the footer shows `· ⚠ stall: resumed` while the stall streak is live
 - Silent while a self-compact is en route (`compact_request` in the message that just ended, its stashed checkpoint waiting for `agent_settled`, or a compact running): a steer refills pi's steering queue, and the deferred compact has to wait behind whatever work the steer starts
 
 #### Stall Escalation
@@ -276,7 +276,7 @@ Tracks bash commands that fail repeatedly with the same error. When a command fa
 - Normalizes commands (whitespace, case) for fuzzy matching
 - Fingerprints errors by last meaningful line
 - Provides hints for common patterns: ENOENT, permission denied, package managers, syntax errors
-- Sends `[Gallop] Failure loop detected: <details>` as steer message
+- Sends `[Gallop] Failure loop detected: <details>` as a hidden steer (`customType: gallop-retry`); the footer shows `· ⚠ same failure ×3: change strategy` while that ladder entry is live
 
 #### Failure-Loop Escalation
 
@@ -299,7 +299,7 @@ Tracks consecutive tool calls with identical arguments across **all tools**. Whe
 - Other tools — fingerprints by sorted JSON of args
 - Resets counter on any different call
 - Skips bash errors (failure-loop handler already covers them)
-- Sends `[Gallop] Repetitive action detected: <details>` as steer message
+- Sends `[Gallop] Repetitive action detected: <details>` as a hidden steer (`customType: gallop-repetitive`); the footer shows `· ⚠ repetitive bash ×5` while that fingerprint is live
 
 #### Repetitive-Call Escalation
 
@@ -329,9 +329,30 @@ Detects when the LLM acknowledges an error in its thinking but then calls the sa
 
 - After any tool call fails, records the fingerprint (tool + args + error)
 - On the next assistant `message_end`, checks if the thinking block contains error keywords ("wrong", "failed", "retry", "different", "instead", etc.) — reading pi's `thinking` field, which is where the text lives
-- If thinking acknowledges an error AND the tool call matches the last failed fingerprint → injects `[Gallop] Mismatch: ...` steer message
+- If thinking acknowledges an error AND the tool call matches the last failed fingerprint → injects `[Gallop] Mismatch: ...` as a hidden steer (`customType: gallop-mismatch`), with `· ⚠ mismatch: re-issuing the failed <tool>` in the footer until a *different* call dispatches
 - One-shot: clears after firing or on any successful tool call
 - Operates independently of failure-loop and repetitive-call escalation
+
+#### Surfaces: hidden steers and one footer line
+
+Every model-facing nudge (retry, repetitive, mismatch, stall, continue) goes out
+through `steer.ts`: a `display: false` custom message with
+`{ triggerTurn: true, deliverAs: "steer" }`. It is a steer in pi's sense — it
+continues a running loop and triggers a turn when idle — while `convertToLlm`
+hands it to the model as a `user` message, so the transcript carries no user
+bubble for it and `/export` renders it as `[gallop-retry] · Hidden in terminal`.
+
+The user sees gallop's half instead: `status.ts` writes the single `compact`
+footer key with two parts — the compaction state part and the nudge part — e.g.
+`· ⚠ ~12k left → compact_request · ⚠ same failure ×3`. A nudge part states what
+keeps it truthful (`live()` over the state that produced it: a ladder entry, a
+stall streak, an owed continue), and `reconcile` at the detection points that
+mutate that state drops it as soon as the model has addressed it. No timers — a
+timer would clear the line while the model is still working. Toasts stay for the
+cases that ask something of the user: block-level enforcement and the
+stall-loop stop. Color is the register: `dim` for a note about something already
+done (`✓ compacted → resuming`), `warning` for a caution the model can still act
+on, `error` for enforcement (a blocked tool).
 
 ### Context-pressure nudge
 

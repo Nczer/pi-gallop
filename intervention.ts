@@ -28,6 +28,8 @@
  * /new). While tripped, no auto-intervention runs at all.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as status from "./status";
+import { sendHiddenSteer } from "./steer";
 
 // ── Normalization and fingerprinting ──
 
@@ -151,12 +153,31 @@ export function normalizeToolArgs(toolName: string, args: unknown): string {
 
 export type EscalationLevel = "nudge" | "nudge_plus" | "block";
 
+/** How one ladder reports an escalation to the user: `customType` labels the
+ *  hidden steer, `statusLabel(level)` is the footer part (short — the footer
+ *  line is shared), `live()` is the condition that keeps that part on screen
+ *  (the same ladder / pattern state the detector already owns, so the line
+ *  clears when the nudge is addressed), `uiLabel` feeds the block-level toast. */
+export interface EscalationUi {
+  customType: string;
+  statusLabel: (level: EscalationLevel) => string;
+  live: () => boolean;
+  uiLabel: string;
+}
+
 export interface EscalationEntry {
   level: EscalationLevel;
   nudgeCount: number;
 }
 
 const ESCALATION_LEVELS: EscalationLevel[] = ["nudge", "nudge_plus", "block"];
+
+/** customType per steer family (transport: steer.ts). The types label the
+ *  messages in the session file and in /export, where hidden customs render as
+ *  `[gallop-retry] · Hidden in terminal`. */
+export const RETRY_TYPE = "gallop-retry";
+export const REPETITIVE_TYPE = "gallop-repetitive";
+export const MISMATCH_TYPE = "gallop-mismatch";
 
 /**
  * Escalation ladder — one per detector. Owns the per-fingerprint level
@@ -177,7 +198,7 @@ export interface EscalationLadder {
     buildMessage: (level: EscalationLevel) => string,
     ctx: ExtensionContext,
     pi: ExtensionAPI,
-    uiLabel: string,
+    ui: EscalationUi,
   ): EscalationLevel | null;
   get(fingerprint: string): EscalationEntry | undefined;
   clear(): void;
@@ -207,7 +228,7 @@ export function createEscalationLadder(
       }
     },
 
-    bump(fingerprint, count, buildMessage, ctx, pi, uiLabel): EscalationLevel | null {
+    bump(fingerprint, count, buildMessage, ctx, pi, ui): EscalationLevel | null {
       if (isQuiesced()) return null;
       if (count < thresholds.nudge) {
         map.delete(fingerprint);
@@ -243,11 +264,23 @@ export function createEscalationLadder(
 
       const msg = buildMessage(targetLevel);
       if (msg) {
-        pi.sendUserMessage(msg, { deliverAs: "steer" });
+        sendHiddenSteer(pi, ui.customType, msg);
       }
 
+      // User-facing: the footer's gallop line carries every level (it stays put
+      // while the state that raised it is live); the toast fires only for a
+      // block, the one escalation that changes what the model can do. Nudges no
+      // longer toast — one shared toast field, and halter's toasts won it.
       if (ctx.hasUI) {
-        ctx.ui.notify(`Gallop: ${targetLevel} — ${uiLabel}`, targetLevel === "block" ? "error" : "warning");
+        status.setNudge(
+          ctx,
+          ui.statusLabel(targetLevel),
+          ui.live,
+          targetLevel === "block" ? "error" : "warning",
+        );
+        if (targetLevel === "block") {
+          ctx.ui.notify(`Gallop: block — ${ui.uiLabel}`, "error");
+        }
       }
 
       return targetLevel;
@@ -335,6 +368,11 @@ let lastFailedToolCall: {
   fingerprint: string;
   error: string;
 } | null = null;
+
+/** Fingerprint of the call a mismatch nudge was issued for. Its footer part
+ *  stays while this holds: a different call starting means the model corrected
+ *  itself (the nudge was addressed); repeating it means the streak continues. */
+let mismatchNudgeFingerprint: string | null = null;
 
 /** Whether LLM's thinking acknowledged an error */
 let llmAcknowledgedError = false;
@@ -446,6 +484,7 @@ async function handleCircuitBreaker(
 
     if (choice === "Continue") {
       fullReset?.();
+      status.clearNudge(ctx);
       pi.sendUserMessage(
         `[Gallop] Circuit breaker: blocks cleared by user. Continuing.`,
         { deliverAs: "steer" },
@@ -502,7 +541,14 @@ function checkRepetitiveCall(
       return `[Gallop] Repetitive action detected: You've called ${toolName} ${count} times in a row with the same arguments (${displayArg}).${hint}`;
     },
     ctx, pi,
-    `repetitive call (${count}x ${toolName})`,
+    {
+      customType: REPETITIVE_TYPE,
+      uiLabel: `repetitive call (${count}x ${toolName})`,
+      statusLabel: (level) => level === "block"
+        ? `⛔ ${toolName} blocked (×${count} same call)`
+        : `⚠ repetitive ${toolName} ×${count}`,
+      live: () => repetitiveLadder.get(fingerprint) !== undefined,
+    },
   );
 }
 
@@ -551,7 +597,14 @@ function checkFailureLoop(
       return `[Gallop] Failure loop detected: You've retried this command ${matchCount} times with the same error — "${errorSnippet}". Command: \`${shortCommand}\`${hint}`;
     },
     ctx, pi,
-    `failure loop (${matchCount} failures)`,
+    {
+      customType: RETRY_TYPE,
+      uiLabel: `failure loop (${matchCount} failures)`,
+      statusLabel: (level) => level === "block"
+        ? `⛔ retries blocked: ${shortCommand}`
+        : `⚠ same failure ×${matchCount}: change strategy`,
+      live: () => failureLadder.get(nudgeKey) !== undefined,
+    },
   );
 }
 
@@ -583,6 +636,14 @@ export function onToolExecutionStart(event: ToolExecStartEvent): void {
   const argFingerprint = normalizeToolArgs(event.toolName, args);
   const callFingerprint = `${event.toolName}:${argFingerprint}`;
   pendingToolCalls.set(event.toolCallId, { args, fingerprint: callFingerprint });
+
+  // A different call dispatching after a mismatch nudge: the model corrected
+  // itself, so the nudge's footer part is stale. The flag drops here and
+  // status.reconcile at tool_execution_end takes the line out (this hook has no
+  // UI context).
+  if (mismatchNudgeFingerprint !== null && mismatchNudgeFingerprint !== callFingerprint) {
+    mismatchNudgeFingerprint = null;
+  }
 
   // Safety cap: if tool_execution_end never fires for a call (e.g. blocked),
   // entries would leak — drop the oldest when the map grows unbounded.
@@ -714,6 +775,11 @@ export function onToolExecutionEnd(event: ToolExecEndEvent, ctx: ExtensionContex
   }
 
   pendingToolCalls.delete(event.toolCallId);
+
+  // The call that just ended may have ended the state behind a footer nudge
+  // part (a bash success clears the failure ladder, a successful different
+  // call clears the other repetitive entries) — reconcile against that state.
+  status.reconcile(ctx);
 }
 
 /** tool_call guard: enforce failure-loop blocks (bash) and repetitive-call
@@ -817,20 +883,29 @@ export function onMessageEnd(
             : lastFailedToolCall.error;
 
           const msg = `[Gallop] Mismatch: You acknowledged an error in your thinking but are about to call ${lastFailedToolCall.toolName} with the same arguments that just failed (error: "${errorSnippet}"). Change the tool call to match your reasoning.`;
-          pi.sendUserMessage(msg, { deliverAs: "steer" });
+          sendHiddenSteer(pi, MISMATCH_TYPE, msg);
 
           if (ctx.hasUI) {
-            ctx.ui.notify("Gallop: reasoning-action mismatch", "warning");
+            status.setNudge(
+              ctx,
+              `⚠ mismatch: re-issuing the failed ${lastFailedToolCall.toolName}`,
+              () => mismatchNudgeFingerprint === callFingerprint,
+            );
           }
 
           // Clear tracking so we don't flag repeatedly
           lastFailedToolCall = null;
           llmAcknowledgedError = false;
+          mismatchNudgeFingerprint = callFingerprint;
           break;
         }
       }
     }
   }
+
+  // The state behind the footer part may have ended in this message (a stall
+  // streak broken, a ladder entry expired) — drop the part if it did.
+  status.reconcile(ctx);
 }
 
 /** Reset all intervention state. Called by the composition root on session
@@ -852,4 +927,5 @@ export function reset(): void {
 
   lastFailedToolCall = null;
   llmAcknowledgedError = false;
+  mismatchNudgeFingerprint = null;
 }

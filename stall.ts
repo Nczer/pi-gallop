@@ -29,6 +29,11 @@
  * tool calls.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as status from "./status";
+import { sendHiddenSteer } from "./steer";
+
+/** customType of the resume steer (see steer.ts). */
+export const STALL_TYPE = "gallop-stall";
 
 const STALL_WARN = 4;                 // Stalls before strong warning
 const STALL_STOP = 5;                 // Stalls before stopping and notifying user
@@ -58,6 +63,8 @@ export function onMessageEnd(message: StallMessage, ctx: ExtensionContext, pi: E
     // way), or empty content: not a stall, and it breaks a stall streak.
     stallCount = 0;
     stallStopNotified = false;
+    // The resume nudge's footer part lives on `stallCount` — it just went false.
+    status.reconcile(ctx);
     return;
   }
 
@@ -85,9 +92,17 @@ export function onMessageEnd(message: StallMessage, ctx: ExtensionContext, pi: E
     if (!stallStopNotified) {
       stallStopNotified = true;
       const msg = `[Gallop] Agent has stalled ${stallCount} times consecutively. Stopping auto-resume to prevent infinite loop. Please try /new, /compact, or change the prompt.`;
-      pi.sendUserMessage(msg, { deliverAs: "steer" });
+      sendHiddenSteer(pi, STALL_TYPE, msg);
 
       if (ctx.hasUI) {
+        // The one stall case that asks something of the USER, so it keeps its
+        // toast on top of the footer part.
+        status.setNudge(
+          ctx,
+          `⛔ stalled ×${stallCount} — auto-resume off`,
+          () => stallCount > 0,
+          "error",
+        );
         ctx.ui.notify(`Gallop: stall loop stopped (${stallCount} stalls)`, "error");
       }
     }
@@ -97,10 +112,10 @@ export function onMessageEnd(message: StallMessage, ctx: ExtensionContext, pi: E
   if (stallCount >= STALL_WARN) {
     if (messageAllowed) {
       const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason}). This is stall #${stallCount} — if generation keeps stopping, consider compacting or restarting.`;
-      pi.sendUserMessage(msg, { deliverAs: "steer" });
+      sendHiddenSteer(pi, STALL_TYPE, msg);
 
       if (ctx.hasUI) {
-        ctx.ui.notify(`Gallop: repeated stall #${stallCount} (${reason})`, "warning");
+        status.setNudge(ctx, `⚠ stall #${stallCount}: resumed`, () => stallCount > 0);
       }
     }
     return;
@@ -108,10 +123,10 @@ export function onMessageEnd(message: StallMessage, ctx: ExtensionContext, pi: E
 
   if (messageAllowed) {
     const msg = `[Gallop] Resume: ${reason} (stopReason: ${stopReason})`;
-    pi.sendUserMessage(msg, { deliverAs: "steer" });
+    sendHiddenSteer(pi, STALL_TYPE, msg);
 
     if (ctx.hasUI) {
-      ctx.ui.notify(`Gallop: ${reason} (stopReason: ${stopReason})`, "info");
+      status.setNudge(ctx, `⚠ stall: resumed`, () => stallCount > 0);
     }
   }
 }

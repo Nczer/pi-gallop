@@ -374,9 +374,12 @@ describe("self-compact wiring (in-session summary)", () => {
     pi.sendUserMessage.mockClear();
     opts.onComplete();
     await flushTimers();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
-    expect(pi.sendUserMessage.mock.calls[0][1]).toEqual({ deliverAs: "steer" });
+    // Hidden custom steer (steer.ts) — visible as gallop's footer line, not a bubble.
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    const [cMsg, cMeta] = pi.sendMessage.mock.calls.find(([m]: any) => m?.customType === "gallop-continue")!;
+    expect(cMsg.content).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(cMsg.display).toBe(false);
+    expect(cMeta).toEqual({ triggerTurn: true, deliverAs: "steer" });
   });
 
   it("injects the proceed message when continue is omitted (default true)", async () => {
@@ -386,8 +389,8 @@ describe("self-compact wiring (in-session summary)", () => {
     pi.sendUserMessage.mockClear();
     opts.onComplete();
     await flushTimers();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue")).toHaveLength(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("does not inject anything after compaction when continue is false", async () => {
@@ -423,8 +426,8 @@ describe("self-compact wiring (in-session summary)", () => {
     pi.sendUserMessage.mockClear();
     opts.onComplete();
     await flushTimers();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue")).toHaveLength(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("fails the call when the context is at or below the keep window — nothing stashed, no deferred compact", async () => {
@@ -700,8 +703,11 @@ describe("self-compact wiring (in-session summary)", () => {
     // The covered user message (u1) is protected verbatim; the session file
     // does not exist, so the evidence index is skipped and only the protected
     // block is delivered.
-    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    const [msg, meta] = pi.sendMessage.mock.calls[0];
+    // The continue steer shares this transport — filter to the evidence blocks.
+    const blocks = pi.sendMessage.mock.calls.filter(([m]: any) =>
+      m?.customType === "gallop-protected" || m?.customType === "gallop-evidence");
+    expect(blocks).toHaveLength(1);
+    const [msg, meta] = blocks[0];
     expect(msg.customType).toBe("gallop-protected");
     expect(msg.display).toBe(false);
     expect(meta).toEqual({ triggerTurn: false });
@@ -767,9 +773,11 @@ describe("self-compact wiring (in-session summary)", () => {
     await flushTimers(300);
 
     // Both blocks delivered — protected first, then the evidence index.
-    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
-    const [pMsg, pMeta] = pi.sendMessage.mock.calls[0];
-    const [eMsg, eMeta] = pi.sendMessage.mock.calls[1];
+    const blocks = pi.sendMessage.mock.calls.filter(([m]: any) =>
+      m?.customType === "gallop-protected" || m?.customType === "gallop-evidence");
+    expect(blocks).toHaveLength(2);
+    const [pMsg, pMeta] = blocks[0];
+    const [eMsg, eMeta] = blocks[1];
     expect(pMsg.customType).toBe("gallop-protected");
     expect(eMsg.customType).toBe("gallop-evidence");
     expect(pMeta).toEqual({ triggerTurn: false });
@@ -830,9 +838,11 @@ describe("self-compact wiring (in-session summary)", () => {
     await flushTimers(300);
 
     // Both blocks still delivered — the evidence block is fragments only.
-    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
-    const [pMsg] = pi.sendMessage.mock.calls[0];
-    const [eMsg] = pi.sendMessage.mock.calls[1];
+    const blocks = pi.sendMessage.mock.calls.filter(([m]: any) =>
+      m?.customType === "gallop-protected" || m?.customType === "gallop-evidence");
+    expect(blocks).toHaveLength(2);
+    const [pMsg] = blocks[0];
+    const [eMsg] = blocks[1];
     expect(pMsg.customType).toBe("gallop-protected");
     expect(eMsg.customType).toBe("gallop-evidence");
     expect(eMsg.content).toContain("config.json");
@@ -948,8 +958,8 @@ describe("self-compact wiring (in-session summary)", () => {
     await settle();
     expect(ctx.compact).not.toHaveBeenCalled();
     await flushTimers();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue")).toHaveLength(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("skips the deferred trigger when the branch already ends in a compaction entry", async () => {

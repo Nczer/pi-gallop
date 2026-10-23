@@ -9,6 +9,7 @@ function makeMockPi() {
     registerTool: vi.fn((tool: any) => { tools.set(tool.name, tool); }),
     registerCommand: vi.fn(),
     sendUserMessage: vi.fn(),
+    sendMessage: vi.fn(),
     appendEntry: vi.fn(),
   };
   return { pi, handlers, tools };
@@ -159,8 +160,12 @@ describe("pending-compact input gate", () => {
     const opts = ctx.compact.mock.calls[0][0];
     opts.onComplete();
     await flushTimers();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+    // Hidden custom steer (steer.ts) — the user sees gallop's footer line instead.
+    const cont = pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue");
+    expect(cont).toHaveLength(1);
+    expect(cont[0][0].content).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(cont[0][0].display).toBe(false);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("keeps the proceed steer when nothing was stashed (auto path)", async () => {
@@ -172,8 +177,9 @@ describe("pending-compact input gate", () => {
     pi.sendUserMessage.mockClear();
     await handlers.get("session_compact")(null, ctx);
     await flushTimers();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0][0]).toBe("[Gallop] Compact done — proceed as commanded.");
+    const cont = pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue");
+    expect(cont).toHaveLength(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("discards the stash on a session reset", async () => {
@@ -184,5 +190,6 @@ describe("pending-compact input gate", () => {
     await handlers.get("session_compact")(null, ctx);
     await flushTimers();
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 });

@@ -15,7 +15,9 @@
  * Subsystems: self-compact.ts (compaction lifecycle + the two tools),
  * stall.ts, intervention.ts (detectors + escalation + breaker), binary.ts
  * (detection + suppression + read guard + toggles), render.ts (TUI
- * renderers). This file wires pi events to the subsystems and owns the
+ * renderers), steer.ts (the single transport for model-facing steers: hidden
+ * custom messages), status.ts (gallop's one footer status line). This file
+ * wires pi events to the subsystems and owns the
  * session lifecycle — state resets on session start, on compaction and on
  * tree navigation (/tree), and the settings toggle reload.
  */
@@ -26,6 +28,7 @@ import * as collapse from "./collapse";
 import * as intervention from "./intervention";
 import * as selfCompact from "./self-compact";
 import * as stall from "./stall";
+import * as status from "./status";
 
 /** True while an assistant message is in flight (message_start →
  *  message_end); message_end processing is gated on it. */
@@ -53,6 +56,7 @@ function resetAllState(): void {
   selfCompact.reset();
   intervention.reset();
   stall.reset();
+  status.reset();
 }
 
 export default function gallopExtension(pi: ExtensionAPI) {
@@ -185,7 +189,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
     if (outcome.stashed.length > 0) {
       selfCompact.scheduleStashedRedelivery(outcome.stashed, pi);
     } else if (outcome.continueAfter) {
-      selfCompact.scheduleContinueSteer(pi);
+      selfCompact.scheduleContinueSteer(ctx, pi);
     }
   });
 
@@ -202,7 +206,7 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // the branch the failure loops, repetitive fingerprints, stall streak and
   // breaker counts came from is no longer in context.
   pi.on("session_tree", (_event, ctx) => {
-    selfCompact.clearPressureStatus(ctx);
+    status.clearAll(ctx);
     resetAllState();
   });
 }

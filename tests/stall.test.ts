@@ -71,7 +71,10 @@ describe("stall detection", () => {
     void handlers.get("message_end")({ message }, ctx);
   };
   const settle = () => handlers.get("agent_settled")(null, ctx);
-  const steers = () => pi.sendUserMessage.mock.calls.map((c: any[]) => c[0] as string);
+  // Hidden steers (steer.ts): gallop sends display:false custom messages, so the
+  // 2026-10-23 transport change moved them from sendUserMessage to sendMessage.
+  const steers = () =>
+    pi.sendMessage.mock.calls.map(([m]: any[]) => m?.content as string).filter((t) => typeof t === "string");
 
   it("does not treat a tool call the provider stopped as a stall", () => {
     // pi runs tool calls whatever finish_reason said; only terminate:true ends the run.
@@ -79,7 +82,7 @@ describe("stall detection", () => {
       [{ type: "thinking", thinking: "write the scripts" }, { type: "toolCall", name: "bash", arguments: { command: "ls" } }],
       "stop",
     ));
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("leaves the compact_request boundary steer-free and settles the compact", async () => {
@@ -89,7 +92,7 @@ describe("stall detection", () => {
     );
     endMessage(message);                                   // message_end precedes the tool call
     await tools.get("compact_request").execute("id1", { summary: SUMMARY }, new AbortController().signal, undefined, ctx);
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();     // no resume steer, no nudge
+    expect(pi.sendMessage).not.toHaveBeenCalled();     // no resume steer, no nudge
 
     settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);          // not held off by a steer
@@ -103,7 +106,7 @@ describe("stall detection", () => {
   it("sends nothing for an aborted or errored mid-thought stop", () => {
     endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "aborted"));
     endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "error"));
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("sends nothing for a mid-thought stop cut off by the output token limit", () => {
@@ -111,7 +114,7 @@ describe("stall detection", () => {
     // resumed generation on the same exhausted budget truncates again.
     endMessage(assistantMessage([{ type: "thinking", thinking: "now I will write the checkpoint a" }], "length"));
     endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "length"));
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("neither counts a truncation nor breaks a stall streak", () => {
@@ -130,9 +133,9 @@ describe("stall detection", () => {
 
   it("sends no stall steer while a compact is pending", async () => {
     await tools.get("compact_request").execute("id1", { summary: SUMMARY }, new AbortController().signal, undefined, ctx);
-    pi.sendUserMessage.mockClear();
+    pi.sendMessage.mockClear();
     endMessage(assistantMessage([{ type: "thinking", thinking: "half a thought" }], "stop"));
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
     settle();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });

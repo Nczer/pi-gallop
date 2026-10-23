@@ -77,7 +77,9 @@ describe("length-truncated responses", () => {
   }
 
   const steers = () =>
-    pi.sendUserMessage.mock.calls.map(([t]: any[]) => t as string).filter((t) => t.startsWith("[Gallop]"));
+    pi.sendMessage.mock.calls
+      .map(([m]: any[]) => m?.content as string)
+      .filter((t) => typeof t === "string" && t.startsWith("[Gallop]"));
 
   it("sends no resume steer for a mid-thought truncation", async () => {
     const message = assistantMessage([{ type: "thinking", thinking: "now I will write the checkpoint and c" }], "length");

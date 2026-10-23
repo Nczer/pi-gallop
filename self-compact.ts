@@ -57,6 +57,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { compactRequestRenderers, contextStatusRenderers } from "./render";
 import { halted as interventionHalted } from "./intervention";
+import * as status from "./status";
+import { sendHiddenSteer } from "./steer";
 import { buildEvidenceBlocks, type EvidenceBlocks } from "./evidence";
 
 // ── Pi's compaction settings ──
@@ -576,8 +578,7 @@ let pressureLabel: string | null = null;
  *  survives. The user-facing nudge used to be a `ui.notify` toast: it shares
  *  one field with halter's dspa toasts and the two overwrote each other. */
 function setPressureStatus(ctx: ExtensionContext, text: string): void {
-  if (!ctx.hasUI) return;
-  ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", text)}`);
+  status.setState(ctx, text);
 }
 
 /** Take gallop's line out of the footer's `compact` slot. pi keeps an extension
@@ -588,8 +589,7 @@ function setPressureStatus(ctx: ExtensionContext, text: string): void {
  *  under the line (`/tree` — `session_tree`), where the remaining-token figure
  *  was measured on a branch that is no longer the context. */
 export function clearPressureStatus(ctx: ExtensionContext): void {
-  if (!ctx.hasUI) return;
-  ctx.ui.setStatus("compact", undefined);
+  status.setStateCleared(ctx);
 }
 
 // ── Message-shape helpers ──
@@ -670,13 +670,31 @@ export function compactEnRoute(message?: { content?: unknown }): boolean {
 
 const CONTINUE_STEER_MESSAGE = "[Gallop] Compact done — proceed as commanded.";
 
+/** customType of the post-compaction proceed steer. */
+export const CONTINUE_STEER_TYPE = "gallop-continue";
+
+/** True from the moment a continue steer is owed until the first assistant
+ *  message_end after it (the model proceeded). Owns the footer part, so the
+ *  line clears itself once the steer is answered. */
+let continueOwed = false;
+
 /** Inject the generic proceed message a beat after compaction completes — the
  *  checkpoint's Next Steps section carries the actual "what next", so no custom
  *  resume text is ever written or re-sent. */
-export function scheduleContinueSteer(pi: ExtensionAPI): void {
+export function scheduleContinueSteer(ctx: ExtensionContext, pi: ExtensionAPI): void {
+  continueOwed = true;
+  status.setNudge(ctx, "✓ compacted → resuming", () => continueOwed, "dim");
   setTimeout(() => {
-    pi.sendUserMessage(CONTINUE_STEER_MESSAGE, { deliverAs: "steer" });
+    sendHiddenSteer(pi, CONTINUE_STEER_TYPE, CONTINUE_STEER_MESSAGE);
   }, 200);
+}
+
+/** message_end (assistant): the model has resumed on the fresh context, so the
+ *  proceed steer is answered and its footer part is stale. */
+export function noteProceeded(ctx: ExtensionContext): void {
+  if (!continueOwed) return;
+  continueOwed = false;
+  status.reconcile(ctx);
 }
 
 function sendStashed(stashed: StashedInput[], pi: ExtensionAPI): void {
@@ -736,7 +754,7 @@ function triggerCompaction(
       // A stashed-redelivery is in flight (session_compact) — the user's own
       // messages are the continuation, so no generic proceed steer.
       if (continueAfter && !stashedRedeliveryPending) {
-        scheduleContinueSteer(pi);
+        scheduleContinueSteer(ctx, pi);
       }
     },
     onError: () => {
@@ -788,6 +806,9 @@ export function onMessageEnd(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
 ): void {
+  // Any assistant message end after a compaction means the model resumed on the
+  // fresh context — the proceed steer is answered (see scheduleContinueSteer).
+  noteProceeded(ctx);
   if (interventionHalted()) return;              // agent halted — a steer would restart a run where every tool is blocked
   // No steer while a compact is en route — see compactEnRoute: it would queue
   // work that the deferred compact then has to wait behind (and the nudge steer
@@ -841,10 +862,7 @@ export function onMessageEnd(
   // when display is true; interactive-mode.ts:3542). triggerTurn preserves
   // sendUserMessage's semantics — it always triggered a turn — and while a run
   // is streaming deliverAs:"steer" queues it as a steer instead.
-  pi.sendMessage(
-    { customType: CONTEXT_NUDGE_TYPE, content: text, display: false },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+  sendHiddenSteer(pi, CONTEXT_NUDGE_TYPE, text);
   setPressureStatus(ctx, `⚠ ${pressureLabel} → compact_request`);
 }
 
@@ -1312,6 +1330,7 @@ export function reset(): void {
   selfSummary = null;
   pendingCompact = null;
   proseCheckpoint = null;
+  continueOwed = false;
   pendingBlocks = null;
   lastRequestTools = null;
   stashedInputs = [];
