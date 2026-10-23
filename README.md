@@ -369,7 +369,10 @@ the state flags are not set yet — the message content is the signal) — when 
 message ends in aborted/error, or when the circuit breaker has halted the
 agent.
 
-Compaction resets all escalation state (blocks, nudges, stall count).
+Compaction resets all escalation state (blocks, nudges, stall count), and so
+does a tree navigation (`/tree`, pi's `session_tree` event): the branch the
+counters and the nudge were measured on is no longer the context, so the gate
+re-arms and the pressure line is cleared (see below).
 
 **What the user sees.** The nudge's user-facing half is gallop's line in the
 footer's `compact` status slot — `· ⚠ ~12k left → compact_request` — the same
@@ -377,7 +380,11 @@ slot the `⟳ Compacting...` line uses, so one place carries the whole pressure
 lifecycle (a `ui.notify` toast lost it: one field shared with halter's dspa
 toasts, overwriting each other). If the nudge goes unanswered — no tool call,
 no prose checkpoint, nothing compacted — the line escalates at `agent_settled`
-to `· ⚠ ~12k left · stalled — /compact`.
+to `· ⚠ ~12k left · stalled — /compact`. The line is cleared by a compaction,
+by an aborted compaction and by a `/tree` navigation: pi hands `setStatus` to
+the footer data provider and keeps the text until something overwrites it
+(interactive-mode.ts:2264), and a `/tree` jump to a shorter branch leaves the
+remaining-token figure measuring a branch that no longer exists.
 
 **A checkpoint that arrives as prose is harvested, not re-asked.** While a
 nudge is live, an assistant message that *is* a checkpoint (`checkpointProseText`:

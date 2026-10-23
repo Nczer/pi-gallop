@@ -1616,6 +1616,43 @@ describe("context pressure in the footer status slot", () => {
     expect(ctx.ui.notify).not.toHaveBeenCalled();
   });
 
+  const treeNav = () =>
+    handlers.get("session_tree")({ type: "session_tree", newLeafId: "leaf-2", oldLeafId: "leaf-1" }, ctx);
+
+  const nudges = () => pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === CONTEXT_NUDGE_TYPE);
+
+  it("a /tree navigation clears the footer line — its token figure measured a branch that is gone", async () => {
+    // pi hands an extension status to the footer data provider and keeps it until
+    // something overwrites it (interactive-mode.ts:2264), so nothing but gallop
+    // can retire a line whose remaining-token figure came from the abandoned
+    // branch (field: the footer kept "⚠ ~30k left · stalled — /compact" after a
+    // /tree jump to a shorter branch, 2026-10-23).
+    await cross();
+    handlers.get("agent_settled")(null, ctx);
+    expect(lastStatus()[1]).toContain("stalled");
+    treeNav();
+    expect(lastStatus()).toEqual(["compact", undefined]);
+  });
+
+  it("/tree clears the slot even with nothing written — a stale line can never survive a branch switch", () => {
+    treeNav();
+    expect(lastStatus()).toEqual(["compact", undefined]);
+  });
+
+  it("/tree re-arms the nudge cycle and stops the settled escalation from restating the old branch", async () => {
+    await cross();
+    handlers.get("agent_settled")(null, ctx);
+    treeNav();
+    // A settle on the new branch has no nudge and no label of its own: it must
+    // not print the abandoned branch's line again.
+    handlers.get("agent_settled")(null, ctx);
+    expect(statuses.filter(([, t]) => t?.includes("stalled"))).toHaveLength(1); // only the pre-/tree one
+    // The new branch is a fresh context, so the one-nudge-per-cycle gate is open.
+    await cross(7_000);
+    expect(nudges()).toHaveLength(2);
+    expect(lastStatus()[1]).toContain("~7k left → compact_request");
+  });
+
   it("the footer line survives a UI-less context", async () => {
     ctx.hasUI = false;
     ctx.ui.setStatus = vi.fn();

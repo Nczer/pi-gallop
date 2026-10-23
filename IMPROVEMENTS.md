@@ -53,3 +53,34 @@ default (e.g. `max(8k, 10% of window)`) would adapt without configuration.
 Candidate for a pi-core issue, not a gallop change. The LLM has no concept
 of the tail size — the model only sees what the tail happens to contain, so
 this is a harness compression parameter, not something the model tunes.
+
+## Post-compaction: the protected/evidence blocks read as open work
+
+**Observation (2026-10-23, 7 sessions / 18 compactions).** After a compaction the
+context ends, in order: the compaction summary → `gallop-protected` ("Pre-compaction
+user messages, verbatim") → `gallop-evidence` (the `L<n>` result index) →
+`[Gallop] Compact done — proceed as commanded.` The blocks sit *after* the summary,
+so the freshest thing in context is the previous branch's user text — and its last
+entry is a message that was already answered.
+
+Measured, not felt:
+
+- The post-compaction thinking referenced that pre-compaction user block in **4 of
+  18** compactions; both cases where the model resumed work on an already-reported
+  task were among the 4 (session `01a1575d` L313→L314: "the user's last message in
+  the pre-compaction block was …" → re-measured sheet ranges it had already
+  measured; L425→L426 → invented a LibreOffice→PDF colour-rect verification pass,
+  ended `stopReason: error`).
+- The evidence index's fetch instruction was **never taken**: `session_recall`
+  appeared in **0 of 18** post-compaction runs (its budget here was ~17 rows plus
+  "17 older result(s) omitted"), so it costs context and shows error rows
+  (`KeyError`, `SyntaxError`, "Omitted results are unknown, not absent-as-success")
+  without being used.
+- Re-runs, if any, are not literal: **5 of 445** post-compaction tool calls were
+  byte-identical to a pre-compaction call — the resumed work is *new* verification,
+  which is what makes it look like rechecking.
+
+**Not implemented (deliberate, 2026-10-23).** The user judged the 2/18 rate too low
+to change the `continue` default; the block position stays as designed. Revisit if
+the rate rises, or if a change is wanted: reframe the protected block as answered
+history rather than recent text, and/or stop indexing errored results in evidence.

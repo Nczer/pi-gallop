@@ -580,6 +580,18 @@ function setPressureStatus(ctx: ExtensionContext, text: string): void {
   ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", text)}`);
 }
 
+/** Take gallop's line out of the footer's `compact` slot. pi keeps an extension
+ *  status until something overwrites it (`interactive-mode.ts:2264` hands
+ *  `setStatus` straight to the footer data provider), so every path that ends a
+ *  pressure cycle has to clear it explicitly: a compaction completed
+ *  (`onCompacted`), a compaction was aborted, or the session branch changed
+ *  under the line (`/tree` — `session_tree`), where the remaining-token figure
+ *  was measured on a branch that is no longer the context. */
+export function clearPressureStatus(ctx: ExtensionContext): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.setStatus("compact", undefined);
+}
+
 // ── Message-shape helpers ──
 
 /** True when the message contains a compact_request tool call. pi emits
@@ -914,11 +926,7 @@ export function onBeforeCompact(
   // returned), so a cancelled compaction can't leak the summary into a
   // later, unrelated compaction. The abort listener only clears the status
   // line — registered unconditionally so a headless abort can't leave it.
-  const onAbort = (): void => {
-    if (ctx.hasUI) {
-      ctx.ui.setStatus("compact", undefined);
-    }
-  };
+  const onAbort = (): void => clearPressureStatus(ctx);
   event.signal.addEventListener("abort", onAbort);
   try {
     const summary = selfSummary;
@@ -1224,9 +1232,7 @@ export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
  *  state and schedules the redelivery or the proceed steer. */
 export function onCompacted(ctx: ExtensionContext): { continueAfter: boolean; stashed: StashedInput[] } {
   compactionRunning = false;
-  if (ctx.hasUI) {
-    ctx.ui.setStatus("compact", undefined);
-  }
+  clearPressureStatus(ctx);
   // If this compaction satisfied a pending request — e.g. pi's automatic
   // threshold compaction consumed the stashed summary before the deferred
   // trigger could run — deliver the proceed message here; the deferred

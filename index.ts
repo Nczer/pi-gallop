@@ -16,8 +16,8 @@
  * stall.ts, intervention.ts (detectors + escalation + breaker), binary.ts
  * (detection + suppression + read guard + toggles), render.ts (TUI
  * renderers). This file wires pi events to the subsystems and owns the
- * session lifecycle — state resets on session start and on compaction, and
- * the settings toggle reload.
+ * session lifecycle — state resets on session start, on compaction and on
+ * tree navigation (/tree), and the settings toggle reload.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadExtSettings } from "./ext-settings";
@@ -191,5 +191,18 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   pi.on("session_compact_failed", () => {
     selfCompact.onCompactFailed(pi);
+  });
+
+  // ── Tree navigation (/tree) ──
+  // A branch switch replaces the context, so everything gallop measured on the
+  // abandoned branch is stale — the pressure line most of all, because pi keeps
+  // an extension status until something overwrites it and the "~Nk left"
+  // figure in it was computed from the abandoned branch's usage. Clear the line,
+  // then reset every counter, exactly as a session start or a compaction does:
+  // the branch the failure loops, repetitive fingerprints, stall streak and
+  // breaker counts came from is no longer in context.
+  pi.on("session_tree", (_event, ctx) => {
+    selfCompact.clearPressureStatus(ctx);
+    resetAllState();
   });
 }
