@@ -668,7 +668,9 @@ export function compactEnRoute(message?: { content?: unknown }): boolean {
 
 // ── Delivery ──
 
-const CONTINUE_STEER_MESSAGE = "[Gallop] Compact done — proceed as commanded.";
+const CONTINUE_STEER_MESSAGE =
+  "[Gallop] Compact done — pick the work up from the checkpoint's Next Steps " +
+  "section; anything re-injected above is the record, not new work.";
 
 /** customType of the post-compaction proceed steer. */
 export const CONTINUE_STEER_TYPE = "gallop-continue";
@@ -678,9 +680,11 @@ export const CONTINUE_STEER_TYPE = "gallop-continue";
  *  line clears itself once the steer is answered. */
 let continueOwed = false;
 
-/** Inject the generic proceed message a beat after compaction completes — the
- *  checkpoint's Next Steps section carries the actual "what next", so no custom
- *  resume text is ever written or re-sent. */
+/** Inject the proceed steer a beat after compaction completes — the checkpoint's
+ *  Next Steps section carries the actual "what next", so no custom resume text is
+ *  ever written or re-sent. It also frames the blocks that landed just above it
+ *  as the record: they are the freshest text in context, and an old user message
+ *  read as open work starts duplicate work (IMPROVEMENTS, 2026-10-23). */
 export function scheduleContinueSteer(ctx: ExtensionContext, pi: ExtensionAPI): void {
   continueOwed = true;
   status.setNudge(ctx, "✓ compacted → resuming", () => continueOwed, "dim");
@@ -1248,7 +1252,13 @@ export function rewriteCompactContext(messagesIn: any[]): any[] | undefined {
  *  UI status, and captures the resume outcome (the pending request's
  *  continue, the stashed inputs) BEFORE the composition root resets all
  *  state and schedules the redelivery or the proceed steer. */
-export function onCompacted(ctx: ExtensionContext): { continueAfter: boolean; stashed: StashedInput[] } {
+export function onCompacted(ctx: ExtensionContext): {
+  continueAfter: boolean;
+  stashed: StashedInput[];
+  /** The protected + evidence blocks staged for this compaction, or null when
+   *  none were built (a native compact with no stashed checkpoint). */
+  blocks: EvidenceBlocks | null;
+} {
   compactionRunning = false;
   clearPressureStatus(ctx);
   // If this compaction satisfied a pending request — e.g. pi's automatic

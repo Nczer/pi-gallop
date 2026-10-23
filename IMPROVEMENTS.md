@@ -80,7 +80,10 @@ Measured, not felt:
   byte-identical to a pre-compaction call — the resumed work is *new* verification,
   which is what makes it look like rechecking.
 
-**Not implemented (deliberate, 2026-10-23).** The user judged the 2/18 rate too low
-to change the `continue` default; the block position stays as designed. Revisit if
-the rate rises, or if a change is wanted: reframe the protected block as answered
-history rather than recent text, and/or stop indexing errored results in evidence.
+**Partly implemented (2026-10-23).** The reframing landed: the protected header now
+names the block as the user's earlier words, still in force as constraints but part
+of the record of what was already said and done, and the continue steer points at the
+checkpoint's `Next Steps` and calls anything re-injected above the record, not new
+work. The block position stays as designed (the user judged the 2/18 rate too low to
+move it), and the evidence index still lists errored results — stop indexing them if
+the reframing doesn't pay off.

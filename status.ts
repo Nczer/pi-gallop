@@ -32,10 +32,13 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 /** pi's reserved slot for compaction-facing statuses. */
 const STATUS_KEY = "compact";
 
-// Parts hold plain text plus a severity; theme.fg is applied in render(), where
-// ctx.ui is guaranteed. That keeps the setters callable with a non-interactive
-// ctx (headless pi, RPC, tests): the part is tracked, nothing is painted.
-type Part = { text: string; live: () => boolean; severity: string };
+// Parts hold plain text plus a register (a pi ThemeColor); theme.fg is applied
+// in render(), where ctx.ui is guaranteed. That keeps the setters callable with
+// a non-interactive ctx (headless pi, RPC, tests): the part is tracked, nothing
+// is painted. The union is closed on purpose — the register is a contract, not a
+// free color choice.
+type Register = "dim" | "warning" | "error";
+type Part = { text: string; live: () => boolean; severity: Register };
 
 let statePart: Part | null = null;
 let nudgePart: Part | null = null;
@@ -58,7 +61,7 @@ function render(ctx: ExtensionContext): void {
 
 /** Set the state part (compaction pressure / in-flight compaction). Pressure is
  *  a caution, not an error, so it paints as warning. */
-export function setState(ctx: ExtensionContext, text: string, severity = "warning"): void {
+export function setState(ctx: ExtensionContext, text: string, severity: Register = "warning"): void {
   statePart = { text, live: () => true, severity };
   render(ctx);
 }
@@ -71,7 +74,7 @@ export function setNudge(
   ctx: ExtensionContext,
   text: string,
   live: () => boolean,
-  severity: "dim" | "warning" | "error" = "warning",
+  severity: Register = "warning",
 ): void {
   nudgePart = { text, live, severity };
   render(ctx);

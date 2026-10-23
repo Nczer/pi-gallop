@@ -377,7 +377,9 @@ describe("self-compact wiring (in-session summary)", () => {
     // Hidden custom steer (steer.ts) — visible as gallop's footer line, not a bubble.
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
     const [cMsg, cMeta] = pi.sendMessage.mock.calls.find(([m]: any) => m?.customType === "gallop-continue")!;
-    expect(cMsg.content).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(cMsg.content).toBe(
+      "[Gallop] Compact done — pick the work up from the checkpoint's Next Steps section; anything re-injected above is the record, not new work.",
+    );
     expect(cMsg.display).toBe(false);
     expect(cMeta).toEqual({ triggerTurn: true, deliverAs: "steer" });
   });

@@ -163,7 +163,9 @@ describe("pending-compact input gate", () => {
     // Hidden custom steer (steer.ts) — the user sees gallop's footer line instead.
     const cont = pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue");
     expect(cont).toHaveLength(1);
-    expect(cont[0][0].content).toBe("[Gallop] Compact done — proceed as commanded.");
+    expect(cont[0][0].content).toBe(
+      "[Gallop] Compact done — pick the work up from the checkpoint's Next Steps section; anything re-injected above is the record, not new work.",
+    );
     expect(cont[0][0].display).toBe(false);
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });

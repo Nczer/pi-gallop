@@ -60,10 +60,11 @@ Tool arguments:
   `firstKeptEntryId` — pi uses it verbatim. The checkpoint must then carry full
   state, since the verbatim tail no longer covers recent work.
 - `continue` (boolean, optional, **default `true`**) — if `true`, a fixed generic steer
-  (`[Gallop] Compact done — proceed as commanded.`) is injected after compaction;
-  the checkpoint's Next Steps section tells the agent what to do next. Only `false`
-  stops the agent so you take the next step. No custom resume text is ever written
-  or re-sent.
+  (`[Gallop] Compact done — pick the work up from the checkpoint's Next Steps section;
+  anything re-injected above is the record, not new work.`) is injected after
+  compaction; the checkpoint's Next Steps section tells the agent what to do next.
+  Only `false` stops the agent so you take the next step. No custom resume text is
+  ever written or re-sent.
 
 Both flags are declared as strict TypeBox booleans, and the schema carries the
 coercion: pi runs `Value.Convert(schema, args)` (in place) before `Check` for
@@ -186,7 +187,11 @@ so they self-clean):
 - **Protected user messages** — the user messages covered by the compaction,
   verbatim (synthetic `[Gallop]`/`[Memory]` messages and recall-hint suffixes
   stripped, newest-first within a 16k-char budget, omissions labeled). The
-  user's instructions never survive only as summary paraphrase.
+  user's instructions never survive only as summary paraphrase. The header
+  names them as the user's *earlier* words, still in force as constraints but
+  part of the record — because these blocks sit after the summary, an answered
+  user message is otherwise the freshest text in context and reads as open work
+  (measurement: IMPROVEMENTS, 2026-10-23).
 - **Evidence index** — the covered span's high-value tool output: errors
   from any tool first, then successful read/edit/write/bash grouped by
   (tool, full command), config/schema/test targets first, per group newest

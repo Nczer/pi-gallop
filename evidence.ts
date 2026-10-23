@@ -136,8 +136,10 @@ export function buildProtected(
   }
   if (msgs.length === 0) return undefined;
   const header =
-    "[Gallop] Pre-compaction user messages, verbatim — deterministic block, " +
-    "not a new instruction; do not restate.";
+    "[Gallop] Pre-compaction user messages, verbatim — the user's earlier " +
+    "words, kept because a summary paraphrases them. They stay in force as " +
+    "constraints, but they are the record of what was already said and done, " +
+    "not open work: not a new instruction — do not restate or resume them.";
   const sepLen = "\n---\n".length;
   // newest-first within budget
   let budget = PROTECTED_BUDGET_CHARS;
