@@ -193,7 +193,16 @@ export default function gallopExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_compact_failed", () => {
+  // Cast seam: the pi-coding-agent types this tree resolves (0.83.0 in
+  // extensions/node_modules; extensions/package.json pins 0.84.3) predate this
+  // event, while the installed pi emits it (its docs/compaction.md documents
+  // it, payload included — gallop reads none of it). Drop the seam when the
+  // pin moves up to the installed pi.
+  type OnCompactFailed = (
+    event: "session_compact_failed",
+    handler: (event: unknown) => void | Promise<void>,
+  ) => void;
+  (pi.on as unknown as OnCompactFailed)("session_compact_failed", () => {
     selfCompact.onCompactFailed(pi);
   });
 

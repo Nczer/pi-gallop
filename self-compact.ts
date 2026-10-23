@@ -701,6 +701,18 @@ export function noteProceeded(ctx: ExtensionContext): void {
   status.reconcile(ctx);
 }
 
+/** Cast seam over the pinned types (same reason as index.ts's
+ *  session_compact_failed seam): the resolved pi-coding-agent types type
+ *  sendUserMessage's options as `{ deliverAs? }` only, while installed pi
+ *  forwards `expandPromptTemplates` to prompt() — where extension sends default
+ *  it to false, so passing true is what keeps "/name" expansion for a
+ *  redelivered message. Drop the seam when the pin moves up to the installed
+ *  pi. */
+type SendUserMessageWithTemplates = (
+  content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+  options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+) => ReturnType<ExtensionAPI["sendUserMessage"]>;
+
 function sendStashed(stashed: StashedInput[], pi: ExtensionAPI): void {
   for (const m of stashed) {
     const content = m.images && m.images.length > 0
@@ -712,7 +724,10 @@ function sendStashed(stashed: StashedInput[], pi: ExtensionAPI): void {
     // Promise<void>, but pi's runtime bridge returns void and swallows a
     // rejection into its own extension-error event (agent-session.ts:2469), so
     // a failed send is pi's record, not something this call can observe.
-    void pi.sendUserMessage(content, { deliverAs: "followUp", expandPromptTemplates: true });
+    void (pi.sendUserMessage as unknown as SendUserMessageWithTemplates)(content, {
+      deliverAs: "followUp",
+      expandPromptTemplates: true,
+    });
   }
 }
 
