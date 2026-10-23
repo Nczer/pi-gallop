@@ -11,9 +11,10 @@
 //   protected: covered user messages verbatim (the user's own words are not
 //     regenerable from a summary — the "protected originals" half, v1 = user
 //     only; assistant text stays in the summary).
-//   evidence:  a bounded index of covered tool output (errors first, then
-//     successful read/edit/write/bash output, grouped by (tool, target),
-//     head…tail fragments). When the model can call session_recall (tracked
+//   evidence:  a bounded index of covered tool output (successful
+//     read/edit/write/bash output, grouped by (tool, target), head…tail
+//     fragments; an errored result is never indexed — it was the row most
+//     likely to invite a blind re-run and the one never fetched). When the model can call session_recall (tracked
 //     from the provider request's tools array), every row carries an L<line>
 //     pointer into the session JSONL — fetchable via session_recall(line=N);
 //     otherwise rows are fragments only (no dead pointers, no session-file
@@ -136,10 +137,9 @@ export function buildProtected(
   }
   if (msgs.length === 0) return undefined;
   const header =
-    "[Gallop] Pre-compaction user messages, verbatim — the user's earlier " +
-    "words, kept because a summary paraphrases them. They stay in force as " +
-    "constraints, but they are the record of what was already said and done, " +
-    "not open work: not a new instruction — do not restate or resume them.";
+    "[Gallop] Pre-compaction user messages, verbatim — the user's own earlier " +
+    "words: in force, already on the record, not open work; do not restate or " +
+    "resume them.";
   const sepLen = "\n---\n".length;
   // newest-first within budget
   let budget = PROTECTED_BUDGET_CHARS;
@@ -176,7 +176,7 @@ export function buildProtected(
 // ── Evidence block ──
 
 /** Tools whose successful output carries exact values worth pointing at.
- *  Errors from ANY tool are indexed regardless. */
+ *  Errored results are skipped whatever the tool — see buildEvidence. */
 const INDEXED_TOOLS = new Set(["read", "edit", "write", "bash"]);
 
 /** Target identity of the call: `key` = grouping identity (the full
@@ -214,15 +214,16 @@ interface ToolRec {
   tool: string;
   key: string;
   target: string;
-  isError: boolean;
   text: string;
   entryId: string;
   order: number;
 }
 
-/** Evidence rows from a covered span. Selection ported from FutureOS:
- *  errors first (newest first), then successful read/edit/write/bash output;
- *  grouped by (tool, target) — config/schema/test targets first, per group
+/** Evidence rows from a covered span. Selection ported from FutureOS, minus
+ *  its error pass: successful read/edit/write/bash output only (an errored
+ *  result is already pi's own record, and a row for it reads like a task to
+ *  redo — measured: error rows head the list and are never fetched).
+ *  Grouped by (tool, target) — config/schema/test targets first, per group
  *  newest + oldest, the remainder by recency; never split a row, stop when
  *  one no longer fits. undefined when there is nothing to index. */
 export function buildEvidence(
@@ -264,12 +265,11 @@ export function buildEvidence(
       if (!text || !m.toolCallId) continue;
       const call = calls.get(m.toolCallId);
       const tool = call?.tool ?? (m.toolName ?? "");
-      if (!m.isError && !INDEXED_TOOLS.has(tool)) continue;
+      if (m.isError || !INDEXED_TOOLS.has(tool)) continue;
       recs.push({
         tool,
         key: call?.key ?? "",
         target: call?.target ?? "",
-        isError: !!m.isError,
         text,
         entryId: e.id,
         order: i,
@@ -278,13 +278,10 @@ export function buildEvidence(
   }
   if (recs.length === 0) return undefined;
 
-  // order: errors first (newest first), then successful output grouped by
-  // (tool, target) — priority targets first, per group newest + oldest,
-  // remainder by recency
-  const errors = recs.filter((r) => r.isError).sort((a, b) => b.order - a.order);
-  const ok = recs.filter((r) => !r.isError);
+  // order: successful output grouped by (tool, target) — priority targets
+  // first, per group newest + oldest, remainder by recency
   const groups = new Map<string, ToolRec[]>();
-  for (const r of ok) {
+  for (const r of recs) {
     const key = r.tool + "\u0000" + r.key;
     const g = groups.get(key);
     if (g) g.push(r);
@@ -304,18 +301,17 @@ export function buildEvidence(
     if (sorted.length === 1) grouped.pop();
   }
   const keptIds = new Set(grouped.map((r) => r.entryId));
-  const rest = ok.filter((r) => !keptIds.has(r.entryId)).sort((a, b) => b.order - a.order);
-  const ordered = [...errors, ...grouped, ...rest];
+  const rest = recs.filter((r) => !keptIds.has(r.entryId)).sort((a, b) => b.order - a.order);
+  const ordered = [...grouped, ...rest];
 
   const header = pointers
-    ? "[Gallop] Evidence index — deterministic pointers to pre-compaction tool " +
-      "output; not a new instruction, do not restate. Fetch a full payload: " +
-      "session_recall with line = the row's number (L<n> → <n>). Fragments are " +
-      "head…tail — the middle is elided. Omitted results are unknown, not " +
-      "absent-as-success."
+    ? "[Gallop] Evidence index — pointers to pre-compaction tool output; not " +
+      "an instruction, do not restate. Full payload: session_recall with line " +
+      "= the row's L<n>. The middle of each fragment is elided; omitted " +
+      "results are unknown, not absent-as-success."
     : "[Gallop] Evidence index — head…tail fragments of pre-compaction tool " +
-      "output; not a new instruction, do not restate. The middle of each " +
-      "fragment is elided. Omitted results are unknown, not absent-as-success.";
+      "output; not an instruction, do not restate. The middle is elided; " +
+      "omitted results are unknown, not absent-as-success.";
   const lines: string[] = [];
   let budget = EVIDENCE_BUDGET_CHARS;
   let droppedNoPointer = 0;
@@ -327,7 +323,7 @@ export function buildEvidence(
       droppedNoPointer++;
       continue;
     }
-    const line = `${pointers ? `L${n} ` : ""}${r.tool}${r.target ? " " + r.target : ""}${r.isError ? " ERR" : ""} :: ${truncateMiddle(r.text)}`;
+    const line = `${pointers ? `L${n} ` : ""}${r.tool}${r.target ? " " + r.target : ""} :: ${truncateMiddle(r.text)}`;
     if (line.length > budget) {
       droppedBudget = ordered.length - i;
       break;

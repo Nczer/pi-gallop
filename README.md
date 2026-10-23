@@ -60,11 +60,10 @@ Tool arguments:
   `firstKeptEntryId` — pi uses it verbatim. The checkpoint must then carry full
   state, since the verbatim tail no longer covers recent work.
 - `continue` (boolean, optional, **default `true`**) — if `true`, a fixed generic steer
-  (`[Gallop] Compact done — pick the work up from the checkpoint's Next Steps section;
-  anything re-injected above is the record, not new work.`) is injected after
-  compaction; the checkpoint's Next Steps section tells the agent what to do next.
-  Only `false` stops the agent so you take the next step. No custom resume text is
-  ever written or re-sent.
+  (`[Gallop] Compact done — continue from the checkpoint's Next Steps; blocks above
+  are the record, not new work.`) is injected after compaction; the checkpoint's
+  Next Steps section tells the agent what to do next. Only `false` stops the agent so
+  you take the next step. No custom resume text is ever written or re-sent.
 
 Both flags are declared as strict TypeBox booleans, and the schema carries the
 coercion: pi runs `Value.Convert(schema, args)` (in place) before `Check` for
@@ -192,16 +191,19 @@ so they self-clean):
   part of the record — because these blocks sit after the summary, an answered
   user message is otherwise the freshest text in context and reads as open work
   (measurement: IMPROVEMENTS, 2026-10-23).
-- **Evidence index** — the covered span's high-value tool output: errors
-  from any tool first, then successful read/edit/write/bash grouped by
-  (tool, full command), config/schema/test targets first, per group newest
-  + oldest, the rest by recency (8k-char budget). Each row:
-  `L<n> tool target [ERR] :: head…tail`, where `L<n>` is a pointer into the
+- **Evidence index** — the covered span's high-value tool output: successful
+  read/edit/write/bash grouped by (tool, full command), config/schema/test
+  targets first, per group newest + oldest, the rest by recency (8k-char
+  budget). Errored results are not indexed — the failure is already in the
+  summary, and a row for it sits at the head of the freshest text in a
+  post-compaction context, where it reads as a task to redo.
+  Each row:
+  `L<n> tool target :: head…tail`, where `L<n>` is a pointer into the
   session JSONL — fetch the full payload with `session_recall`, line = the
   number after L. Pointers (and the fetch instruction) render only when the
   model can actually call `session_recall` — the tool set is tracked from
   the `tools` array of the last provider request; with the memory extension
-  absent the rows degrade to fragments only (`tool target [ERR] :: head…tail`),
+  absent the rows degrade to fragments only (`tool target :: head…tail`),
   built from the in-memory entries with no session-file read.
 
 The build is fail-open: any error (no covered range, unreadable session file)

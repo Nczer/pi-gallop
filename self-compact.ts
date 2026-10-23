@@ -669,8 +669,8 @@ export function compactEnRoute(message?: { content?: unknown }): boolean {
 // ── Delivery ──
 
 const CONTINUE_STEER_MESSAGE =
-  "[Gallop] Compact done — pick the work up from the checkpoint's Next Steps " +
-  "section; anything re-injected above is the record, not new work.";
+  "[Gallop] Compact done — continue from the checkpoint's Next Steps; blocks " +
+  "above are the record, not new work.";
 
 /** customType of the post-compaction proceed steer. */
 export const CONTINUE_STEER_TYPE = "gallop-continue";

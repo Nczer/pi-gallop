@@ -164,7 +164,7 @@ describe("pending-compact input gate", () => {
     const cont = pi.sendMessage.mock.calls.filter(([m]: any) => m?.customType === "gallop-continue");
     expect(cont).toHaveLength(1);
     expect(cont[0][0].content).toBe(
-      "[Gallop] Compact done — pick the work up from the checkpoint's Next Steps section; anything re-injected above is the record, not new work.",
+      "[Gallop] Compact done — continue from the checkpoint's Next Steps; blocks above are the record, not new work.",
     );
     expect(cont[0][0].display).toBe(false);
     expect(pi.sendUserMessage).not.toHaveBeenCalled();

@@ -84,6 +84,11 @@ Measured, not felt:
 names the block as the user's earlier words, still in force as constraints but part
 of the record of what was already said and done, and the continue steer points at the
 checkpoint's `Next Steps` and calls anything re-injected above the record, not new
-work. The block position stays as designed (the user judged the 2/18 rate too low to
-move it), and the evidence index still lists errored results — stop indexing them if
-the reframing doesn't pay off.
+work. The evidence index stopped indexing errored results — the errors-led ordering is
+gone, along with the `ERR` marker. The block position stays as designed (the user
+judged the 2/18 rate too low to move it) and the 8k-char budget stays: self-compact
+already shrinks the verbatim tail to 8k tokens (`KEEP_RECENT_TOKENS_DEFAULT`, against
+pi's 20k default for native compacts), so the package is an addendum to a smaller tail
+rather than a competing one. **Next, if the following batch of compactions again shows
+0 `session_recall` drill-ins: delete the evidence block** and keep only the protected
+one — the pointer affordance has then had two batches of evidence against it.

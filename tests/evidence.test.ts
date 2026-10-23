@@ -150,7 +150,7 @@ describe("buildEvidence", () => {
     expect(buildEvidence(entries, 0, 2, new Map())).toBeUndefined();
   });
 
-  it("indexes errors first with the ERR marker, newest first", () => {
+  it("does not index errored results", () => {
     const entries = [
       asstCall("a1", "c1", "bash", { command: "ls" }),
       result("r1", "c1", "bash", "ok output"),
@@ -161,13 +161,10 @@ describe("buildEvidence", () => {
     ];
     const out = buildEvidence(entries, 0, 6, lineNo(entries.map((e) => e.id)));
     expect(out).toBeDefined();
-    const r3 = out!.indexOf("L6");
-    const r2 = out!.indexOf("L4");
-    expect(r3).not.toBe(-1);
-    expect(r2).not.toBe(-1);
-    expect(r3).toBeLessThan(r2); // newest error first
-    expect(out).toContain("ERR");
-    expect(out!.indexOf("L4")).toBeLessThan(out!.indexOf("L2")); // error before success
+    expect(out).toContain("L2"); // the one successful row survives
+    expect(out).not.toContain("L4");
+    expect(out).not.toContain("L6");
+    expect(out).not.toContain("ERR");
   });
 
   it("groups by (tool, target): keeps newest + oldest per group", () => {
@@ -233,13 +230,12 @@ describe("buildEvidence", () => {
     expect(buildEvidence(entries, 0, 2, lineNo(entries.map((e) => e.id)))).toBeUndefined();
   });
 
-  it("indexes errors from any tool", () => {
+  it("skips errored output from an unlisted tool too", () => {
     const entries = [
       asstCall("a1", "c1", "mystery_tool", { q: 1 }),
       result("r1", "c1", "mystery_tool", "boom", true),
     ];
-    const out = buildEvidence(entries, 0, 2, lineNo(entries.map((e) => e.id)));
-    expect(out).toContain("mystery_tool ERR");
+    expect(buildEvidence(entries, 0, 2, lineNo(entries.map((e) => e.id)))).toBeUndefined();
   });
 
   it("formats rows: L<n> tool target :: head…tail (whitespace collapsed)", () => {
