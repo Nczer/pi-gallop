@@ -29,6 +29,7 @@ import {
   sessionRecallAvailable,
   reset,
   scheduleStashedRedelivery,
+  scheduleContinueSteer,
   onCompacted,
 } from "../self-compact";
 
@@ -2082,5 +2083,57 @@ describe("stashed redelivery (user input is never dropped)", () => {
     await vi.advanceTimersByTimeAsync(200);
     const texts = pi.sendUserMessage.mock.calls.map((c: any[]) => c[0]);
     expect(texts).toEqual(["first", "second"]);
+  });
+});
+
+// ── The deferred sends vs. a session swap ──
+//
+// All three post-compaction sends wait 200 ms. pi invalidates a session's
+// ctx/runtime when it is replaced or reloaded (/new, /fork, /resume, /reload)
+// and every sender on it throws from then on, so a session swap inside the
+// delay leaves the timer holding a dead runtime. A throw escaping a bare timer
+// callback is an uncaughtException outside any handler, and pi exits on one.
+
+const STALE = "This extension ctx is stale after session replacement or reload.";
+const deadSend = () => {
+  throw new Error(STALE);
+};
+
+describe("deferred sends against a dead runtime", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    reset();
+  });
+
+  it("swallows a stale continue steer instead of escaping the timer", () => {
+    vi.useFakeTimers();
+    reset();
+    const pi: any = { sendMessage: vi.fn(deadSend) };
+    scheduleContinueSteer({ hasUI: false } as any, pi);
+    expect(() => vi.advanceTimersByTime(200)).not.toThrow();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1); // tried, then caught
+  });
+
+  it("swallows a stale stashed redelivery instead of escaping the timer", () => {
+    vi.useFakeTimers();
+    reset();
+    const pi: any = { sendUserMessage: vi.fn(deadSend) };
+    scheduleStashedRedelivery([{ text: "typed while compaction was pending" }], pi);
+    expect(() => vi.advanceTimersByTime(200)).not.toThrow();
+    // The input dies with the session it was stashed for: nothing may be left
+    // owed, or it would surface in an unrelated session's next redelivery.
+    expect(onCompacted({ hasUI: false } as any).stashed).toEqual([]);
+  });
+
+  it("reset() at a session boundary cancels both deferred sends", () => {
+    vi.useFakeTimers();
+    reset();
+    const pi: any = { sendMessage: vi.fn(), sendUserMessage: vi.fn() };
+    scheduleContinueSteer({ hasUI: false } as any, pi);
+    scheduleStashedRedelivery([{ text: "a" }], pi);
+    reset(); // what the next session_start's resetAllState does
+    vi.advanceTimersByTime(200);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 });

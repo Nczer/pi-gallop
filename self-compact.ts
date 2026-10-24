@@ -679,6 +679,9 @@ export const CONTINUE_STEER_TYPE = "gallop-continue";
  *  message_end after it (the model proceeded). Owns the footer part, so the
  *  line clears itself once the steer is answered. */
 let continueOwed = false;
+/** Armed by scheduleContinueSteer; cleared by reset() at a session boundary.
+ *  Named so the timer is cancellable — see `stashedRedeliveryTimer`. */
+let continueSteerTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** Inject the proceed steer a beat after compaction completes — the checkpoint's
  *  Next Steps section carries the actual "what next", so no custom resume text is
@@ -688,8 +691,18 @@ let continueOwed = false;
 export function scheduleContinueSteer(ctx: ExtensionContext, pi: ExtensionAPI): void {
   continueOwed = true;
   status.setNudge(ctx, "✓ compacted → resuming", () => continueOwed, "dim");
-  setTimeout(() => {
-    sendHiddenSteer(pi, CONTINUE_STEER_TYPE, CONTINUE_STEER_MESSAGE);
+  continueSteerTimer = setTimeout(() => {
+    continueSteerTimer = undefined;
+    try {
+      sendHiddenSteer(pi, CONTINUE_STEER_TYPE, CONTINUE_STEER_MESSAGE);
+    } catch {
+      // pi invalidates a session's ctx/runtime on /new, /fork, /resume and
+      // /reload, and every sender on it throws from then on. A session swap
+      // inside this 200 ms window is not prevented by reset() when /reload
+      // re-imports this module (the new copy cannot reach the old timer), so
+      // the failure has to land here: a throw in a bare timer callback is an
+      // uncaughtException outside any handler, and pi exits on one.
+    }
   }, 200);
 }
 
@@ -748,7 +761,15 @@ export function scheduleStashedRedelivery(stashed: StashedInput[], pi: Extension
     stashedRedeliveryPending = false;
     const payload = pendingRedelivery;
     pendingRedelivery = [];
-    sendStashed(payload, pi);
+    try {
+      sendStashed(payload, pi);
+    } catch {
+      // Same shape as scheduleContinueSteer: a session swap inside the delay
+      // leaves this `pi` throwing, and the throw would exit pi. This is the one
+      // case where "user input is never dropped" cannot hold — the session
+      // those messages were stashed for no longer exists, and injecting them
+      // into whatever replaced it means guessing what that session is for.
+    }
   }, 200);
 }
 
@@ -1361,10 +1382,11 @@ export function reset(): void {
   stashedInputs = [];
   pendingRedelivery = [];
   stashedRedeliveryPending = false;
-  if (stashedRedeliveryTimer) {
-    clearTimeout(stashedRedeliveryTimer);
-    stashedRedeliveryTimer = undefined;
+  for (const timer of [stashedRedeliveryTimer, continueSteerTimer]) {
+    if (timer) clearTimeout(timer);
   }
+  stashedRedeliveryTimer = undefined;
+  continueSteerTimer = undefined;
   contextNudgeState = "idle";
   pressureLabel = null;
 }
