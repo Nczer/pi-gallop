@@ -143,7 +143,8 @@ export function setNudgeSettings(
 /** Default for `compactKeepRecentTokens` — pi's own default, so unset means
  *  zero behavior change. */
 /** Self-compact's default keep window: 8k. The model-written checkpoint plus
- *  the post-compaction evidence package (protected user messages + L-pointers)
+ *  the post-compaction evidence package (protected user messages/answers +
+ *  L-pointers)
  *  carry what a 20k verbatim tail would, so self-compact runs a smaller tail
  *  by default. Native compacts are never affected — the cut override only
  *  applies when a stashed checkpoint exists (self-compact by definition), and

@@ -183,14 +183,29 @@ in context before the continue steer starts the next turn — and are
 regenerated per compaction (the keep window carries them only while inside it,
 so they self-clean):
 
-- **Protected user messages** — the user messages covered by the compaction,
-  verbatim (synthetic `[Gallop]`/`[Memory]` messages and recall-hint suffixes
-  stripped, newest-first within a 16k-char budget, omissions labeled). The
-  user's instructions never survive only as summary paraphrase. The header
+- **Protected record** — the user messages covered by the compaction, **plus
+  the user's answers to interactive asks** (`consult`), verbatim (synthetic
+  `[Gallop]`/`[Memory]` messages and recall-hint suffixes stripped,
+  newest-first within a 16k-char budget, omissions labeled). The user's
+  instructions never survive only as summary paraphrase. Ask answers belong here
+  because they are user speech travelling in the toolResult channel: 26% carry a
+  free-form `User's note:` the model never authored, and measured over one
+  17-consult session, no answer's literal text survived in any of its 6
+  compaction summaries (IMPROVEMENTS, 2026-10-24). Each answer renders as
+  `Q: <question stem, capped at 160 chars>\nA: <answer verbatim>` — the stem
+  comes from the ask call's `question` argument (pi's record, not consult's
+  result shape) so a bare `User selected: 2. B` is never an orphan, and the
+  answer stays whole. A failed or cancelled ask is not carried: a dismissed
+  question sitting in the freshest slot reads as a question to re-ask (same
+  reasoning as the evidence index dropping error rows). The ask channel is
+  recognized by the result's `toolName` (or, failing that, by its call id being a
+  recorded ask call) against one set — `ASK_TOOLS = {"consult"}` — so with no ask
+  tool installed nothing matches and only user messages are carried. The header
   names them as the user's *earlier* words, still in force as constraints but
   part of the record — because these blocks sit after the summary, an answered
   user message is otherwise the freshest text in context and reads as open work
-  (measurement: IMPROVEMENTS, 2026-10-23).
+  (measurement: IMPROVEMENTS, 2026-10-23); it now also says `Q:` is the model's
+  question and not to re-ask an answered one.
 - **Evidence index** — the covered span's high-value tool output: successful
   read/edit/write/bash grouped by (tool, full command), config/schema/test
   targets first, per group newest + oldest, the rest by recency (8k-char

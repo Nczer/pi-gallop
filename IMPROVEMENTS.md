@@ -92,3 +92,36 @@ pi's 20k default for native compacts), so the package is an addendum to a smalle
 rather than a competing one. **Next, if the following batch of compactions again shows
 0 `session_recall` drill-ins: delete the evidence block** and keep only the protected
 one — the pointer affordance has then had two batches of evidence against it.
+
+## Post-compaction: ask answers (consult) survived only as paraphrase
+
+Measured 2026-10-24 over the 24 session files of the current project's session
+dir (`$HOME/.pi/agent/sessions/<project-slug>/`)
+(pi of the gallop 2026-10-23 build — evidence package in place, keep window 8k):
+
+- 65 successful `consult` results vs 212 user messages: the ask channel is
+  roughly a third as busy as typing, and in the compacting sessions **55 of 60**
+  consult results sit inside a compaction's covered span.
+- **17 of 65** results carry a `User's note:` — free-form text the model never
+  authored, and it carries new direction, not confirmation: "do remember retry
+  nudge, etc. should clear if its addressed", "btw i plan to change gallop
+  compaction message and protected block a bit…".
+- Cheap to carry: median 86 chars, p90 224, max 419.
+- Fidelity loss is not hypothetical: in session `01a16795` (17 consults, 6
+  compaction summaries) **0 of 17** answers appear with their literal text in
+  any summary. That measures paraphrase, not decision loss — the decisions were
+  implemented, so the checkpoint carried *something* — but the exact option
+  label ("Report only (Recommended)") and every note were rewritten away.
+- A recovery path exists and works: `session_recall(tool="consult")` returns 34
+  hits for that session, each result rendered next to its ask call (`question=`),
+  with `L<n>` pointers. Recovery is voluntary though — the model has to notice it
+  lost the answer, which is the failure the protected block exists to prevent.
+
+**Implemented (2026-10-24).** Ask answers joined the protected block, interleaved
+with user messages in the same newest-first 16k budget, as
+`Q: <question stem, capped 160 chars>` + `A: <answer verbatim>`; question stems are
+read from the ask call's `question` argument, failed/cancelled asks are skipped, and
+`ASK_TOOLS` is the only coupling to consult. **Next:** if a post-compaction run
+re-asks a question that is in the block, the header's "do not re-ask an answered
+question" is not doing the job and the ask rows need their own label rather than
+riding the shared header.

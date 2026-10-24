@@ -8,9 +8,11 @@
 // display: false, triggerTurn: false: invisible in the TUI, present in the
 // LLM context, at the very tail of the projection:
 //
-//   protected: covered user messages verbatim (the user's own words are not
-//     regenerable from a summary — the "protected originals" half, v1 = user
-//     only; assistant text stays in the summary).
+//   protected: covered user messages AND the user's answers to interactive
+//     asks (consult), verbatim — the user's own words are not regenerable from
+//     a summary (assistant text stays in the summary; an ask answer is user
+//     speech that happens to travel in the toolResult channel, and 26% of them
+//     carry a free-form note the model never authored).
 //   evidence:  a bounded index of covered tool output (successful
 //     read/edit/write/bash output, grouped by (tool, target), head…tail
 //     fragments; an errored result is never indexed — it was the row most
@@ -109,6 +111,66 @@ function textOf(content: unknown): string {
     .join("\n");
 }
 
+/** The interactive-ask channel: the tool result IS the user's decision, so it
+ *  belongs with the protected originals — a decision is not exact-value tool
+ *  output (the evidence index truncates and points; an answer is short enough
+ *  to carry whole) and not summary-safe (measured: no consult answer's literal
+ *  text survived in any of that session's 6 compaction summaries). */
+const ASK_TOOLS = new Set(["consult"]);
+/** The question is model-authored and routinely a paragraph; the answer is the
+ *  high-value side, so the stem is capped and the answer stays whole. */
+const ASK_QUESTION_CAP_CHARS = 160;
+
+/** Question stems of the covered span's ask calls, keyed by tool call id — read
+ *  from the toolCall arguments (pi's record), not from the extension's result
+ *  payload, so gallop does not couple to consult's result shape. Every ask call
+ *  gets an entry (empty stem when the arguments carry none), so the key set is
+ *  also the recognition fallback for a result that carries no `toolName`. */
+function askQuestions(entries: SessionEntry[], start: number, end: number): Map<string, string> {
+  const q = new Map<string, string>();
+  for (let i = start; i < end; i++) {
+    const e = entries[i];
+    if (e.type !== "message") continue;
+    const m = e.message as { role?: string; content?: unknown };
+    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (!b || typeof b !== "object") continue;
+      const bc = b as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown };
+      if (bc.type !== "toolCall" || typeof bc.id !== "string" || typeof bc.name !== "string") continue;
+      if (!ASK_TOOLS.has(bc.name)) continue;
+      const args = bc.arguments as { question?: unknown } | undefined;
+      q.set(bc.id, args && typeof args.question === "string" ? args.question : "");
+    }
+  }
+  return q;
+}
+
+/** An ask answer as a protected item: the question stem (so a bare "User
+ *  selected: 3" is not an orphan) plus the answer verbatim. null for anything
+ *  else, and for a failed/cancelled ask — a dismissed question re-injected into
+ *  the freshest slot reads as a question to re-ask (same reason the evidence
+ *  index dropped error rows). */
+function askText(e: SessionEntry, questions: Map<string, string>): string | null {
+  if (e.type !== "message") return null;
+  const m = e.message as {
+    role?: string;
+    content?: unknown;
+    toolCallId?: string;
+    toolName?: string;
+    isError?: boolean;
+  };
+  if (m.role !== "toolResult" || m.isError) return null;
+  const cid = m.toolCallId ?? "";
+  if (!ASK_TOOLS.has(m.toolName ?? "") && !questions.has(cid)) return null;
+  const answer = textOf(m.content).trim();
+  if (!answer) return null;
+  const q = questions.get(cid);
+  if (!q) return answer;
+  const stem = q.replace(/\s+/g, " ").trim();
+  const capped = stem.length > ASK_QUESTION_CAP_CHARS ? stem.slice(0, ASK_QUESTION_CAP_CHARS) + "…" : stem;
+  return `Q: ${capped}\nA: ${answer}`;
+}
+
 /** Verbatim user text of a covered user entry, or null (synthetic/empty). */
 function userText(e: SessionEntry): string | null {
   if (e.type !== "message") return null;
@@ -122,24 +184,29 @@ function userText(e: SessionEntry): string | null {
 
 // ── Protected block ──
 
-/** Protected block: covered user messages verbatim, newest-first within the
- *  budget (oldest dropped with a labeled omission), rendered chronologically.
- *  undefined when there is nothing to protect. */
+/** Protected block: covered user messages and ask answers verbatim, in
+ *  chronological order, newest-first within the budget (oldest dropped with a
+ *  labeled omission). undefined when there is nothing to protect. */
 export function buildProtected(
   entries: SessionEntry[],
   start: number,
   end: number,
 ): string | undefined {
+  const questions = askQuestions(entries, start, end);
   const msgs: string[] = [];
   for (let i = start; i < end; i++) {
-    const t = userText(entries[i]);
+    const t = userText(entries[i]) ?? askText(entries[i], questions);
     if (t) msgs.push(t);
   }
   if (msgs.length === 0) return undefined;
+  // Not everything here is the user's phrasing — a graded answer carries the
+  // model's own `Correct:` key and a select answer echoes the model's option
+  // label — so the header claims the decision, not the wording.
   const header =
-    "[Gallop] Pre-compaction user messages, verbatim — the user's own earlier " +
-    "words: in force, already on the record, not open work; do not restate or " +
-    "resume them.";
+    "[Gallop] Pre-compaction record, verbatim — the user's own earlier words " +
+    "and the answers they gave to model questions (`Q:` is the model's " +
+    "question): in force, already on the record, not open work; do not restate " +
+    "or resume them, and do not re-ask an answered question.";
   const sepLen = "\n---\n".length;
   // newest-first within budget
   let budget = PROTECTED_BUDGET_CHARS;
@@ -161,13 +228,13 @@ export function buildProtected(
   if (truncateNewest) {
     parts.push(msgs[msgs.length - 1].slice(0, PROTECTED_BUDGET_CHARS) + " …[truncated]");
     if (msgs.length > 1) {
-      parts.push(`[Gallop] ${msgs.length - 1} older user message(s) omitted (block cap).`);
+      parts.push(`[Gallop] ${msgs.length - 1} older message(s)/answer(s) omitted (block cap).`);
     }
   } else {
     for (const t of msgs.slice(msgs.length - keptCount)) parts.push(t);
     const dropped = msgs.length - keptCount;
     if (dropped > 0) {
-      parts.push(`[Gallop] ${dropped} older user message(s) omitted (block cap).`);
+      parts.push(`[Gallop] ${dropped} older message(s)/answer(s) omitted (block cap).`);
     }
   }
   return parts.join("\n---\n");
