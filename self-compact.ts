@@ -498,11 +498,14 @@ let pendingRedelivery: StashedInput[] = [];
 let stashedRedeliveryPending = false;
 let stashedRedeliveryTimer: ReturnType<typeof setTimeout> | undefined;
 /** Re-entrancy guard for ctx.compact(). Set when a compact actually starts;
- *  cleared only at a true new-turn boundary (a new user message or a new
- *  session) — NOT on session_compact or compact complete/error.
- *  Belt-and-braces: the deferred trigger already makes double-compaction a no-op,
- *  this stops a redundant second ctx.compact() (and its continue message) in the
- *  window before the next user turn. */
+ *  cleared when that cycle ends: a compact that landed (onCompacted), a
+ *  failed/cancelled one (onCompactFailed), or a new user turn (noteUserTurn).
+ *  Completion, not the next user message, is the boundary that matters: what
+ *  continues a post-compaction run is gallop's own hidden steers, which are not
+ *  user turns, so a latch held past completion strands every later request in
+ *  the run. Belt-and-braces: the deferred trigger already makes
+ *  double-compaction a no-op; this stops a redundant second ctx.compact()
+ *  (and its continue message) while one is still settling. */
 let compactionInFlight = false;
 
 /** Post-compaction evidence blocks built in onBeforeCompact, delivered from
@@ -781,9 +784,10 @@ function triggerCompaction(
   continueAfter: boolean = false,
 ): void {
   // Re-entrancy guard: skip a redundant second trigger while a compact from the
-  // previous turn boundary is still settling. (The deferred agent_settled trigger
-  // already prevents the automatic-threshold double-compact; this covers any
-  // other re-trigger before the next user message.)
+  // current cycle is still settling. (The deferred agent_settled trigger already
+  // prevents the automatic-threshold double-compact; this covers any other
+  // re-trigger inside that cycle. A request arriving after a compact LANDED is
+  // not redundant and must reach ctx.compact — hence onCompacted re-arms.)
   if (compactionInFlight) {
     return;
   }
@@ -812,8 +816,8 @@ function triggerCompaction(
 
 // ── Event surface ──
 
-/** message_start (user role): a new user turn — the "already compacted"
- *  re-trigger window is over, so allow future compaction. */
+/** message_start (user role): a new user turn — a cycle that ended without
+ *  landing its compact (or never got one) stops holding the latch. */
 export function noteUserTurn(): void {
   compactionInFlight = false;
   // A prose checkpoint belongs to the run that wrote it; agent_settled is the
@@ -1297,6 +1301,15 @@ export function onCompacted(ctx: ExtensionContext): {
   blocks: EvidenceBlocks | null;
 } {
   compactionRunning = false;
+  // The cycle ended, so re-arm the re-entrancy latch. The continuation after a
+  // compaction is gallop's own hidden steers, never a user turn, so a latch left
+  // armed here strands every later compact_request in the run: the tool answers
+  // "Compacting." while the deferred trigger no-ops — the masked no-op onError
+  // warns about. A redundant second compact stays covered: onSettled skips when
+  // the branch already ends in a compaction entry, and pi itself refuses that
+  // call with "Already compacted" (agent-session.ts, prepareCompaction null and
+  // the branch tail is a compaction).
+  compactionInFlight = false;
   clearPressureStatus(ctx);
   // If this compaction satisfied a pending request — e.g. pi's automatic
   // threshold compaction consumed the stashed summary before the deferred
@@ -1370,9 +1383,9 @@ export function onCompactFailed(pi: ExtensionAPI): void {
 // ── Reset ──
 
 /** Reset the compaction-lifecycle state. Called by the composition root on
- *  session start and compaction. Deliberately does NOT touch
- *  compactionInFlight (cleared by a new user turn / noteUserTurn) or
- *  compactionRunning (cleared by session_compact / onError). */
+ *  session start and compaction. Deliberately does NOT touch the two compact
+ *  latches: they are released by the cycle that armed them (onCompacted /
+ *  onCompactFailed / noteUserTurn), not by a state reset. */
 export function reset(): void {
   selfSummary = null;
   pendingCompact = null;

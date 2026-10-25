@@ -137,10 +137,15 @@ deterministic, so the prefix stays cache-stable.
 
 `message_end` triggers nothing (pi emits it *before* pending tools execute) —
 every compact request resolves deterministically at `agent_settled`. A
-re-entrancy guard skips re-triggered `ctx.compact()` calls while a compact is
-in flight (pi would throw "Already compacted"), re-armed at each new user turn
-and on a failed/cancelled compact (`session_compact_failed` also re-arms the
-pressure nudge — nothing compacted, so the cycle is not over).
+re-entrancy guard skips re-triggered `ctx.compact()` calls while a compact of the
+current cycle is still settling. It re-arms when a compact lands
+(`session_compact`), on a failed/cancelled one (`session_compact_failed` also
+re-arms the pressure nudge — nothing compacted, so the cycle is not over), and at
+each new user turn. Landing is the boundary that matters: a post-compaction run
+continues on gallop's own hidden steers, never on a user turn, so a latch held
+past it strands every later request in the run. A redundant second call stays
+covered from both sides — `agent_settled` skips when the branch already ends in a
+compaction entry, and pi itself throws "Already compacted" for that call.
 
 **Messages typed while a compact is pending** are swallowed by the input gate
 (queued interactively they would run on the stale context and delay the

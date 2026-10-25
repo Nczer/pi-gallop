@@ -263,8 +263,9 @@ describe("self-compact wiring (in-session summary)", () => {
       },
     };
     // Reset shared module state (no disk I/O) so each test is independent.
-    // compactionInFlight is deliberately NOT in resetAllState (it stays active through
-    // the re-trigger window) — clear it via the real new-turn boundary.
+    // session_compact closes a compact cycle the previous test left open (it
+    // re-arms compactionInFlight — completion is a cycle boundary); the user
+    // message_start then clears what only a new turn clears (proseCheckpoint).
     void handlers.get("session_compact")(null, { hasUI: false });
     void handlers.get("message_start")({ message: { role: "user" } }, ctx);
     // Normal session: the model's last request carried session_recall, so the
@@ -885,6 +886,23 @@ describe("self-compact wiring (in-session summary)", () => {
 
     // A new user turn re-arms the guard — the next request is honored.
     await handlers.get("message_start")({ message: { role: "user" } }, ctx);
+    await callTool({ summary: LONG_SUMMARY });
+    await settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(2);
+  });
+
+  it("a compact that LANDED re-arms the guard too: no user turn needed", async () => {
+    // Field case (2026-10-25, session 01a17140): a compact landed at 05:16:34
+    // and the run continued on gallop's own steers — no user message until
+    // 06:27:07. The request at 05:29:23 answered "Compacting." and hit the
+    // re-entrancy guard, so nothing compacted for over an hour of work; the
+    // request 49 s after that user turn landed in 25 ms. A completed compact
+    // must therefore re-arm on its own.
+    await callTool({ summary: LONG_SUMMARY });
+    await settle();
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+
+    compactDone(); // session_compact: the compact landed
     await callTool({ summary: LONG_SUMMARY });
     await settle();
     expect(ctx.compact).toHaveBeenCalledTimes(2);
