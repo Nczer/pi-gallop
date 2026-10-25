@@ -170,14 +170,14 @@ describe("normalizeToolArgs", () => {
   });
 
   it("distinguishes nested object args in the default branch", () => {
-    const fp1 = normalizeToolArgs("consult", { question: "q", options: { limit: 5 } });
-    const fp2 = normalizeToolArgs("consult", { question: "q", options: { limit: 99 } });
+    const fp1 = normalizeToolArgs("ask_choice", { question: "q", options: { limit: 5 } });
+    const fp2 = normalizeToolArgs("ask_choice", { question: "q", options: { limit: 99 } });
     expect(fp1).not.toBe(fp2);
   });
 
   it("sorts keys recursively at every depth", () => {
-    const fp1 = normalizeToolArgs("consult", { b: { z: 1, a: 2 }, a: 1 });
-    const fp2 = normalizeToolArgs("consult", { a: 1, b: { a: 2, z: 1 } });
+    const fp1 = normalizeToolArgs("ask_choice", { b: { z: 1, a: 2 }, a: 1 });
+    const fp2 = normalizeToolArgs("ask_choice", { a: 1, b: { a: 2, z: 1 } });
     expect(fp1).toBe(fp2);
   });
 

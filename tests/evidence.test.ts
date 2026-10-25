@@ -117,11 +117,23 @@ describe("buildProtected", () => {
     expect(buildProtected([result("r1", "c1", "read", "x")], 0, 1)).toBeUndefined();
   });
 
-  it("carries a consult answer with its question stem, in place chronologically", () => {
+  it("still carries an answer recorded under the pre-rename name", () => {
+    // A resumed session holds calls from before the 2026-10-26 rename; the set
+    // reads that history, it is not an alias for the live tools.
+    const entries = [
+      asstCall("a1", "c1", "consult", { question: "Commit now?" }),
+      result("r1", "c1", "consult", "User selected: 1. Yes"),
+    ];
+    const out = buildProtected(entries, 0, entries.length)!;
+    expect(out).toContain("Q: Commit now?");
+    expect(out).toContain("A: User selected: 1. Yes");
+  });
+
+  it("carries an ask answer with its question stem, in place chronologically", () => {
     const entries = [
       user("u1", "ship the flag"),
-      asstCall("a1", "c1", "consult", { question: "Which transport — A or B?", options: [] }),
-      result("r1", "c1", "consult", "User selected: 2. B (Recommended)"),
+      asstCall("a1", "c1", "ask_choice", { question: "Which transport — A or B?", options: [] }),
+      result("r1", "c1", "ask_choice", "User selected: 2. B (Recommended)"),
       user("u2", "and test it"),
     ];
     const out = buildProtected(entries, 0, entries.length)!;
@@ -135,8 +147,8 @@ describe("buildProtected", () => {
 
   it("protects an ask answer on its own when no user message is covered", () => {
     const entries = [
-      asstCall("a1", "c1", "consult", { question: "Commit now?" }),
-      result("r1", "c1", "consult", "User selected: 1. Yes — commit it\nUser's note: keep the changelog entry terse"),
+      asstCall("a1", "c1", "ask_choice", { question: "Commit now?" }),
+      result("r1", "c1", "ask_choice", "User selected: 1. Yes — commit it\nUser's note: keep the changelog entry terse"),
     ];
     const out = buildProtected(entries, 0, entries.length)!;
     expect(out).toContain("Q: Commit now?");
@@ -146,8 +158,8 @@ describe("buildProtected", () => {
   it("caps a long question stem but keeps the answer whole", () => {
     const q = "w ".repeat(200);
     const entries = [
-      asstCall("a1", "c1", "consult", { question: q }),
-      result("r1", "c1", "consult", "User answered: " + "a".repeat(400)),
+      asstCall("a1", "c1", "ask", { question: q }),
+      result("r1", "c1", "ask", "User answered: " + "a".repeat(400)),
     ];
     const out = buildProtected(entries, 0, entries.length)!;
     expect(out).toContain("…");
@@ -157,12 +169,12 @@ describe("buildProtected", () => {
 
   it("skips a failed/cancelled ask and an ask call with no recorded question", () => {
     const cancelled = [
-      asstCall("a1", "c1", "consult", { question: "Commit?" }),
-      result("r1", "c1", "consult", "User dismissed the question.", true),
+      asstCall("a1", "c1", "ask", { question: "Commit?" }),
+      result("r1", "c1", "ask", "User dismissed the question.", true),
     ];
     expect(buildProtected(cancelled, 0, cancelled.length)).toBeUndefined();
     // answer whose toolCall sits outside the covered span → answer alone, no orphan Q:
-    const orphan = buildProtected([result("r1", "gone", "consult", "User selected: 1. Yes")], 0, 1)!;
+    const orphan = buildProtected([result("r1", "gone", "ask_choice", "User selected: 1. Yes")], 0, 1)!;
     expect(orphan).toContain("User selected: 1. Yes");
     expect(orphan).not.toContain("Q: ");
   });
@@ -170,8 +182,8 @@ describe("buildProtected", () => {
   it("budget counts ask answers next to user messages", () => {
     const entries: SessionEntry[] = [];
     for (let i = 0; i < 8; i++) {
-      entries.push(asstCall(`a${i}`, `c${i}`, "consult", { question: `question ${i} ` + "q".repeat(3000) }));
-      entries.push(result(`r${i}`, `c${i}`, "consult", `answer ${i} ` + "y".repeat(3000)));
+      entries.push(asstCall(`a${i}`, `c${i}`, "ask", { question: `question ${i} ` + "q".repeat(3000) }));
+      entries.push(result(`r${i}`, `c${i}`, "ask_choice", `answer ${i} ` + "y".repeat(3000)));
     }
     const out = buildProtected(entries, 0, entries.length)!;
     expect(out).toContain("older message(s)/answer(s) omitted (block cap)");
@@ -180,10 +192,10 @@ describe("buildProtected", () => {
     expect(out!.length).toBeLessThan(PROTECTED_BUDGET_CHARS + 500);
   });
 
-  it("uncoupled from consult's result phrasing: any result text is carried whole", () => {
+  it("uncoupled from the ask extension's phrasing: any result text is carried whole", () => {
     const entries = [
-      asstCall("a1", "c1", "consult", { question: "Which?" }),
-      result("r1", "c1", "consult", "User answered incorrectly.\nSelected: 1. A\nCorrect: 2. B"),
+      asstCall("a1", "c1", "ask", { question: "Which?" }),
+      result("r1", "c1", "ask_choice", "User answered incorrectly.\nSelected: 1. A\nCorrect: 2. B"),
     ];
     const out = buildProtected(entries, 0, entries.length)!;
     expect(out).toContain("Correct: 2. B"); // the model's key rides along, header names `Q:` as the model's
@@ -212,9 +224,9 @@ describe("buildProtected", () => {
   });
 });
 
-// ── the ask pass when consult is not installed / the shape is odd ──
+// ── the ask pass when no ask tool is installed / the shape is odd ──
 
-describe("buildProtected without the consult extension", () => {
+describe("buildProtected with an ask tool that is not installed", () => {
   it("leaves behavior unchanged — no ask tool, no ask rows", () => {
     const entries = [user("u1", "do x"), result("r1", "c1", "other_ask", "User chose y"), user("u2", "then z")];
     const out = buildProtected(entries, 0, entries.length)!;
@@ -225,8 +237,8 @@ describe("buildProtected without the consult extension", () => {
 
   it("tolerates a malformed ask result and a call with no arguments", () => {
     const bad = [
-      { type: "message", id: "r", message: { role: "toolResult", toolName: "consult", content: null, timestamp: 0 } },
-      { type: "message", id: "a", message: { role: "assistant", content: [{ type: "toolCall", id: "c", name: "consult" }], timestamp: 0 } },
+      { type: "message", id: "r", message: { role: "toolResult", toolName: "ask", content: null, timestamp: 0 } },
+      { type: "message", id: "a", message: { role: "assistant", content: [{ type: "toolCall", id: "c", name: "ask" }], timestamp: 0 } },
       { type: "message", id: "r2", message: { role: "toolResult", toolCallId: "c", content: [{ type: "text", text: "answered" }], timestamp: 0 } },
     ] as unknown as SessionEntry[];
     const out = buildProtected(bad, 0, bad.length)!;

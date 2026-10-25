@@ -9,7 +9,7 @@
 // LLM context, at the very tail of the projection:
 //
 //   protected: covered user messages AND the user's answers to interactive
-//     asks (consult), verbatim — the user's own words are not regenerable from
+//     asks (ask / ask_choice), verbatim — the user's own words are not regenerable from
 //     a summary (assistant text stays in the summary; an ask answer is user
 //     speech that happens to travel in the toolResult channel, and 26% of them
 //     carry a free-form note the model never authored).
@@ -114,16 +114,20 @@ function textOf(content: unknown): string {
 /** The interactive-ask channel: the tool result IS the user's decision, so it
  *  belongs with the protected originals — a decision is not exact-value tool
  *  output (the evidence index truncates and points; an answer is short enough
- *  to carry whole) and not summary-safe (measured: no consult answer's literal
- *  text survived in any of that session's 6 compaction summaries). */
-const ASK_TOOLS = new Set(["consult"]);
+ *  to carry whole) and not summary-safe (measured: no ask answer's literal text
+ *  survived in any of that session's 6 compaction summaries).
+ *
+ *  `consult` is the name those asks went by until 2026-10-26; it stays in the
+ *  set because a resumed session still holds those calls in its history, and
+ *  this reads that history — it is not an API alias. */
+const ASK_TOOLS = new Set(["ask", "ask_choice", "consult"]);
 /** The question is model-authored and routinely a paragraph; the answer is the
  *  high-value side, so the stem is capped and the answer stays whole. */
 const ASK_QUESTION_CAP_CHARS = 160;
 
 /** Question stems of the covered span's ask calls, keyed by tool call id — read
  *  from the toolCall arguments (pi's record), not from the extension's result
- *  payload, so gallop does not couple to consult's result shape. Every ask call
+ *  payload, so gallop does not couple to the ask extension's result shape. Every ask call
  *  gets an entry (empty stem when the arguments carry none), so the key set is
  *  also the recognition fallback for a result that carries no `toolName`. */
 function askQuestions(entries: SessionEntry[], start: number, end: number): Map<string, string> {
