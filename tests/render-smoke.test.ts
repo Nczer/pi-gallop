@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import gallopExtension from "../index.ts";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+
+/** pi's expand hint reads pi's own theme singleton (and throws before it is
+ *  initialized), so it is initialized here the way the app does it. Its key TEXT
+ *  resolves from a live keybinding registry, which a bare harness has none of:
+ *  the assertions strip ANSI and pin the wording around the key. */
+initTheme(undefined, false);
+const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 const fakeTheme = {
   fg: (name: string, text: string) => `<${name}>${text}</>`,
@@ -86,7 +94,7 @@ describe("context_status renderers", () => {
     expect(lines[0]).toContain("context_status");
   });
 
-  it("collapsed result is the usage line only; expanded shows the full text", () => {
+  it("collapsed result is the usage line plus pi's mark; expanded shows the full text", () => {
     const tool = captureTools().get("context_status");
     const collapsed: any = tool.renderResult(
       { content: [{ type: "text", text: STATUS }] },
@@ -94,11 +102,16 @@ describe("context_status renderers", () => {
       fakeTheme,
       {},
     );
-    const lines = collapsed.render(100);
+    const lines = collapsed.render(120);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("142.3k / 200k");
-    expect(lines[0]).not.toContain("Thresholds");
-    expect(lines[0]).not.toContain("Advice");
+    expect(stripAnsi(lines[0])).toContain("142.3k / 200k");
+    // The collapse is what needs saying: pi's mark, on the same line.
+    // The collapse is what needs saying: pi's mark, riding the same line.
+    // (`keyHint` styles through pi's singleton theme, so the fake-theme tags and
+    //  pi's codes interleave — match the wording, not the markup.)
+    expect(stripAnsi(lines[0])).toMatch(/\.\.\. \(2 more lines, .*to expand.*\)/);
+    expect(stripAnsi(lines[0])).not.toContain("Thresholds");
+    expect(stripAnsi(lines[0])).not.toContain("Advice");
 
     const expanded: any = tool.renderResult(
       { content: [{ type: "text", text: STATUS }] },

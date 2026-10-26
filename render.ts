@@ -14,7 +14,7 @@
  * renderer parameters are contextually typed by registerTool, so they track
  * pi's ToolDefinition signature instead of a hand-kept structural copy.
  */
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { keyHint, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 /** Shape of the tool result the renderers read (pi's content-block array). */
@@ -40,9 +40,21 @@ export function formatCompactResultText(
   return text ? theme.fg("toolOutput", text) : "";
 }
 
+/**
+ * pi's collapsed-truncation mark — `... (2 more lines, ctrl+o to expand)`; the
+ * form is fixed in `../ui-kit/README.md` ("Truncation marks") and each
+ * component marks its own collapse. It rides the collapsed line rather than
+ * taking a line of its own: `context_status` is a two-line report squeezed to
+ * one, and a marker line would give back the space the collapse bought.
+ */
+function expandMark(theme: Theme, lines: number): string {
+  const hidden = `${lines} more ${lines === 1 ? "line" : "lines"}`;
+  return `${theme.fg("muted", `... (${hidden}, `)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+}
+
 /** context_status: the result IS the payload — collapsed shows the usage line
- *  only, expanded the full text (usage / thresholds / advice). No args are
- *  ever shown (the tool has none). */
+ *  only, marked with what the collapse holds back, expanded the full text
+ *  (usage / thresholds / advice). No args are ever shown (the tool has none). */
 export function formatStatusResultText(
   theme: Theme,
   result: ToolResultShape | undefined,
@@ -55,7 +67,9 @@ export function formatStatusResultText(
     .join("\n")
     .trim();
   if (!text) return "";
-  return theme.fg("toolOutput", options.expanded ? text : text.split("\n")[0]!);
+  if (options.expanded) return theme.fg("toolOutput", text);
+  const [head = "", ...rest] = text.split("\n");
+  return theme.fg("toolOutput", head) + (rest.length ? ` ${expandMark(theme, rest.length)}` : "");
 }
 
 /** Renderers for one tool (shapes match pi's ToolDefinition render hooks). */

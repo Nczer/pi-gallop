@@ -463,5 +463,7 @@ The tool description scopes the call frequency — task boundaries and large
 batches of reads or images (~1.6k tokens each), not after every tool call — so
 the on-demand query stays on-demand (each result stays in the kept context).
 Per-category visualization for humans remains the separate `/context`
-extension.
+extension. Its tool row collapses to the usage line and marks what the collapse
+holds back with pi's `... (N more lines, ctrl+o to expand)` (ui-kit README:
+"Truncation marks"); expanded prints the whole report.
 
