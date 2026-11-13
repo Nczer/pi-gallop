@@ -46,6 +46,17 @@ describe("footer status composition", () => {
     expect(line(ctx)[1]).toContain("stall");
   });
 
+  it("retires a line it never tracked (a raw setStatus write)", () => {
+    // The footer keeps an extension status until something overwrites it
+    // (interactive-mode.ts:2264), so the clear must render even when no state
+    // part is tracked — a `!statePart` early return here stranded
+    // "· ⟳ Compacting..." after a continue:false compact.
+    ctx.ui.setStatus("compact", "· ⟳ Compacting...");
+    ctx.ui.setStatus.mockClear();
+    setStateCleared(ctx);
+    expect(line(ctx)).toEqual(["compact", undefined]);
+  });
+
   it("drops a nudge part in reconcile once its live() condition goes false", () => {
     let streak = 1;
     setNudge(ctx, "⚠ stall: resumed", () => streak > 0);

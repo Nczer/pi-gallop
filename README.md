@@ -431,8 +431,9 @@ lifecycle (a `ui.notify` toast lost it: one field shared with halter's dspa
 toasts, overwriting each other). If the nudge goes unanswered — no tool call,
 no prose checkpoint, nothing compacted — the line escalates at `agent_settled`
 to `· ⚠ ~12k left · stalled — /compact`. The line is cleared by a compaction,
-by an aborted compaction and by a `/tree` navigation: pi hands `setStatus` to
-the footer data provider and keeps the text until something overwrites it
+by a failed or aborted compaction and by a `/tree` navigation: pi hands
+`setStatus` to the footer data provider and keeps the text until something
+overwrites it
 (interactive-mode.ts:2264), and a `/tree` jump to a shorter branch leaves the
 remaining-token figure measuring a branch that no longer exists.
 

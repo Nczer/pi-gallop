@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import gallopExtension from "../index";
+import { setNudge } from "../status";
 import {
   computeSelfCompactFileLists,
   appendSelfCompactFileOps,
@@ -856,18 +857,39 @@ describe("self-compact wiring (in-session summary)", () => {
     compactDone();
   });
 
-  it("registers its abort handler on the signal and removes it again on the way out", async () => {
+  it("keeps a once abort handler on the signal — a cancel retires the Compacting line", async () => {
     await callTool({ summary: LONG_SUMMARY });
 
-    const added: string[] = [];
-    const removed: string[] = [];
-    const signal = {
-      addEventListener: (type: string, _fn: () => void) => { added.push(type); },
-      removeEventListener: (type: string, _fn: () => void) => { removed.push(type); },
+    const statuses: Array<[string, string | undefined]> = [];
+    const uiCtx = {
+      ...ctx,
+      hasUI: true,
+      ui: {
+        notify: vi.fn(),
+        setStatus: (key: string, text: string | undefined) => statuses.push([key, text]),
+        theme: { fg: (_kind: string, s: string) => s },
+      },
     };
-    await handlers.get("session_before_compact")({ preparation: prep(emptyOps()), signal }, ctx);
-    expect(added).toEqual(["abort"]);
-    expect(removed).toEqual(["abort"]);
+    let listener: (() => void) | undefined;
+    let options: unknown;
+    const signal = {
+      addEventListener: (type: string, fn: () => void, opts?: unknown) => {
+        if (type === "abort") { listener = fn; options = opts; }
+      },
+      removeEventListener: vi.fn(),
+    };
+    await handlers.get("session_before_compact")({ preparation: prep(emptyOps()), branchEntries: [], signal }, uiCtx);
+    expect(listener).toBeTypeOf("function");
+    expect(options).toEqual({ once: true });
+    expect(statuses.at(-1)?.[1]).toContain("Compacting");
+
+    // The listener has to outlive this synchronous hook: pi aborts the signal
+    // after it returns (cancel during the summarizer / the post-hook aborted
+    // check). Removing it on the way out — the old behavior this test used to
+    // pin — made the abort path unreachable code.
+    expect(signal.removeEventListener).not.toHaveBeenCalled();
+    listener!();
+    expect(statuses.at(-1)).toEqual(["compact", undefined]);
     compactDone();
   });
 
@@ -1557,13 +1579,14 @@ describe("context pressure in the footer status slot", () => {
   const WINDOW = 200_000;
   let pi: any;
   let handlers: Map<string, any>;
+  let tools: Map<string, any>;
   let ctx: any;
   let statuses: Array<[string, string | undefined]>;
   let tmpHome: string;
   let tmpCwd: string;
 
   beforeEach(() => {
-    ({ pi, handlers } = makeMockPi());
+    ({ pi, handlers, tools } = makeMockPi());
     gallopExtension(pi);
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-status-home-"));
     tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gallop-status-cwd-"));
@@ -1690,6 +1713,63 @@ describe("context pressure in the footer status slot", () => {
     await cross();
     expect(ctx.ui.setStatus).not.toHaveBeenCalled();
     expect(pi.sendMessage).toHaveBeenCalledTimes(1); // the model-facing nudge still lands
+  });
+
+  // ── The ⟳ Compacting... line's own lifecycle ──
+  // These were the field leak: the line was written raw into the footer (not
+  // through status.setState), so setStateCleared saw no state part and never
+  // re-rendered. Anything that overwrote the slot later hid it — the continue
+  // steer, a fresh nudge — and a compact nothing followed left it up for the
+  // rest of the session.
+
+  const beforeCompact = (signal = new AbortController().signal) =>
+    handlers.get("session_before_compact")({
+      preparation: {
+        firstKeptEntryId: "entry-123", tokensBefore: 50_000,
+        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+      },
+      branchEntries: [],
+      signal,
+    }, ctx);
+
+  it("a compact_request with continue:false retires the ⟳ Compacting... line", async () => {
+    // Nothing crosses the nudge threshold here, so no tracked part exists in
+    // front of the compaction — the exact field shape (footer left on
+    // "· ⟳ Compacting..." until /reload).
+    const tool = tools.get("compact_request");
+    await tool.execute(
+      "id1", { summary: LONG_SUMMARY, continue: false },
+      new AbortController().signal, undefined, ctx,
+    );
+    handlers.get("agent_settled")(null, ctx);
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(await beforeCompact()).toBeDefined(); // the stashed checkpoint was consumed
+    expect(lastStatus()[1]).toContain("Compacting");
+    await handlers.get("session_compact")(null, ctx);
+    expect(lastStatus()).toEqual(["compact", undefined]);
+  });
+
+  it("a failed or cancelled compact retires the line through session_compact_failed", async () => {
+    // pi's compact() catch emits this event; it does NOT abort the
+    // session_before_compact signal on an ordinary failure, and the abort
+    // listener gallop used to register could never fire anyway (this handler
+    // is synchronous, so its finally removed the listener first).
+    beforeCompact();
+    expect(lastStatus()[1]).toContain("Compacting");
+    await handlers.get("session_compact_failed")({}, ctx);
+    expect(lastStatus()).toEqual(["compact", undefined]);
+  });
+
+  it("a live nudge part does not survive the compaction's state reset", async () => {
+    // resetAllState's status.reset() drops parts without painting, and the
+    // footer keeps its last text until a render — so a compaction with
+    // continue:false and no stashed input (nothing scheduled after it) left
+    // the pre-compaction nudge text on screen.
+    setNudge(ctx, "⚠ stall: resumed", () => true);
+    beforeCompact();
+    expect(lastStatus()[1]).toContain("stall: resumed");
+    await handlers.get("session_compact")(null, ctx);
+    expect(lastStatus()).toEqual(["compact", undefined]);
   });
 });
 

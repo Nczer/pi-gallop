@@ -96,9 +96,11 @@ export function reconcile(ctx: ExtensionContext): void {
 }
 
 /** Take gallop's state part out of the footer line, leaving a live nudge part
- *  alone (it has its own lifecycle). */
+ *  alone (it has its own lifecycle). Renders even when no state part is
+ *  tracked: the key is gallop's, and the render is what retires whatever is
+ *  on screen. (A `!statePart` early return stranded an untracked raw write —
+ *  the "⟳ Compacting..." line's `continue: false` field case.) */
 export function setStateCleared(ctx: ExtensionContext): void {
-  if (!statePart) return;
   statePart = null;
   render(ctx);
 }

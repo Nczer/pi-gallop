@@ -576,7 +576,7 @@ let pressureLabel: string | null = null;
 
 /** Gallop's line in the footer's `compact` status slot — the slot pi's bottom
  *  bar keeps for the compaction, so the pressure states and `⟳ Compacting...`
- *  follow one another in one place (and `onCompacted` / the abort listener
+ *  follow one another in one place (and `onCompacted` / `onCompactFailed`
  *  already clear it). The footer drops items from the tail on a narrow
  *  terminal, and `compact` is 4th of 6 in its priority list, so this line
  *  survives. The user-facing nudge used to be a `ui.notify` toast: it shares
@@ -589,7 +589,8 @@ function setPressureStatus(ctx: ExtensionContext, text: string): void {
  *  status until something overwrites it (`interactive-mode.ts:2264` hands
  *  `setStatus` straight to the footer data provider), so every path that ends a
  *  pressure cycle has to clear it explicitly: a compaction completed
- *  (`onCompacted`), a compaction was aborted, or the session branch changed
+ *  (`onCompacted`), a compaction failed or was aborted (`onCompactFailed`,
+ *  via session_compact_failed), or the session branch changed
  *  under the line (`/tree` — `session_tree`), where the remaining-token figure
  *  was measured on a branch that is no longer the context. */
 export function clearPressureStatus(ctx: ExtensionContext): void {
@@ -982,66 +983,80 @@ export function onBeforeCompact(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
 ): { compaction: CompactionResult } | undefined {
-  if (ctx.hasUI) {
-    ctx.ui.setStatus("compact", `${ctx.ui.theme.fg("dim", "· ")}${ctx.ui.theme.fg("warning", "⟳ Compacting...")}`);
-  }
+  // Through status.ts, never `ctx.ui.setStatus` directly: the state part is
+  // what `clearPressureStatus` retires. Written raw, the line was untracked, so
+  // `setStateCleared` saw no state part and returned without rendering — the
+  // footer kept "⟳ Compacting..." forever unless something later re-rendered
+  // the slot (the continue steer, a pressure nudge, /tree). Field case: a
+  // compact_request with `continue: false` on a context that never crossed the
+  // nudge threshold left the line up for the rest of the session.
+  status.setState(ctx, "⟳ Compacting...");
   // The stash is consumed eagerly below (nulled before the result is
   // returned), so a cancelled compaction can't leak the summary into a
-  // later, unrelated compaction. The abort listener only clears the status
-  // line — registered unconditionally so a headless abort can't leave it.
-  const onAbort = (): void => clearPressureStatus(ctx);
-  event.signal.addEventListener("abort", onAbort);
-  try {
-    const summary = selfSummary;
-    selfSummary = null;
-    if (!summary || summary.length < MIN_SUMMARY_LENGTH) return undefined;
-    // Cut point: pi computed preparation with ITS configured keep window —
-    // gallop's self-compact keeps its own (compactKeepRecentTokens,
-    // settings-ext; the tail size is part of gallop's compaction design, so
-    // the extension owns it). When gallop's window differs from pi's — or
-    // nuke (budget 0: keep only the last turn's tail) — recompute the cut
-    // with the same findCutPoint walker pi's prepareCompaction uses and
-    // return the custom firstKeptEntryId; pi uses it verbatim. Equal to pi's
-    // window → pi's cut as-is. This code is only reachable with a stashed
-    // checkpoint (self-compact — the deferred manual path, or the automatic
-    // threshold compact that won the race); native compacts return
-    // undefined above and keep pi's own window untouched. Falls back to pi's
-    // cut when no usable custom cut exists.
-    let firstKeptEntryId = event.preparation.firstKeptEntryId;
-    const nuke = pendingCompact?.nuke === true;
-    const piKeep = readPiCompactionSettings(ctx.cwd).keepRecentTokens;
-    // Fail-open: no branch entries → the walker has nothing to cut → pi's cut
-    // as-is (never block the compaction on a missing event field).
-    if (event.branchEntries && (nuke || keepRecentTokens !== piKeep)) {
-      const custom = computeCustomFirstKeptEntryId(event.branchEntries, nuke ? 0 : keepRecentTokens);
-      if (custom) firstKeptEntryId = custom;
-    }
-    // Evidence package: the covered span and the final cut are both known
-    // here — build the blocks now, deliver from onCompacted only on success
-    // (a failed compact must not emit dangling blocks). Pointers only when
-    // the model can actually call session_recall (memory ext loaded) —
-    // otherwise the rows degrade to fragments and the file is not read.
+  // later, unrelated compaction.
+  // The abort listener stays on the signal for the life of the compaction,
+  // deliberately NOT removed when this synchronous handler returns: pi aborts
+  // the signal later (a cancel during its summarizer, or its post-hook
+  // `signal.aborted` check), and that abort is the earliest point the line
+  // should go. `once` bounds it — the signal dies with the AbortController pi
+  // created for this compact. The catch covers /reload: the module copy holding
+  // this ctx is gone and the new copy owns the footer. A compaction that fails
+  // without aborting ("Already compacted", a summarizer error) is cleared by
+  // onCompactFailed instead.
+  event.signal.addEventListener("abort", () => {
     try {
-      pendingBlocks = buildEvidenceBlocks(
-        event.branchEntries,
-        firstKeptEntryId,
-        ctx.sessionManager?.getSessionFile?.() ?? null,
-        sessionRecallAvailable(),
-      );
+      clearPressureStatus(ctx);
     } catch {
-      pendingBlocks = null; // fail-open: never block compaction
+      // stale runtime / disposed UI: nothing left to paint
     }
-    return {
-      compaction: {
-        summary: appendSelfCompactFileOps(summary, event.preparation.fileOps),
-        firstKeptEntryId,
-        tokensBefore: event.preparation.tokensBefore,
-        details: computeSelfCompactFileLists(event.preparation.fileOps),
-      },
-    };
-  } finally {
-    event.signal.removeEventListener("abort", onAbort);
+  }, { once: true });
+  const summary = selfSummary;
+  selfSummary = null;
+  if (!summary || summary.length < MIN_SUMMARY_LENGTH) return undefined;
+  // Cut point: pi computed preparation with ITS configured keep window —
+  // gallop's self-compact keeps its own (compactKeepRecentTokens,
+  // settings-ext; the tail size is part of gallop's compaction design, so
+  // the extension owns it). When gallop's window differs from pi's — or
+  // nuke (budget 0: keep only the last turn's tail) — recompute the cut
+  // with the same findCutPoint walker pi's prepareCompaction uses and
+  // return the custom firstKeptEntryId; pi uses it verbatim. Equal to pi's
+  // window → pi's cut as-is. This code is only reachable with a stashed
+  // checkpoint (self-compact — the deferred manual path, or the automatic
+  // threshold compact that won the race); native compacts return
+  // undefined above and keep pi's own window untouched. Falls back to pi's
+  // cut when no usable custom cut exists.
+  let firstKeptEntryId = event.preparation.firstKeptEntryId;
+  const nuke = pendingCompact?.nuke === true;
+  const piKeep = readPiCompactionSettings(ctx.cwd).keepRecentTokens;
+  // Fail-open: no branch entries → the walker has nothing to cut → pi's cut
+  // as-is (never block the compaction on a missing event field).
+  if (event.branchEntries && (nuke || keepRecentTokens !== piKeep)) {
+    const custom = computeCustomFirstKeptEntryId(event.branchEntries, nuke ? 0 : keepRecentTokens);
+    if (custom) firstKeptEntryId = custom;
   }
+  // Evidence package: the covered span and the final cut are both known
+  // here — build the blocks now, deliver from onCompacted only on success
+  // (a failed compact must not emit dangling blocks). Pointers only when
+  // the model can actually call session_recall (memory ext loaded) —
+  // otherwise the rows degrade to fragments and the file is not read.
+  try {
+    pendingBlocks = buildEvidenceBlocks(
+      event.branchEntries,
+      firstKeptEntryId,
+      ctx.sessionManager?.getSessionFile?.() ?? null,
+      sessionRecallAvailable(),
+    );
+  } catch {
+    pendingBlocks = null; // fail-open: never block compaction
+  }
+  return {
+    compaction: {
+      summary: appendSelfCompactFileOps(summary, event.preparation.fileOps),
+      firstKeptEntryId,
+      tokensBefore: event.preparation.tokensBefore,
+      details: computeSelfCompactFileLists(event.preparation.fileOps),
+    },
+  };
 }
 
 // ── context: replace the compact_request exchange with a completion marker ──
@@ -1368,7 +1383,11 @@ export function scheduleEvidenceBlocks(blocks: EvidenceBlocks, pi: ExtensionAPI)
  *  to fire again (reset() runs only on session_start / a successful compact,
  *  so without this the nudge stays spent for the rest of the session) and the
  *  compact latches must not strand a later request. */
-export function onCompactFailed(pi: ExtensionAPI): void {
+export function onCompactFailed(ctx: ExtensionContext, pi: ExtensionAPI): void {
+  // pi's `compact()` catch emits this before rethrowing, and it does NOT abort
+  // the session_before_compact signal on a normal failure, so the abort
+  // listener cannot be the only way the in-flight line leaves the footer.
+  clearPressureStatus(ctx);
   pendingBlocks = null; // failed compact: no dangling blocks
   contextNudgeState = "idle";
   pressureLabel = null;

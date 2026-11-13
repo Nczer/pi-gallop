@@ -21,7 +21,7 @@
  * session lifecycle — state resets on session start, on compaction and on
  * tree navigation (/tree), and the settings toggle reload.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadExtSettings } from "./ext-settings";
 import * as binary from "./binary";
 import * as collapse from "./collapse";
@@ -181,6 +181,14 @@ export default function gallopExtension(pi: ExtensionAPI) {
     const outcome = selfCompact.onCompacted(ctx);
     // Reset all gallop state after compaction to avoid stale state
     resetAllState();
+    // resetAllState's status.reset() drops the parts without painting (the
+    // session-start path relies on pi rebuilding the footer). Here the footer
+    // is live and keeps whatever was on screen until a render: onCompacted's
+    // clear runs BEFORE the nudge part is dropped, so a compaction that
+    // nothing follows (continue:false, nothing stashed) left that nudge text
+    // stranded. Repaint the empty line once, then let the continuation write
+    // its own.
+    status.clearAll(ctx);
     // Evidence blocks first: they must land in context before the
     // continuation (steer / stashed redelivery) starts the next turn.
     if (outcome.blocks) {
@@ -200,10 +208,10 @@ export default function gallopExtension(pi: ExtensionAPI) {
   // pin moves up to the installed pi.
   type OnCompactFailed = (
     event: "session_compact_failed",
-    handler: (event: unknown) => void | Promise<void>,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
   ) => void;
-  (pi.on as unknown as OnCompactFailed)("session_compact_failed", () => {
-    selfCompact.onCompactFailed(pi);
+  (pi.on as unknown as OnCompactFailed)("session_compact_failed", (_event, ctx) => {
+    selfCompact.onCompactFailed(ctx, pi);
   });
 
   // ── Tree navigation (/tree) ──
