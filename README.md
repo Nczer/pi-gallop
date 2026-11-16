@@ -105,6 +105,21 @@ state and the deferred trigger skips (a second check that the branch does not
 already end in a compaction entry); in that race case the `continue` steer is
 sent from `session_compact` instead of the manual `onComplete`.
 
+Because the compact fires at `agent_settled`, the run has to end for it to land —
+and pi ends a run on a terminating tool result only when **every** finalized result
+in that batch terminates. A `compact_request` sharing its assistant message with
+another tool therefore waits behind the rest of the run (measured: 17 s / 3 further
+tool calls, and 8 min / 20). So gallop blocks the siblings: once the `tool_call`
+hook has seen `compact_request` in the current message, every later call in that
+message is answered with `{ block: true, terminate: true }` — a blocked call
+finalizes with `terminate`, so the batch still ends the run and the compact lands at
+settle. The block reason names the remedy (re-issue the call after the compaction;
+call `compact_request` alone in a message), and the tool description asks for that
+shape up front. Coverage is partial by construction: pi fires `tool_call` for every
+call in a batch before executing any, so a sibling listed *before* the request is
+already past the hook and runs, and nested calls (`parentToolCallId`) are left alone
+— their parent's batch cannot terminate either way.
+
 Once the checkpoint has become the compaction summary, a `context` handler
 replaces the `compact_request` exchange in every LLM request — the exchange
 would otherwise duplicate the ~1k-token summary in the kept tail *and* read

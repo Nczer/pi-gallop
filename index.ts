@@ -84,6 +84,8 @@ export default function gallopExtension(pi: ExtensionAPI) {
   pi.on("message_start", (event) => {
     if (event.message.role === "assistant") {
       sawAssistantMessage = true;
+      // A fresh message: the previous one's compact_request sibling guard is over.
+      selfCompact.noteAssistantMessageStart();
     } else if (event.message.role === "user") {
       // A new user turn: a user message now follows any prior compaction, so the
       // "already compacted" re-trigger window is over — allow future compaction.
@@ -131,14 +133,18 @@ export default function gallopExtension(pi: ExtensionAPI) {
 
   // ── Tool call interceptor: halt, read guard, enforced blocks ──
   pi.on("tool_call", async (event, ctx) => {
-    // User halted via circuit breaker — block everything; circuit breaker
-    // tripped — no more auto-intervention; otherwise the read guard, then the
-    // failure-loop / repetitive enforcement.
-    const decision = intervention.halted()
-      ? { block: true as const, reason: intervention.haltReason() }
-      : intervention.tripped()
-        ? undefined
-        : (binary.guardRead(event, ctx) ?? (await intervention.guardToolCall(event, ctx, pi)));
+    // A call sharing its message with compact_request answers first: pi ends the
+    // run for a terminating tool only when the whole batch terminates, so the
+    // siblings have to be blocked for the compaction to land promptly
+    // (selfCompact.guardCompactSiblings). Then: user halted via circuit breaker —
+    // block everything; circuit breaker tripped — no more auto-intervention;
+    // otherwise the read guard, then the failure-loop / repetitive enforcement.
+    const decision = selfCompact.guardCompactSiblings(event)
+      ?? (intervention.halted()
+        ? { block: true as const, reason: intervention.haltReason() }
+        : intervention.tripped()
+          ? undefined
+          : (binary.guardRead(event, ctx) ?? (await intervention.guardToolCall(event, ctx, pi))));
     // Record every block gallop issues, by call id: detection tells gallop's own
     // blocks apart from a real failure whose output gallop reshaped (binary
     // suppression, repetitive-output collapse) — a text match cannot.

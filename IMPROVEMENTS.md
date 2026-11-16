@@ -125,3 +125,69 @@ read from the ask call's `question` argument, failed/cancelled asks are skipped,
 re-asks a question that is in the block, the header's "do not re-ask an answered
 question" is not doing the job and the ask rows need their own label rather than
 riding the shared header.
+
+## Self-compact: `compact_request` can wait an arbitrarily long time to land
+
+**Evidence (2026-11-17; 60 most recent transcripts under `~/.pi/agent/sessions`,
+177 `compact_request` calls; delay = the tool result → the next `compaction`
+entry).**
+
+- `compact_request` **alone** in its assistant message — 175 calls: median delay
+  **0.01 s**, p90 0.06 s.
+- `compact_request` **sharing** the message with another tool — 2 calls:
+  `compact_request + bash` (`01a1e3ed`, 2026-11-16 11:41:50) → **17.3 s**, 3 more
+  tool calls, 121,247 → 121,864 tokens; `memory_edit + compact_request`
+  (`01a18065`, 2026-10-28 03:52:57) → **481.8 s (8 min)**, 20 more tool calls,
+  compacting at 126,286 tokens.
+- Two of the solo cases lagged over a minute anyway, for the *other* reason: a
+  message queued behind the batch keeps pi's run alive (`01a1ded6`, 2026-11-15
+  13:55:09 — a user message 3 ms after the result, then bash + a consult → 57.8 s,
+  and the cycle ended on the user aborting). Known in code (`agent_settled` waits
+  for queued continuations, self-compact.ts:26); now measured.
+
+**Mechanism.** `compact_request` stashes `pendingCompact` and returns
+`terminate: true` (self-compact.ts:1517); the compact itself is triggered at
+`agent_settled` (index.ts:118 → self-compact.ts:952). pi honours `terminate` only
+when **every** finalized result in the batch terminates
+(`shouldTerminateToolBatch`, agent-loop.ts:690; consumed as `hasMoreToolCalls =
+!executedToolBatch.terminate`, :272) — deliberate, documented
+(coding-agent/docs/extensions.md:140, "after every completed tool in that batch
+agrees to terminate") and pinned by a test (`agent-loop.test.ts:1858`, "should
+continue after parallel tool calls when not all tool results terminate"; pi
+200387122). So one sibling call silently cancels the terminate, the loop keeps
+running, and "Compacting." sits there for an unbounded number of tool calls. With
+pi's automatic compaction off (this corpus) there is no backstop — the nudge's own
+text says the fallback is a context overflow that aborts the run.
+
+**Not the cause: the aborted tool calls.** That 11-16 window also produced two
+`edit` results reading `Operation aborted`, which is what drew attention here. They
+are the user's ESC interrupts — confirmed by the user on 2026-11-17, and the
+compaction landing right after the ESC is the deferred trigger doing its job. Not
+gallop: across the 60-session corpus there are 9 real
+`Operation aborted` tool results and 7 of them have no `compact_request` or
+compaction anywhere near. No compaction path can reach a live tool from gallop's
+side — pi's threshold/overflow checks run post-run (`_handlePostAgentRun` →
+`_checkCompaction`, agent-session.ts:1837/2009) and `agent_settled` is emitted
+after `_isAgentRunActive = false` (:1052), so the deferred trigger cannot abort
+work. **Guard to keep:** `AgentSession.compact()` opens with `await this.abort()`
+(:2718) and `ExtensionAPI.compact()` is fire-and-forget (:3407) — a trigger that
+is not strictly at settle time would abort whatever tool is in flight.
+
+**Implemented (2026-11-17).** Candidates 1 and 2. `selfCompact.guardCompactSiblings`
+blocks every call the `tool_call` hook sees after `compact_request` in the same
+assistant message with `{ block: true, terminate: true }` (pi's
+`ToolCallEventResult.terminate`; a blocked call finalizing with terminate is pinned by
+`agent-loop.test.ts:1742` / regression 5998), so the batch terminates, `agent_settled`
+fires, and the compact lands. The guard opens on the request's own hook and closes at
+the next assistant `message_start` — it must outlive the request's `message_end`, since
+pi executes after that — and the tool description now states the alone-in-a-message
+shape. Coverage stays partial by design: a sibling listed before the request is already
+past the hook, and nested calls (`parentToolCallId`) are exempt because their parent's
+batch cannot terminate. `tests/sibling-guard.test.ts`.
+
+**Next.** The lag that remains is the queued-message one (57.8 s, `01a1ded6`): a
+message typed behind the batch keeps pi's run alive, and the compact waits behind the
+turn it starts — the same window `compactEnRoute` closes for gallop's own steers.
+Blocking *user* messages there is not on the table. A shorter trigger is, but not
+`turn_end`: `compact()` opens with `await this.abort()`, which would abort live tools
+— candidate 3, rejected for exactly that reason.

@@ -574,6 +574,11 @@ let proseCheckpoint: string | null = null;
  *  usage to recompute it from. Set with the nudge, cleared with the nudge gate. */
 let pressureLabel: string | null = null;
 
+/** True from the `tool_call` hook of a `compact_request` until the next assistant
+ *  message starts: the calls sharing that message are blocked (see
+ *  `guardCompactSiblings`). */
+let requestedInThisMessage = false;
+
 /** Gallop's line in the footer's `compact` status slot — the slot pi's bottom
  *  bar keeps for the compaction, so the pressure states and `⟳ Compacting...`
  *  follow one another in one place (and `onCompacted` / `onCompactFailed`
@@ -824,6 +829,55 @@ export function noteUserTurn(): void {
   // A prose checkpoint belongs to the run that wrote it; agent_settled is the
   // only consumer and it has already run by the next user turn.
   proseCheckpoint = null;
+}
+
+/** message_start (assistant role): a fresh message. The previous message's
+ *  sibling guard is over — and it has to outlive that message's `message_end`,
+ *  because pi executes the tool calls AFTER message_end (see `compactEnRoute`). */
+export function noteAssistantMessageStart(): void {
+  requestedInThisMessage = false;
+}
+
+/** Reason a call sharing its message with `compact_request` was not run. Says
+ *  what to do about it: the call itself is fine, the batching is not. */
+export const SIBLING_BLOCK_REASON =
+  "[Gallop] Not run: this message also calls compact_request, and the compaction " +
+  "lands only when that run ends — a second tool call keeps the run going. Re-issue " +
+  "this call after the compaction, and call compact_request alone in a message.";
+
+/** Block the tool calls that share a message with `compact_request`, and end the
+ *  batch by terminating them.
+ *
+ *  `compact_request` promises the compaction, but pi honours a terminating tool
+ *  result only when EVERY finalized result in the batch terminates
+ *  (agent-loop.ts:690, `hasMoreToolCalls = !terminate` at :272; documented at
+ *  coding-agent/docs/extensions.md:140). One sibling therefore cancels the
+ *  terminate silently, the loop keeps going, and the compact — fired at
+ *  `agent_settled` — waits behind the rest of the run: measured 8 minutes / 20
+ *  further tool calls, and 17 s / 3 calls (IMPROVEMENTS.md).
+ *
+ *  A blocked call finalizes with `terminate: true` (ToolCallEventResult), so
+ *  blocking the siblings restores the fast path: every result terminates, the
+ *  batch ends the run, `agent_settled` fires, the compact lands in ~ms.
+ *
+ *  Partial by construction, and deliberately so: pi prepares every call in a
+ *  batch (firing `tool_call` for each) before executing any, so a sibling listed
+ *  BEFORE the request is already past this hook and runs — the compact then waits
+ *  for the run, exactly as before. The tool description asks for the alone-in-a-message
+ *  shape that this guard cannot retrofit. */
+export function guardCompactSiblings(event: {
+  toolName: string;
+  parentToolCallId?: string;
+}): { block: true; reason: string; terminate: true } | undefined {
+  if (event.toolName === "compact_request") {
+    requestedInThisMessage = true;
+    return undefined;
+  }
+  // A nested call (a tool running its own sub-tools, e.g. codemode) belongs to a
+  // batch that cannot terminate anyway — its parent's own result is not
+  // terminating — so blocking it only buries the parent in a confusing error.
+  if (event.parentToolCallId || !requestedInThisMessage) return undefined;
+  return { block: true, reason: SIBLING_BLOCK_REASON, terminate: true };
 }
 
 /** message_end (assistant): the context-pressure nudge — one advisory steer
@@ -1408,6 +1462,7 @@ export function onCompactFailed(ctx: ExtensionContext, pi: ExtensionAPI): void {
 export function reset(): void {
   selfSummary = null;
   pendingCompact = null;
+  requestedInThisMessage = false;
   proseCheckpoint = null;
   continueOwed = false;
   pendingBlocks = null;
@@ -1440,6 +1495,7 @@ export function registerTools(pi: ExtensionAPI, registeredKeepTokens: number): v
     label: "Request Compact",
     description: `Compact context to remove unrelated old context and increase performance while preserving active tasks.
 - Call when: edit keeps failing (broken text matching), a major task finished and another is queued (compact at the boundary), the session is long, or context_status / a [Gallop] notice reports pressure.
+- Emit it alone in its message: the compact lands as the run ends, and any tool call sharing the message keeps that run going.
 - Context broken beyond repair (tool calls failing repeatedly): pass nuke: true — the checkpoint must then carry full state, not just older work`,
     parameters: Type.Object({
       summary: Type.String({ description: checkpointSkeleton(registeredKeepTokens) }),
